@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qmt_strategy"
+version = "0.1.0"
+description = "打板量化 · QMT 侧执行引擎（Windows VPS / xtquant）"
+requires-python = ">=3.9"
+# 说明：运行期真实依赖 xtquant（xttrader/xtdata），仅 Windows + miniQMT 可用，
+#       故不写入 install_requires；本仓库通过 Protocol 抽象 xtquant，单测用 fake 对象，
+#       可在任意平台（含 macOS/Linux）跑通逻辑与单测，详见 README 与 doc/04 开发计划。
+dependencies = []
+
+[project.optional-dependencies]
+# 直连 MySQL 写库（方案 A）时需要；CI/单测默认用内存仓储，不强依赖。
+mysql = ["PyMySQL>=1.0"]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["qmt_strategy*"]
+
+[tool.pytest.ini_options]
+# pythonpath 让 `import qmt_strategy` 无需安装即可在仓库根目录解析；
+# testpaths 固定到 tests，避免误收集其它目录。
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"

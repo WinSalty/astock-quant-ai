@@ -1,0 +1,250 @@
+"""实时回调采集（§6.2.1 两条腿之一：事件驱动增量）。
+
+业务意图：把 xttrader（XtQuantTrader）注册的各类回调统一接入回流落库写端（DataWriter）与本地
+下单台账（LocalLedger）。回调路径承载两类不可替代的事实：
+1) 成交回报 on_stock_trade —— 唯一事实源，绝不可丢；
+2) 废单 / 拒单（on_order_error）/ 撤单失败（on_cancel_error）—— 回调独有，隔日 query_* 兜底
+   无法还原历史失败态（§6.2.1 / §6.9），必须在事件发生当下落库，避免「计划单凭空消失」。
+
+依赖分层：本模块只依赖 DataWriter / LocalLedger 协议与 normalize 纯函数，不直接 import xtquant；
+真实链路把本类实例 register_callback 给 XtQuantTrader，单测用 contracts.xt_objects 的 FakeXt* 驱动。
+
+时间口径：一律经 normalize → time_utils.qmt_ts_to_db 双写（UTC naive + 东八区原值），本模块不手工 ±8h。
+data_source：回调路径产生的成交 / 委托记录一律 CALLBACK（区别于收盘兜底 / 断线补采的 QUERY_BACKFILL）。
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Any, Callable, Optional
+
+from ..contracts.enums import DataSource, OrderState, OrderStatus, SnapshotType
+from ..contracts.models import OrderRecord
+from ..contracts.protocols import DataWriter, LocalLedger, StructLogger
+from . import normalize
+from .normalize import SideResolver, StatusResolver
+
+# 回调侧需要的「交易日提供器」签名：返回当日 trade_date（东八区自然日，§6.6）。
+# 用可注入的 Callable 而非直接 clock，便于上游集中口径（如盘后补采用收盘日而非系统日）。
+TradeDateProvider = Callable[[], date]
+
+# OrderStatus（落库委托终态枚举）→ OrderState（台账本地状态机）映射（§6.2.1 on_stock_order）。
+# 业务意图：on_stock_order 落库用 OrderStatus，但同步台账要用 OrderState；两者成员名多有重叠，
+# 仍显式建表而非按名字硬转，避免后续任一枚举增删成员时静默串态。
+# 边界：REPORTED/PART_TRADED/TRADED/CANCELLED 语义一一对应；REJECTED/ERROR 均为终态失败，
+#       台账侧分别落 REJECTED / ERROR（与 OrderState 终态集合一致，幂等收口后不再推进）。
+_STATUS_TO_STATE = {
+    OrderStatus.REPORTED: OrderState.REPORTED,
+    OrderStatus.PART_TRADED: OrderState.PART_TRADED,
+    OrderStatus.TRADED: OrderState.TRADED,
+    OrderStatus.CANCELLED: OrderState.CANCELLED,
+    OrderStatus.REJECTED: OrderState.REJECTED,
+    OrderStatus.ERROR: OrderState.ERROR,
+}
+
+
+def _no_op() -> None:
+    """on_disconnected_hook 默认空实现：未注入重连补采钩子时不做任何动作（§6.2.3 补采本身不在此）。"""
+    return None
+
+
+class ExecCallback:
+    """xttrader 回调接入器（§6.2.1）。把各类推送规整后落库 + 同步本地台账。
+
+    依赖注入：
+      - data_writer：DataWriter，负责规整后记录的幂等 upsert（含 snapshot_type 注入）；
+      - ledger：LocalLedger，回调侧只按 order_id 同步状态 / 累计成交，不新建计划单；
+      - logger：StructLogger，断线等事件留痕（不写敏感信息）；
+      - account_id：当前账户号（落 qmt_*.account_id）；
+      - trade_date_provider：每次回调取当日 trade_date（东八区自然日），避免跨日 ID 复用串号（§6.5）；
+      - on_disconnected_hook：断线时触发重连 + 补采的钩子（默认空），补采逻辑本身不在本模块；
+      - side_resolver / status_resolver：方向 / 状态解析器，默认走 normalize 的实测默认表，可注入覆盖。
+
+    幂等口径：成交 / 委托落库的幂等由 repository 唯一键 + COALESCE 保证（§6.5）；本模块只负责把
+    每条回调如实规整并转交，不在此去重。台账侧 sync_status / add_fill 对未知 order_id 自身忽略，
+    故回调对手工单 / 非本系统单不会越权改写台账。
+    """
+
+    def __init__(
+        self,
+        data_writer: DataWriter,
+        ledger: LocalLedger,
+        logger: StructLogger,
+        *,
+        account_id: str,
+        trade_date_provider: TradeDateProvider,
+        on_disconnected_hook: Callable[[], None] = _no_op,
+        side_resolver: SideResolver = normalize.default_side_resolver,
+        status_resolver: StatusResolver = normalize.default_status_resolver,
+    ):
+        self._dw = data_writer
+        self._ledger = ledger
+        self._logger = logger
+        self._account_id = account_id
+        self._trade_date_provider = trade_date_provider
+        self._on_disconnected_hook = on_disconnected_hook
+        self._side_resolver = side_resolver
+        self._status_resolver = status_resolver
+
+    # ------------------------------------------------------------------
+    # 成交回报：唯一事实源，绝不可丢（§6.2.1 on_stock_trade）
+    # ------------------------------------------------------------------
+    def on_stock_trade(self, t: Any) -> None:
+        """成交回报落库 + 同步台账累计成交。
+
+        流程：
+          1) normalize_trade 规整为 TradeRecord（代码归一 / 方向映射 / 时间双写 / trade_date）；
+             data_source 固定 CALLBACK（成交回报来自实时推送）。
+          2) data_writer.upsert_trade 幂等落库（同 traded_id 后到覆盖，§6.5）。
+          3) ledger.add_fill(order_id, traded_volume, traded_price)：把本笔成交累计回台账，
+             推进 PART_TRADED / TRADED。台账无该 order_id（手工单 / 非本系统单）时 add_fill 内部忽略。
+        边界：order_id 缺失（getattr 取 None）时仍照常落库，仅台账侧无法关联（add_fill 对 None 忽略）。
+        """
+        rec = normalize.normalize_trade(
+            t,
+            account_id=self._account_id,
+            trade_date=self._trade_date_provider(),
+            data_source=DataSource.CALLBACK,
+            side_resolver=self._side_resolver,
+        )
+        # 成交是唯一事实源：先落库（写端失败会抛出告警，不静默吞）。
+        self._dw.upsert_trade(rec)
+        # 同步台账累计成交：order_id 缺失或台账无此单时由 add_fill 自身忽略，不抛错。
+        # 传 traded_id 供台账按成交编号去重（断线重连回放/券商重投不重复累计，§6.5/§4.4(4)）。
+        order_id = getattr(t, "order_id", None)
+        self._ledger.add_fill(
+            order_id,
+            getattr(t, "traded_id", None),
+            getattr(t, "traded_volume", None),
+            getattr(t, "traded_price", None),
+        )
+
+    # ------------------------------------------------------------------
+    # 委托状态变化：已报 / 部成 / 已成 / 已撤 / 废单（§6.2.1 on_stock_order）
+    # ------------------------------------------------------------------
+    def on_stock_order(self, o: Any) -> None:
+        """委托回报落库 + 按 order_id 同步台账状态。
+
+        流程：
+          1) normalize_order 规整为 OrderRecord（含 order_status 经 status_resolver 映射）；data_source=CALLBACK。
+          2) data_writer.upsert_order 幂等落库。
+          3) ledger.sync_status(order_id, 映射后的 OrderState, status_msg)：把委托终态同步回台账。
+        边界：order_id 缺失时不调用 sync_status（台账以 order_id 为关联键，无键无从同步）。
+        """
+        rec = normalize.normalize_order(
+            o,
+            account_id=self._account_id,
+            trade_date=self._trade_date_provider(),
+            data_source=DataSource.CALLBACK,
+            side_resolver=self._side_resolver,
+            status_resolver=self._status_resolver,
+        )
+        self._dw.upsert_order(rec)
+        # 同步台账状态：OrderStatus → OrderState 显式映射，未知态兜底 REPORTED（在途，不臆造终态）。
+        if rec.order_id is not None:
+            state = _STATUS_TO_STATE.get(rec.order_status, OrderState.REPORTED)
+            self._ledger.sync_status(rec.order_id, state, rec.status_msg)
+
+    # ------------------------------------------------------------------
+    # 下单失败：废单 / 拒单（回调独有，§6.2.1 on_order_error）
+    # ------------------------------------------------------------------
+    def on_order_error(self, e: Any) -> None:
+        """下单失败落库 + 同步台账 ERROR。
+
+        业务意图：on_order_error 是回调独有事实——下单未被交易所接受（废单 / 拒单），
+        隔日 query_* 不返回该失败态历史，若不落库则计划单凭空消失（§6.2.1）。
+        实现：因 XtOrderError 字段稀少（通常只有 order_id / error_id / error_msg，部分版本含
+        stock_code / order_remark），这里构造 OrderRecord 骨架：order_status=ERROR，
+        error_id / error_msg 来自 e，其余字段缺失则 getattr 容错落 None / 0（DDL 已设可空 / 缺省）。
+        幂等：同一 order_id upsert（唯一键 account_id+trade_date+order_id），不新增重复行；
+              若后续 on_stock_order 带来更明确终态，由后到覆盖语义接管（§6.5）。
+        边界：error_id 经 _to_int 容错；缺 stock_code 则 ts_code / qmt_stock_code 落 None 不抛错。
+        """
+        order_id = normalize._to_int(getattr(e, "order_id", None))
+        qmt_stock_code = getattr(e, "stock_code", None)
+        ts_code = normalize.identity.resolve_code(qmt_stock_code)
+        rec = OrderRecord(
+            account_id=self._account_id,
+            trade_date=self._trade_date_provider(),
+            ts_code=ts_code,                 # 多数版本 XtOrderError 不含 stock_code → None
+            qmt_stock_code=qmt_stock_code,
+            order_id=order_id,
+            trade_side=self._side_resolver(
+                getattr(e, "order_type", None), getattr(e, "offset_flag", None)
+            ),
+            order_volume=normalize._to_int(getattr(e, "order_volume", None)) or 0,
+            order_status=OrderStatus.ERROR,  # 回调独有：下单失败终态
+            error_id=normalize._to_int(getattr(e, "error_id", None)),
+            error_msg=getattr(e, "error_msg", None),
+            order_remark=getattr(e, "order_remark", None),  # 部分版本含，缺则 None
+            data_source=DataSource.CALLBACK,
+        )
+        self._dw.upsert_order(rec)
+        # 同步台账：把对应计划单推进 ERROR 终态（台账无该 order_id 则 sync_status 自身忽略）。
+        if order_id is not None:
+            self._ledger.sync_status(order_id, OrderState.ERROR, getattr(e, "error_msg", None))
+
+    # ------------------------------------------------------------------
+    # 撤单失败：留痕（回调独有，§6.2.1 on_cancel_error）
+    # ------------------------------------------------------------------
+    def on_cancel_error(self, e: Any) -> None:
+        """撤单失败留痕。
+
+        业务意图：撤单失败也是回调独有事实——仅在既有委托行追加 cancel_failed=1 + error_*，
+        绝不改 order_status 终态、不新增重复行（§6.2.1）。委托当前真实终态仍由 on_stock_order 决定。
+        边界：error_id 经 _to_int 容错；缺字段落 None。
+        """
+        order_id = normalize._to_int(getattr(e, "order_id", None))
+        error_id = normalize._to_int(getattr(e, "error_id", None))
+        error_msg = getattr(e, "error_msg", None)
+        # 委托唯一键以 order_id 关联，缺 order_id 无从定位既有行，记 warn 后返回（不臆造新行）。
+        if order_id is None:
+            self._logger.warn("on_cancel_error_missing_order_id", account_id=self._account_id)
+            return
+        self._dw.mark_cancel_failed(self._account_id, order_id, error_id, error_msg)
+
+    # ------------------------------------------------------------------
+    # 盘中资产 / 持仓快照（§6.2.1 仅刷新当日 INTRADAY 行，不进历史净值）
+    # ------------------------------------------------------------------
+    def on_stock_asset(self, a: Any) -> None:
+        """盘中资产回报落库 INTRADAY（§6.2.1 on_stock_asset）。
+
+        业务意图：盘中仅刷新当日 INTRADAY 行，CLOSE 才是净值曲线唯一来源（§6.2.2）；
+        故 snapshot_type 固定 INTRADAY，data_source 由 normalize 默认 QUERY 改写为 CALLBACK。
+        """
+        rec = normalize.normalize_account(
+            a,
+            account_id=self._account_id,
+            trade_date=self._trade_date_provider(),
+            snapshot_type=SnapshotType.INTRADAY,
+            data_source=DataSource.CALLBACK,
+        )
+        self._dw.upsert_account_daily(rec, SnapshotType.INTRADAY)
+
+    def on_stock_position(self, p: Any) -> None:
+        """盘中持仓回报落库 INTRADAY（§6.2.1 on_stock_position）。
+
+        业务意图：盘中仅刷新当日 INTRADAY 行；持仓复盘只认 CLOSE（§6.2.2）。
+        """
+        rec = normalize.normalize_position(
+            p,
+            account_id=self._account_id,
+            trade_date=self._trade_date_provider(),
+            snapshot_type=SnapshotType.INTRADAY,
+            data_source=DataSource.CALLBACK,
+        )
+        self._dw.upsert_position(rec, SnapshotType.INTRADAY)
+
+    # ------------------------------------------------------------------
+    # 断线检测：驱动重连 + 补采（§6.2.1 on_disconnected）
+    # ------------------------------------------------------------------
+    def on_disconnected(self) -> None:
+        """断线回报：告警并触发重连补采钩子（补采逻辑本身不在本模块，§6.2.3）。
+
+        业务意图：xttrader 断开不自动重连且退出即丢推送（§2.2 强约束），断线期间缺失的明细要靠
+        重连后的 query_* 全量补采（data_source=QUERY_BACKFILL）。本模块只负责告警 + 触发钩子，
+        实际补采由 on_disconnected_hook 注入的实现完成。
+        边界：钩子异常不应吞掉断线告警，但也不在此重试——交由钩子实现自行退避。
+        """
+        self._logger.warn("disconnected", account_id=self._account_id)
+        self._on_disconnected_hook()

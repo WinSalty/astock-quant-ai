@@ -1,0 +1,156 @@
+"""建仓策略接口与阈值口径（§4.1 / §4.2）。
+
+业务意图：
+- 把「按 action 判定如果…就买 / 弃」的逻辑抽象为统一策略接口 ``EntryStrategy``，每类 action
+  一个实现文件（chase_limit_up / chase_auction_strong / dip_buy_ma / leader_pullback / skip），
+  便于单测与扩展（§4.1 各策略一文件）。
+- 提供注册 / 选择机制（``register`` 装饰器 + ``get_strategy``），entry_router 据
+  (strategy_family, setup) 推出 action 后，按 action 取对应策略实例。
+- 统一竞价阈值取数口径（``resolve_thresholds``）：弱开 / 低吸档 / 高开超 三档阈值一律对接
+  settings（auction_abandon_pct / auction_lowbuy_pct_low/high / auction_overheat_pct），
+  缺省时回退用 plan.reasonable_open_low/high 折算的百分比；执行侧绝不臆造阈值（§4.2）。
+
+返回口径：策略 ``decide`` 返回 ``StrategyOutcome(action, limit_price, reason, order_phase)``，
+由 entry_router 组装成 EntryDecision（补 ts_code / 日期 / plan_volume / decided_at /
+factors_snapshot 等透传字段）。策略本身不产 EntryDecision，便于纯函数式单测。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Callable, Dict, Optional, Type
+
+from ...config.settings import Settings
+from ...contracts.enums import CentroidTrend, EntryAction, OrderPhase
+from ...contracts.models import AuctionSnapshot, PlanRow
+
+# 竞价整体不可得（降级 B）的 data_quality 标记码。
+# 口径与 auction.auction_factors.DQ_NO_TICK 一致（值 "NO_TICK"）：整帧 tick 缺失即降级 B。
+# 此处本地常量声明（不 import 前序 auction 层），避免跨业务模块耦合，只认这一字符串契约。
+DQ_NO_TICK = "NO_TICK"
+
+
+@dataclass(frozen=True)
+class StrategyOutcome:
+    """单个策略的判定产物（§4.2 买 / 弃）。
+
+    - action：命中买条件→对应 BUY 类 action；命中弃条件→SKIP。
+    - limit_price：BUY 的计划限价（涨停价 / 低吸价 / 竞价价）；SKIP / 缺价为 None。
+    - reason：买 / 弃理由（含命中的关键因子值，供复盘归因）。
+    - order_phase：AUCTION（竞价单，9:20 前）/ OPENING（开盘后追）；默认沿用策略语义。
+    """
+
+    action: EntryAction
+    reason: str
+    limit_price: Optional[Decimal] = None
+    order_phase: OrderPhase = OrderPhase.OPENING
+    # defer：本帧暂不决策（如竞价早期瞬时丢帧），entry_router 据此返回 None——不留痕、不锁幂等，
+    # 等后续帧重评，避免单帧抖动永久污染当日决策（评审 medium#4）。
+    defer: bool = False
+
+
+@dataclass(frozen=True)
+class AuctionThresholds:
+    """竞价三档阈值（均为「相对昨收的涨跌幅」小数，如 0.03 表示 +3%）。
+
+    口径（§4.2 / 信号侧竞价观察清单 3.2.2）：
+    - abandon_pct：弱开放弃线，open_pct 弱于此值（低于）即视为弱开。
+    - lowbuy_low / lowbuy_high：低吸档区间 [low, high]，open_pct 落区间内为低吸候选。
+    - overheat_pct：高开超线，open_pct 高于此值视为高开超（追高警惕 / 强开档下沿）。
+
+    缺省回退：settings 未配置某档时，用 plan.reasonable_open_low/high 折算昨收百分比兜底
+    （reasonable_open_* 是信号侧给的合理高开绝对价位，除以昨收减 1 即得百分比口径）。
+    """
+
+    abandon_pct: Optional[Decimal] = None
+    lowbuy_low: Optional[Decimal] = None
+    lowbuy_high: Optional[Decimal] = None
+    overheat_pct: Optional[Decimal] = None
+
+
+def _pre_close_of(plan: PlanRow, snap: AuctionSnapshot) -> Optional[Decimal]:
+    """取昨收基准：优先用快照 pre_close（实时帧权威），缺则无法折算回退百分比。"""
+    if snap.pre_close is not None and snap.pre_close != 0:
+        return snap.pre_close
+    return None
+
+
+def _abs_price_to_pct(price: Optional[Decimal], pre_close: Optional[Decimal]) -> Optional[Decimal]:
+    """把信号侧给的合理高开绝对价位折算成相对昨收的涨跌幅百分比（兜底口径）。
+
+    边界：价位或昨收缺失 / 昨收为 0 → 返回 None（无法折算，该档阈值视为未知）。
+    """
+    if price is None or pre_close is None or pre_close == 0:
+        return None
+    return (price - pre_close) / pre_close
+
+
+def resolve_thresholds(plan: PlanRow, snap: AuctionSnapshot, settings: Settings) -> AuctionThresholds:
+    """统一解析竞价三档阈值（§4.2 阈值对接，不在执行侧臆造）。
+
+    优先级：settings 显式配置 > plan.reasonable_open_low/high 折算回退 > None（未知，下游按缺失处理）。
+    - lowbuy_low/high 缺省回退：reasonable_open_low/high 折算的百分比（信号侧合理高开区间即低吸档）。
+    - overheat_pct 缺省回退：reasonable_open_high 折算的百分比（高开超出合理上沿即追高警惕）。
+    - abandon_pct 缺省回退：reasonable_open_low 折算的百分比（弱于合理下沿即弱开放弃）。
+    """
+    pre_close = _pre_close_of(plan, snap)
+    low_pct = _abs_price_to_pct(plan.reasonable_open_low, pre_close)
+    high_pct = _abs_price_to_pct(plan.reasonable_open_high, pre_close)
+    return AuctionThresholds(
+        # 弱开放弃线：配置优先，否则回退合理下沿折算（弱于合理下沿即弱开）。
+        abandon_pct=settings.auction_abandon_pct if settings.auction_abandon_pct is not None else low_pct,
+        # 低吸档下沿。
+        lowbuy_low=settings.auction_lowbuy_pct_low if settings.auction_lowbuy_pct_low is not None else low_pct,
+        # 低吸档上沿。
+        lowbuy_high=settings.auction_lowbuy_pct_high if settings.auction_lowbuy_pct_high is not None else high_pct,
+        # 高开超线：配置优先，否则回退合理上沿折算。
+        overheat_pct=settings.auction_overheat_pct if settings.auction_overheat_pct is not None else high_pct,
+    )
+
+
+def is_auction_degraded(snap: AuctionSnapshot) -> bool:
+    """判定该帧是否处于「竞价数据整体不可得」（降级 B，§4.6）。
+
+    口径：data_quality 含 NO_TICK（整帧 tick 缺失）→ 竞价因子整体不可得，
+    CHASE_AUCTION_STRONG 据此自动改判 OPENING（开盘后追），不在竞价段下竞价单。
+    """
+    return DQ_NO_TICK in (snap.data_quality or [])
+
+
+class EntryStrategy:
+    """建仓策略接口（§4.2）。各 action 一实现，统一 ``decide`` 签名。
+
+    decide(plan, snap, settings) -> StrategyOutcome：
+      - 命中买条件 → StrategyOutcome(action=本策略 BUY 类 action, limit_price, reason, order_phase)。
+      - 命中弃条件 → StrategyOutcome(action=SKIP, reason)。
+    """
+
+    # 该策略负责的 action（子类覆盖），用于注册表与日志留痕。
+    action: EntryAction
+
+    def decide(self, plan: PlanRow, snap: AuctionSnapshot, settings: Settings) -> StrategyOutcome:
+        raise NotImplementedError
+
+
+# —— 策略注册表（action → 策略类）：注册 / 选择机制（§4.1）——
+_REGISTRY: Dict[EntryAction, Type[EntryStrategy]] = {}
+
+
+def register(action: EntryAction) -> Callable[[Type[EntryStrategy]], Type[EntryStrategy]]:
+    """类装饰器：把策略类按其负责的 action 注册进全局表，供 entry_router 选择。"""
+
+    def _wrap(cls: Type[EntryStrategy]) -> Type[EntryStrategy]:
+        cls.action = action
+        _REGISTRY[action] = cls
+        return cls
+
+    return _wrap
+
+
+def get_strategy(action: EntryAction) -> EntryStrategy:
+    """按 action 取策略实例。未注册 action 视为编码缺陷，直接抛错（不静默放过）。"""
+    cls = _REGISTRY.get(action)
+    if cls is None:
+        raise KeyError(f"未注册的建仓策略 action={action}")
+    return cls()
