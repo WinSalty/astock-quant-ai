@@ -105,6 +105,9 @@ class Settings:
     order_ttl_seconds: int = 60               # 单最长存活时限（开盘单），竞价单到 9:25 定盘
     repository_unique_with_trade_date: bool = True  # §6.5 加固：明细唯一键是否纳入 trade_date
 
+    # —— 本地化数据栈（doc/05 单进程+SQLite）——
+    local_db_path: str = "qmt_local.db"       # QMT_LOCAL_DB_PATH：本机 SQLite 库路径（回流/台账/名单）
+
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Settings":
         """从环境变量映射构造配置。
@@ -162,6 +165,7 @@ class Settings:
             repository_unique_with_trade_date=_as_bool(
                 g("QMT_UNIQUE_WITH_TRADE_DATE") or "true"
             ),
+            local_db_path=g("QMT_LOCAL_DB_PATH") or "qmt_local.db",
         )
 
     def assert_safe_to_trade(self) -> None:

@@ -27,8 +27,23 @@ qmt_strategy/
 ├── risk/           # 风控护栏（§5.4，账户/单票阈值、FROZEN、空仓闸门、卖量钳制）
 ├── data_writer/    # 回流写库：规整+幂等upsert+仓储（第六节，qmt_* 四表，COALESCE 不空覆盖）
 ├── reconcile/      # 对账（§6.7 四类勾稽 + signal_trade_date 回填）
-└── app/            # 进程编排入口（run_forever 常驻）
+├── storage/        # 本机 SQLite 数据栈（doc/05 单进程+异步持久化：建表/mappers/写队列/仓储/台账/名单源/同步/装配器）
+├── adapters/       # 真实外部依赖适配器：xt_real.py 把 xtquant 翻译成 Protocol（唯一 import xtquant 处，仅 Windows 运行）
+└── app/            # 编排：main.py Engine（装配+生命周期）/ run.py 真实进程入口（仅目标机，含 TODO(实测)）
 ```
+
+## 真实部署（仅 Windows + miniQMT）
+
+引擎逻辑全部跨平台可测（fake/内存实现）；接真实环境只需在目标机补两处「适配器」：
+
+- `adapters/xt_real.py`：`RealXtTrader` / `make_stock_account` / `make_trader_callback` / `import_xtdata`
+  把 xtquant 翻译成本引擎的 `XtTraderLike` / `XtDataLike`；`TraderHolder` 让重连换 trader 不影响下单引用。
+  xtquant 全惰性 import——非 Windows 上 import 本模块不报错，调用工厂才抛清晰 RuntimeError。
+- `app/run.py`：`build_real_engine(settings)` 装配「本机 SQLite 栈 + 适配器 + Engine + 连接守护」，
+  `main()` 给出生命周期调用序列骨架。**所有「待实测」点（xtconstant 取值、回报字段名、order_stock 签名、
+  get_full_tick 键名、StockAccount 构造、DSN/调度）均以 `TODO(实测)` 标注**，到目标机用 `vars(obj)`/`dir(obj)` 核对后填实。
+
+数据流（doc/05）：盘前信号侧 watchlist 同步入本机 SQLite → 盘中内存权威 + 异步落盘（不阻塞交易）→ 盘后幂等同步回远端 MySQL。
 
 ## 运行单测
 
