@@ -30,24 +30,58 @@ from .main import Engine, EngineDeps, build_engine
 from .scheduler import DailyScheduler, parse_hhmm
 
 
-def _build_remote_repo(settings: Settings, logger):
-    """构造远端 MySQL 仓储（仅盘后同步用，写 qmt_* 四表）。
+def _build_signal_client(settings: Settings, logger):
+    """构造信号侧 HTTP 客户端（base_url + token + 超时），供盘后回流与盘前 watchlist 拉取共用。
 
-    缺 DSN → 返回 None（只本地、暂不同步，sync_to_remote 会跳过并告警）。
-    安全口径（doc/05 §4.3）：盘中不连远端；同步用仅 qmt_* 四表写权限的独立账号。
+    缺 base_url → 返回 None（不走 HTTP 通道）。token 经 resolve_signal_token（文件优先）解析；
+    未配 token 时记告警但仍返回 client（信号侧会以 401 兜底，便于本机连通性排查）。
     """
-    if not settings.mysql_dsn:
+    if not settings.signal_base_url:
         return None
-    from ..data_writer.repository import MySqlQmtRepository
+    from ..common.http_client import SignalHttpClient
 
-    def conn_factory():
-        import pymysql  # 惰性 import（CI/测试不强依赖）
+    token = settings.resolve_signal_token()
+    if not token:
+        logger.warn(
+            "signal_client_no_token",
+            note="QMT_SIGNAL_INTERNAL_TOKEN(_FILE) 未配置，HTTP 调用将被信号侧 401",
+        )
+    return SignalHttpClient(settings.signal_base_url, token, settings.http_timeout_seconds, logger)
 
-        # TODO(实测/落地)：解析 settings.mysql_dsn → pymysql.connect(host/port/user/password/db, charset, ...)。
-        #   用仅对 qmt_* 四表有 INSERT/UPDATE/SELECT 权限的独立账号；敏感信息不入库/不进日志（§6.10）。
-        raise NotImplementedError("TODO(落地)：由 QMT_MYSQL_DSN 解析并返回 pymysql.connect(...)")
 
-    return MySqlQmtRepository(conn_factory, unique_with_trade_date=settings.repository_unique_with_trade_date)
+def _build_remote_repo(settings: Settings, logger):
+    """构造盘后回流的「远端写端」（实现 contracts.QmtRepository），供 RemoteSyncJob 注入。
+
+    选路（doc/07）：
+    1) 优先 **HTTP 回流**：配了 signal_base_url → HttpIngestQmtRepository（POST /api/internal/qmt/ingest）；
+       盘中不连远端、回流逐行幂等 POST，是当前默认方案。
+    2) 回落 **直连 MySQL**（旧方案 A）：仅配了 QMT_MYSQL_DSN（未配 signal_base_url）时启用。
+    3) 都没配 → None（只本地、暂不同步，sync_to_remote 跳过并告警）。
+    """
+    # 1) HTTP 回流优先。
+    client = _build_signal_client(settings, logger)
+    if client is not None:
+        from ..storage.http_ingest_repository import HttpIngestQmtRepository
+
+        return HttpIngestQmtRepository(client, logger)
+
+    # 2) 回落直连 MySQL（保留旧通道，仅当显式配 DSN）。
+    if settings.mysql_dsn:
+        from ..data_writer.repository import MySqlQmtRepository
+
+        def conn_factory():
+            import pymysql  # 惰性 import（CI/测试不强依赖）
+
+            # TODO(实测/落地)：解析 settings.mysql_dsn → pymysql.connect(host/port/user/password/db, ...)。
+            #   用仅对 qmt_* 四表有 INSERT/UPDATE/SELECT 权限的独立账号；敏感信息不入库/不进日志（§6.10）。
+            raise NotImplementedError("TODO(落地)：由 QMT_MYSQL_DSN 解析并返回 pymysql.connect(...)")
+
+        return MySqlQmtRepository(
+            conn_factory, unique_with_trade_date=settings.repository_unique_with_trade_date
+        )
+
+    # 3) 未配任何远端写端。
+    return None
 
 
 def _make_session_id_provider():
@@ -107,6 +141,16 @@ def main() -> None:
 
     engine, stack, guard, clock, calendar = build_real_engine(settings, logger)
 
+    # —— 盘前 watchlist 拉取钩子（doc/07）：配了 signal_base_url 才启用——
+    # PREWARM 时先从信号侧 GET /internal/watchlist 拉当日名单落本机 SQLite，再让 engine.prewarm 装载。
+    watchlist_prefetch = None
+    signal_client = _build_signal_client(settings, logger)
+    if signal_client is not None:
+        from ..watchlist.remote_watchlist import WatchlistPrefetcher
+
+        prefetcher = WatchlistPrefetcher(signal_client, calendar, stack.save_watchlist, logger)
+        watchlist_prefetch = prefetcher.prefetch
+
     # —— 启动调度线程：按东八区钟点触发 盘前装载 / 竞价 / 盘中巡检 / 收盘对账 / 盘后同步（设计 §7.5）——
     # 调度细节全在 DailyScheduler；本入口只负责装配与「主线程 run_forever 接收回调」。
     scheduler = DailyScheduler(
@@ -115,6 +159,7 @@ def main() -> None:
         # TODO(落地)：sell_books_provider 注入「由 xtdata 实时盘口构造 {ts_code: OrderBook}」的函数后，
         #   盘中才会跑 run_sell_pass（卖出决策需实时盘口，§5.3）；缺省只跑 sweep_ttl（超时撤单巡检）。
         sell_books_provider=None,
+        watchlist_prefetch=watchlist_prefetch,
     )
     scheduler.start_thread()
     logger.info("scheduler_started")

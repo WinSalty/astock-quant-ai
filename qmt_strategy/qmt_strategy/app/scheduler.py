@@ -76,6 +76,7 @@ class DailyScheduler:
         sync_time: Optional[dtime] = None,
         poll_seconds: float = 15.0,
         sell_books_provider: Optional[Callable[[date], dict]] = None,
+        watchlist_prefetch: Optional[Callable[[date], int]] = None,
     ) -> None:
         self._engine = engine
         self._guard = guard
@@ -87,6 +88,9 @@ class DailyScheduler:
         self._sync_time = sync_time or _DEFAULT_SYNC
         self._poll_seconds = poll_seconds
         self._sell_books_provider = sell_books_provider
+        # 盘前 watchlist 拉取钩子（doc/07）：PREWARM 时先从信号侧 HTTP 拉当日名单落本机 SQLite，
+        # 再让 engine.prewarm 从本机库装载。缺省 None → 跳过（向后兼容：engine 读本机库已有/旧数据）。
+        self._watchlist_prefetch = watchlist_prefetch
         # 每个交易日已触发的「一次性」动作集合：key=date → {Action,...}
         self._fired: Dict[date, Set[Action]] = {}
         self._stopped = False
@@ -132,6 +136,16 @@ class DailyScheduler:
         if action == Action.PREWARM:
             if self._guard is not None:
                 self._guard.connect_and_subscribe()
+            # 先盘前拉取当日 watchlist 落本机 SQLite（失败不抛、降级无名单，详见 WatchlistPrefetcher），
+            # 再让 engine.prewarm 从本机库装载——保证 prewarm 读到的是当日最新名单。
+            if self._watchlist_prefetch is not None:
+                try:
+                    saved = self._watchlist_prefetch(today)
+                    self._logger.info("scheduler_watchlist_prefetched", trade_date=str(today), saved=saved)
+                except Exception as exc:  # noqa: BLE001 prefetch 内部已兜底，这里再保险一层不拖垮 PREWARM
+                    self._logger.error(
+                        "scheduler_watchlist_prefetch_error", trade_date=str(today), error=repr(exc)
+                    )
             self._engine.prewarm(today)
             self._mark(today, Action.PREWARM)
             self._logger.info("scheduler_prewarmed", trade_date=str(today))

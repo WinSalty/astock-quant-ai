@@ -22,6 +22,7 @@ _SENSITIVE = {
     "writeback_token",
     "ingest_token",
     "writeback_base_url",
+    "signal_internal_token",
 }
 
 
@@ -69,6 +70,12 @@ class Settings:
     # —— watchlist 契约来源（§1.2.1 二选一，默认 A 直读表）——
     watchlist_source: str = "DB"              # QMT_WATCHLIST_SOURCE：DB（A）/ HTTP（B）
     watchlist_api_url: Optional[str] = None   # QMT_WATCHLIST_API_URL：B 方案只读接口地址
+
+    # —— 信号侧 HTTP 内网接口（doc/07：盘前 GET watchlist + 盘后 POST 回流，两接口同源同 token）——
+    signal_base_url: Optional[str] = None     # QMT_SIGNAL_BASE_URL：信号侧服务根，如 http://1.2.3.4:8000
+    signal_internal_token: Optional[str] = None      # QMT_SIGNAL_INTERNAL_TOKEN：X-Internal-Token 值
+    signal_internal_token_file: Optional[str] = None  # QMT_SIGNAL_INTERNAL_TOKEN_FILE：token 落盘文件（优先）
+    http_timeout_seconds: float = 10.0        # QMT_HTTP_TIMEOUT_SECONDS：单次接口超时秒数
 
     # —— 7.1.3 竞价轮询与采集节奏 ——
     auction_poll_interval_sec: float = 3.0    # QMT_AUCTION_POLL_INTERVAL_SEC（默认 3s，§7.1.3）
@@ -140,6 +147,10 @@ class Settings:
             ingest_token=g("QMT_INGEST_TOKEN") or None,
             watchlist_source=(g("QMT_WATCHLIST_SOURCE") or "DB").upper(),
             watchlist_api_url=g("QMT_WATCHLIST_API_URL") or None,
+            signal_base_url=g("QMT_SIGNAL_BASE_URL") or None,
+            signal_internal_token=g("QMT_SIGNAL_INTERNAL_TOKEN") or None,
+            signal_internal_token_file=g("QMT_SIGNAL_INTERNAL_TOKEN_FILE") or None,
+            http_timeout_seconds=_as_float(g("QMT_HTTP_TIMEOUT_SECONDS")) or 10.0,
             auction_poll_interval_sec=_as_float(g("QMT_AUCTION_POLL_INTERVAL_SEC")) or 3.0,
             auction_window=g("QMT_AUCTION_WINDOW") or "09:15-09:25",
             intraday_snapshot_minutes=_as_int(g("QMT_INTRADAY_SNAPSHOT_MINUTES")) or 5,
@@ -167,6 +178,26 @@ class Settings:
             ),
             local_db_path=g("QMT_LOCAL_DB_PATH") or "qmt_local.db",
         )
+
+    def resolve_signal_token(self) -> Optional[str]:
+        """解析信号侧内网接口 token：优先落盘文件（不入 env/日志），其次环境变量；均无返回 None。
+
+        与 AGENTS.md 安全口径一致：token 不硬编码、不进日志（redacted() 已脱敏 signal_internal_token）；
+        生产建议用 QMT_SIGNAL_INTERNAL_TOKEN_FILE 指向本机文件，避免明文落 .env。
+        """
+        token_file = self.signal_internal_token_file
+        if token_file:
+            try:
+                with open(token_file, encoding="utf-8") as fh:
+                    token = fh.read().strip()
+                if token:
+                    return token
+            except OSError:
+                # 文件不存在/不可读：不抛，回落环境变量（缺则 None，由调用方按未配置处理）。
+                pass
+        if self.signal_internal_token:
+            return self.signal_internal_token.strip()
+        return None
 
     def assert_safe_to_trade(self) -> None:
         """下单前安全校验（§7.1.6）：竞价择时开关只有在显式置真时才允许，
