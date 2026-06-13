@@ -15,18 +15,19 @@ from __future__ import annotations
 import itertools
 import os
 import time
-from datetime import date
+from datetime import date, time as dtime
 from typing import Optional, Tuple
 
 from ..adapters import xt_real
 from ..auction.tick_source import XtdataTickSource
 from ..common.logger import StructLoggerImpl
-from ..common.time_utils import SystemClock, east8_trade_date
+from ..common.time_utils import SystemClock
 from ..common.trade_calendar import WeekdayTradeCalendar
 from ..config.settings import Settings
 from ..connection.connection_guard import ConnectionGuard
 from ..storage.local_stack import LocalStorage
 from .main import Engine, EngineDeps, build_engine
+from .scheduler import DailyScheduler, parse_hhmm
 
 
 def _build_remote_repo(settings: Settings, logger):
@@ -55,8 +56,10 @@ def _make_session_id_provider():
     return lambda: next(seq)
 
 
-def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalStorage, ConnectionGuard]:
-    """装配真实引擎：本地 SQLite 栈 + xtquant 适配器 + Engine + 连接守护。返回 (engine, stack, guard)。
+def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalStorage, ConnectionGuard, SystemClock, object]:
+    """装配真实引擎：本地 SQLite 栈 + xtquant 适配器 + Engine + 连接守护。
+
+    返回 (engine, stack, guard, clock, calendar)——后两者供 main 装配调度器复用同一时钟/日历。
 
     仅目标机可成功（xtquant 工厂在此触发）；缺 xtquant 时 make_stock_account/import_xtdata 抛清晰 RuntimeError。
     """
@@ -93,7 +96,7 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
         clock=clock, logger=logger, session_id_provider=_make_session_id_provider(),
         on_reconnect_backfill=engine.on_reconnect_backfill,     # 重连后触发当日 query_* 补采
     )
-    return engine, stack, guard
+    return engine, stack, guard, clock, calendar
 
 
 def main() -> None:
@@ -102,33 +105,30 @@ def main() -> None:
     logger = StructLoggerImpl()
     logger.info("engine_boot", config=settings.redacted())     # 脱敏后才打印（§7.1 安全口径）
 
-    engine, stack, guard = build_real_engine(settings, logger)
+    engine, stack, guard, clock, calendar = build_real_engine(settings, logger)
 
-    # —— 盘前：建连重订阅（connect 返 0 才就绪，§2.2）+ 装载当日名单（需信号侧已盘前同步入本机 SQLite）——
-    if not guard.connect_and_subscribe():
-        logger.error("engine_not_ready_exit", reason="connect/subscribe 未就绪")
-        stack.stop()
-        return
-    today = east8_trade_date(SystemClock().now_utc())
-    engine.prewarm(today)
+    # —— 启动调度线程：按东八区钟点触发 盘前装载 / 竞价 / 盘中巡检 / 收盘对账 / 盘后同步（设计 §7.5）——
+    # 调度细节全在 DailyScheduler；本入口只负责装配与「主线程 run_forever 接收回调」。
+    scheduler = DailyScheduler(
+        engine, guard, stack, clock, logger, calendar=calendar,
+        close_time=parse_hhmm(settings.close_snapshot_time, dtime(15, 5)),
+        # TODO(落地)：sell_books_provider 注入「由 xtdata 实时盘口构造 {ts_code: OrderBook}」的函数后，
+        #   盘中才会跑 run_sell_pass（卖出决策需实时盘口，§5.3）；缺省只跑 sweep_ttl（超时撤单巡检）。
+        sell_books_provider=None,
+    )
+    scheduler.start_thread()
+    logger.info("scheduler_started")
 
-    # ============================ 调度（TODO：环境相关，由任务计划 / 调度线程驱动）============================
-    # 设计 §1.4/§7.5 的时点序列（东八区）；run_forever 接收回调须常驻，故下列时点动作应在【独立线程/定时器】触发：
-    #   ~09:00  盘前：guard 重连 + engine.prewarm(today)
-    #   09:15-09:25  竞价：engine.run_auction()（仅 QMT_AUCTION_TIMING_ENABLED 实测通过后才真正下竞价单）
-    #   盘中周期  engine.sweep_ttl()（超时撤单巡检）
-    #   可卖日盘中  engine.run_sell_pass(today, books, session=...)（books 由 xtdata 实时盘口构造，TODO）
-    #   15:05/15:30  收盘：engine.close_batch(today)（先 flush 再对账）
-    #   盘后  stack.sync_to_remote(today)（本机 SQLite → 远端 MySQL 幂等同步，须当日完成）
-    #   盘后  stack.flush() / stack.stop()（停机 drain）
-    # TODO(落地)：实现上述调度（推荐：一个调度线程按东八区钟点触发 + Windows 任务计划每日开盘前拉起/重连）。
-    # =======================================================================================================
-
-    # —— 常驻：接收 xttrader 推送（成交/委托/资产/持仓回调），进程退出即丢推送（§2.2）——
-    # connect_and_subscribe 成功后 current_trader 已就绪；run_forever 阻塞驻留接收回调。
-    trader = guard.current_trader
-    if trader is not None:
-        trader.run_forever()
+    # —— 主线程常驻：等连接就绪（调度器 PREWARM 阶段会建连）后 run_forever 接收回调；进程退出即丢推送（§2.2）——
+    # 注：run_forever / 断线重连(on_disconnected→guard.reconnect 换 trader) 的交互依 QMT 运行期行为，
+    #     具体阻塞/返回语义须目标机实测，这里给出常驻骨架（TODO(实测)）。
+    while True:
+        if guard.ready and guard.current_trader is not None:
+            try:
+                guard.current_trader.run_forever()  # 阻塞接收回调；返回（断线）后回到循环等待重连
+            except Exception as e:  # noqa: BLE001 run_forever 异常不应直接终止进程
+                logger.error("run_forever_error", error=repr(e))
+        time.sleep(5)
 
 
 if __name__ == "__main__":
