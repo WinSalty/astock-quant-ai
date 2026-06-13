@@ -89,15 +89,24 @@ class InMemoryQmtRepository:
     ) -> None:
         """on_cancel_error：在既有委托行追加 cancel_failed=1 + error_*，不改 order_status 终态（§6.2.1）。
 
-        现行键可能不含 trade_date，这里对所有匹配 (account_id, order_id) 的行打标（通常仅当日一行）。
+        跨日防误标（评审 medium#5）：order_id 可跨日复用，撤单失败只针对【当日】那笔委托。
+        故只对该 (account_id, order_id) 的【最新交易日】行打标，绝不波及历史同号委托行。
         """
-        for key, o in self._orders.items():
-            if o.account_id == account_id and o.order_id == order_id:
-                o.cancel_failed = True
-                if error_id is not None:
-                    o.error_id = error_id
-                if error_msg is not None:
-                    o.error_msg = error_msg
+        matches = [
+            o for o in self._orders.values()
+            if o.account_id == account_id and o.order_id == order_id
+        ]
+        if not matches:
+            return
+        latest_date = max(o.trade_date for o in matches)
+        for o in matches:
+            if o.trade_date != latest_date:
+                continue
+            o.cancel_failed = True
+            if error_id is not None:
+                o.error_id = error_id
+            if error_msg is not None:
+                o.error_msg = error_msg
 
     # —— 对账只读 ——
     def get_orders(self, account_id: str, trade_date: date) -> List[OrderRecord]:

@@ -83,6 +83,12 @@ class EngineDeps:
     prior_provider: Callable[[str, date], Optional[SignalPrior]] = field(
         default=lambda ts, today: None
     )
+    # 本地下单台账（可注入）：本地化方案注入 PersistentLocalLedger（SQLite 持久 + 重启重建）；
+    # 缺省 None → Engine 用内存台账（向后兼容，离线/单测用）。
+    ledger: Optional[Any] = None
+    # 持久化 flush 钩子（可注入）：本地化方案注入 LocalStorage.flush；
+    # close_batch 在对账前调用它，保证「写后异步」的回流已落盘、对账读到一致数据（doc/05 关键不变量）。
+    flush_hook: Callable[[], Any] = field(default=lambda: None)
 
 
 class Engine:
@@ -100,7 +106,8 @@ class Engine:
         self._today_provider: Callable[[], date] = lambda: east8_trade_date(self._clock.now_utc())
 
         # —— 回流写端 + 本地台账 ——
-        self._ledger = InMemoryLocalLedger()
+        # 台账可注入（本地化方案注入 PersistentLocalLedger 以持久 + 重启重建）；缺省内存台账。
+        self._ledger = deps.ledger if deps.ledger is not None else InMemoryLocalLedger()
         self._data_writer = DataWriterImpl(deps.repository, deps.logger, deps.clock)
 
         # —— 名单 / 持仓 / 风控 / 决策 ——
@@ -323,6 +330,9 @@ class Engine:
         """收盘批次（§6.2.2）：全量明细兜底 + CLOSE 资产/持仓快照，随后触发对账（§6.7）。"""
         td = trade_date or self._today_provider()
         self._snapshot.run_close(td)
+        # 对账前 flush 持久化队列：收盘兜底 + 盘中回调都是「写后异步」入队，必须先落盘，
+        # 否则对账（读本机 SQLite）会读到不完整数据（doc/05 关键不变量「当日完成 / 一致读」）。
+        self._deps.flush_hook()
         report = self._reconcile.run(td)
         self._logger.info(
             "engine_close_done",
