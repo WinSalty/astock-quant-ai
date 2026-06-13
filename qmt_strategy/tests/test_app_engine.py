@@ -157,6 +157,29 @@ def test_empty_position_state_blocks_open():
     assert deps.trader.order_calls == []                # 空仓禁开新仓
 
 
+def test_buy_blocked_on_account_drawdown_breach():
+    """评审 P0-B1/B2：账户日内回撤击穿 → 买入路径经 risk.gate 冻结、不开新仓。
+
+    修复前买入完全绕过 risk.gate，账户熔断对开仓零作用；此用例证明回撤击穿能挡住新开仓。
+    """
+    deps = _deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_ACCOUNT_DRAWDOWN_LIMIT": "0.05"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)                  # 抓取日初基线 total_asset=100 万
+    deps.trader._cash = 900_000         # 当前总资产跌到 90 万（回撤 10% > 5% 限）
+    eng._router_sink(_strong_auction_snap())
+    assert deps.trader.order_calls == []   # 回撤击穿 → 不开新仓
+
+
+def test_buy_allowed_when_drawdown_within_limit():
+    """回撤未击穿（小于阈值）→ 正常开新仓（证明不是无脑冻结）。"""
+    deps = _deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_ACCOUNT_DRAWDOWN_LIMIT": "0.20"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    deps.trader._cash = 950_000         # 回撤 5% < 20% 限
+    eng._router_sink(_strong_auction_snap())
+    assert len(deps.trader.order_calls) == 1
+
+
 def test_kill_switch_blocks_order_even_if_timing_on():
     """全局熔断：kill_switch=True → 即便竞价择时开启也不下单（§7.1.5 双保险）。"""
     deps = _deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_KILL_SWITCH": "true"})

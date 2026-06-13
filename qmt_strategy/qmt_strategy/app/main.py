@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional
 
 from ..common.time_utils import east8_trade_date
@@ -155,6 +156,9 @@ class Engine:
         # 行情 / 下单通道健康标志（断线时置 False，恢复后置 True；供 risk.gate 安全默认）。
         self._market_feed_ok = True
         self._trade_conn_ok = True
+        # 日初总资产基线（评审 P0-B2）：prewarm 抓取，供 risk.gate 算账户日内回撤击穿。
+        # None 表示未取到基线（查询失败/未装载）→ 回撤口径返回 None，不凭空冻结（其它闸门仍生效）。
+        self._day_open_equity: Optional[Decimal] = None
 
     # ------------------------------------------------------------------
     # 对外暴露（供 main / 连接守护注册回调 / 调度）
@@ -177,6 +181,8 @@ class Engine:
         self._market_state = self._extract_market_state(ctx)
         # 推进持仓状态：跨买入日 LOCKED_T1 → HOLDING，并刷新先验挂接（§5.6）。
         self._position.refresh_state(today)
+        # 抓取日初总资产基线（评审 P0-B2）：供盘中 risk.gate 算账户日内回撤击穿。
+        self._capture_day_open_equity()
         self._logger.info(
             "engine_prewarmed",
             trade_date=str(today),
@@ -196,6 +202,67 @@ class Engine:
             if entry.market_state is not None:
                 return entry.market_state
         return None
+
+    # ------------------------------------------------------------------
+    # 账户级风控输入（评审 P0-B2：喂给 risk.gate，使账户回撤击穿真正触发 FREEZE）
+    # ------------------------------------------------------------------
+    def _capture_day_open_equity(self) -> None:
+        """抓取日初总资产作回撤基线（prewarm 调用）。查询失败 → None（不凭空冻结，安全默认）。"""
+        try:
+            asset = self._deps.trader.query_stock_asset(self._deps.account)
+            ta = getattr(asset, "total_asset", None)
+            self._day_open_equity = Decimal(str(ta)) if ta is not None else None
+        except Exception as exc:  # noqa: BLE001 资产查询失败不阻断盘前装载，回撤口径降级为 None
+            self._day_open_equity = None
+            self._logger.warn("engine_day_open_equity_failed", error=str(exc))
+
+    def _account_drawdown(self) -> Optional[Decimal]:
+        """账户日内回撤 = max(0, (日初总资产 − 当前总资产) / 日初总资产)，正数表示亏损幅度。
+
+        口径：总资产(total_asset=现金+市值)较日初的回撤，综合承载已实现+浮动亏损，故 account_realized_loss
+        不再单列（喂 None）。无基线 / 查询失败 → None（不凭空冻结，FREEZE 交由其它确定可信的闸门）。
+        """
+        if self._day_open_equity is None or self._day_open_equity <= 0:
+            return None
+        try:
+            asset = self._deps.trader.query_stock_asset(self._deps.account)
+            cur = getattr(asset, "total_asset", None)
+            if cur is None:
+                return None
+            cur_dec = Decimal(str(cur))
+        except Exception as exc:  # noqa: BLE001 查询失败 → 回撤未知，返回 None
+            self._logger.warn("engine_account_drawdown_query_failed", error=str(exc))
+            return None
+        dd = (self._day_open_equity - cur_dec) / self._day_open_equity
+        return dd if dd > 0 else Decimal("0")
+
+    def _open_blocked_by_risk(self, ts_code: str) -> bool:
+        """买入前风控总闸（评审 P0-B1/B2）：返回 True 表示禁止开新仓。
+
+        判据（任一命中即禁开）：
+        - risk.gate 非 ALLOW：行情/下单中断 FREEZE、账户回撤击穿 FREEZE、空仓 SELL_ONLY_HOLD；
+        - is_open_blocked(market_state)：退潮/冰点/空仓等情绪周期禁开（市场级，§5.4.2）。
+        注意：本闸门只管「开新仓」；卖出（风险减仓）不受账户回撤/空仓闸门影响，避免冻结必要的止损出场，
+        故 run_sell_pass 的 gate 仍只用行情/下单中断口径（不喂账户回撤）。
+        """
+        verdict = self._risk.gate(
+            market_state=self._market_state,
+            market_feed_ok=self._market_feed_ok,
+            trade_conn_ok=self._trade_conn_ok,
+            account_drawdown=self._account_drawdown(),
+            account_realized_loss=None,  # 由 total_asset 回撤综合承载，不单列
+            unit_float_loss=None,        # 开新仓为全新标的，无既有浮亏
+        )
+        if verdict.verdict != RiskVerdict.ALLOW or self._risk.is_open_blocked(self._market_state):
+            self._logger.info(
+                "engine_open_blocked_by_risk",
+                ts_code=ts_code,
+                verdict=str(verdict.verdict),
+                market_state=self._market_state,
+                reason=verdict.reason,
+            )
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # 成交回报 → 持仓状态机回写（评审 P0-A2 修复）
@@ -277,6 +344,10 @@ class Engine:
                 ts_code=decision.ts_code,
                 reason="open_new_position_allowed=False",
             )
+            return
+        # 风控总闸（评审 P0-B1/B2）：买入也必须过 risk.gate——账户日内回撤击穿 / 行情或下单中断 /
+        # 空仓 / 退潮冰点 → 禁开新仓。原实现买入路径完全绕过 gate，账户熔断对开仓零作用。
+        if self._open_blocked_by_risk(decision.ts_code):
             return
         # 竞价择时闸门：竞价单仅在实测开关打开时下单，否则只采集留痕（§7.1.6）。
         if decision.order_phase == OrderPhase.AUCTION and not self._settings.auction_timing_enabled:
@@ -364,7 +435,7 @@ class Engine:
         if action_type == SellActionType.CLEAR:
             decision_vol = unit.can_use_volume
         else:
-            ratio = reduce_ratio if reduce_ratio is not None else __import__("decimal").Decimal("0.5")
+            ratio = reduce_ratio if reduce_ratio is not None else Decimal("0.5")
             decision_vol = int(unit.can_use_volume * ratio)
         sell_vol = self._risk.clamp_sell_volume(decision_vol, unit.can_use_volume)
         if sell_vol <= 0:
