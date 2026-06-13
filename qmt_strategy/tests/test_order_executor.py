@@ -418,6 +418,32 @@ def test_skip_action_no_order(clock_0916):
     assert "order_skip_decision" in logger.events()
 
 
+def test_max_orders_per_day_blocks_overtrading(clock_0916):
+    """评审 P0-B3：单日下单次数达上限 → 后续新开仓被拦、不再调用 order_stock。"""
+    trader = FakeTrader()
+    logger = RecordingLogger()
+    ex = _executor(trader, clock_0916, settings=Settings(max_orders_per_day=2), logger=logger)
+    # 三个不同标的（避开同标的幂等短路），上限 2。
+    assert ex.place(_decision(ts_code="600036.SH")) is not None
+    assert ex.place(_decision(ts_code="600000.SH")) is not None
+    assert len(trader.order_calls) == 2
+    # 第 3 个标的超限 → 拦截、不下单、留痕。
+    assert ex.place(_decision(ts_code="000001.SZ")) is None
+    assert len(trader.order_calls) == 2
+    assert "order_max_orders_per_day_block" in logger.events()
+
+
+def test_max_orders_per_day_idempotent_hit_not_counted(clock_0916):
+    """幂等命中（重复推同一计划）不占下单次数配额：上限 1 时同标的二次推仍返回既有单。"""
+    trader = FakeTrader()
+    ex = _executor(trader, clock_0916, settings=Settings(max_orders_per_day=1))
+    biz1 = ex.place(_decision(ts_code="600036.SH"))
+    assert biz1 is not None and len(trader.order_calls) == 1
+    # 同标的同计划重复推 → 幂等命中返回既有单号，不新下单、不占配额。
+    biz2 = ex.place(_decision(ts_code="600036.SH"))
+    assert biz2 == biz1 and len(trader.order_calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # 计划股数现算 + 资金不足
 # ---------------------------------------------------------------------------

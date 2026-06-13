@@ -78,6 +78,10 @@ class OrderExecutor:
         # 业务意图：on_ttl_expired 只收到 biz_no，需据此回查原决策因子判定「买不进」归因 + 转次优；
         # 同样放内存，避免改动锁定的台账契约。
         self._decision_by_biz: Dict[str, EntryDecision] = {}
+        # 单日下单次数计数（评审 P0-B3）：key=target_trade_date → 当日已真实发出的下单次数。
+        # 业务意图：信号异常放量 / 重复推送 / 转次优链失控时，限制单日开仓次数，防止超频下单耗尽资金。
+        # 只计真实 order_stock 发出（含同步失败，二者都占「下单次数」配额），幂等命中不计。
+        self._orders_count_by_date: Dict[Any, int] = {}
 
     # ------------------------------------------------------------------
     # (1) 业务唯一单号
@@ -166,6 +170,21 @@ class OrderExecutor:
             )
             return existing.biz_order_no
 
+        # —— 单日下单次数上限（评审 P0-B3）：超限不再开新仓，只留痕 ——
+        # 放在幂等命中之后：幂等命中（重复推/重启重放）返回既有单，不占配额；只有真正会新发的单才计数。
+        max_orders = self._settings.max_orders_per_day
+        if max_orders is not None:
+            placed_today = self._orders_count_by_date.get(decision.target_trade_date, 0)
+            if placed_today >= max_orders:
+                self._logger.warn(
+                    "order_max_orders_per_day_block",
+                    ts_code=decision.ts_code,
+                    account_id=self._account_id,
+                    placed_today=placed_today,
+                    limit=max_orders,
+                )
+                return None
+
         limit_price = decision.limit_price
 
         # —— 计划股数：优先用决策给定，否则按账户可用资金现算 ——
@@ -218,6 +237,12 @@ class OrderExecutor:
             float(limit_price) if limit_price is not None else 0.0,
             decision.strategy_family or "",
             remark,
+        )
+
+        # 单日下单次数 +1（评审 P0-B3）：真实发出 order_stock 即占配额（含同步失败，下同），
+        # 防止转次优链 / 重复推送导致超频下单；幂等命中不会走到这里，故不重复计。
+        self._orders_count_by_date[decision.target_trade_date] = (
+            self._orders_count_by_date.get(decision.target_trade_date, 0) + 1
         )
 
         # —— 同步下单失败（order_stock 返回 <0 / None）：标 ERROR，绝不置 SUBMITTED（评审 medium#9）。——
