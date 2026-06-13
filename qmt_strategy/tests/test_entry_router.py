@@ -342,6 +342,61 @@ def test_skip_action_unmatched_family():
     assert decision.limit_price is None
 
 
+# ---------------------------------------------------------------------------
+# 评审 P0-A1：信号侧英文枚举 strategy_family(DABAN/BANLU/DIXI) + 真实 setup 必须能路由到非 SKIP
+# （历史实现只匹配中文关键词 → 英文枚举全部落 SKIP、永不开仓；这里用生产真实取值域回归）
+# ---------------------------------------------------------------------------
+def test_english_family_daban_chain_routes_chase_limit_up():
+    """DABAN + setup「连板打板」（非首板/竞价）→ 打板跟买（顶板封单稳则买）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="DABAN", setup="连板打板", market_state="启动",
+                         limit_up_price=Decimal("11.00"))
+    snap = _snap(is_limit_up=True, last_price=Decimal("11.00"),
+                 seal_to_float_ratio=Decimal("0.08"), centroid_trend=CentroidTrend.UP)
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.CHASE_LIMIT_UP
+
+
+def test_english_family_daban_first_board_routes_chase_auction_strong():
+    """DABAN + setup「首板打板」（竞价定方向）→ 竞价强开追。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="DABAN", setup="首板打板", market_state="启动")
+    snap = _snap(open_pct=Decimal("0.06"), auction_vol_ratio=Decimal("0.5"),
+                 centroid_trend=CentroidTrend.UP, last_price=Decimal("10.60"))
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.CHASE_AUCTION_STRONG
+
+
+def test_english_family_dixi_routes_dip_buy_ma():
+    """DIXI + setup「高位低吸」→ 低吸。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="DIXI", setup="高位低吸", market_state="震荡",
+                         reasonable_open_low=Decimal("9.90"))
+    snap = _snap(open_pct=Decimal("-0.005"), centroid_trend=CentroidTrend.UP, last_price=Decimal("9.95"))
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.DIP_BUY_MA
+
+
+def test_english_family_banlu_routes_chase_family_not_skip():
+    """BANLU（半路）+ setup「连板半路」→ 归打板族（打板跟买），绝不再落 SKIP。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="BANLU", setup="连板半路", market_state="启动",
+                         limit_up_price=Decimal("11.00"))
+    snap = _snap(is_limit_up=True, last_price=Decimal("11.00"),
+                 seal_to_float_ratio=Decimal("0.08"), centroid_trend=CentroidTrend.UP)
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.CHASE_LIMIT_UP
+
+
+def test_block_keyword_not_overmatched():
+    """P2：含「板」但非打板战法（如「板块轮动」）不再被误路由到打板跟买 → SKIP。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="板块轮动", setup="题材发酵", market_state="启动")
+    snap = _snap(open_pct=Decimal("0.02"), centroid_trend=CentroidTrend.UP, last_price=Decimal("10.20"))
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.SKIP
+
+
 def test_skip_action_traded_via_strategy_registry():
     """SKIP（买/弃对称的「买」侧不存在）：SKIP 策略实例恒产 SKIP（验证注册表覆盖第五类）。"""
     from qmt_strategy.entry.strategies import base as sb

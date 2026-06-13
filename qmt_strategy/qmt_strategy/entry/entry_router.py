@@ -33,6 +33,31 @@ from .strategies import skip as _skip  # noqa: F401
 # 仓位测算回调：给定 (plan, limit_price) 返回计划股数；为 None 则交由 order_executor 按账户算。
 PositionSizer = Callable[[PlanRow, Decimal], int]
 
+# —— 信号侧 strategy_family 英文枚举 → 中文战法词 归一表（评审 P0-A1 修复）——
+# 业务背景：信号侧 limit_up_leader_scoring_service 产出的 strategy_family 是英文枚举
+# DABAN/BANLU/DIXI（原样经 HTTP 契约透传到执行侧），而本路由历史实现只按「中文关键词包含」匹配。
+# 二者取值域不一致 → 英文枚举对任何中文关键词都不命中 → 所有计划票一律落 SKIP、永不开新仓
+# （执行侧建仓闭环空转）。这里把英文枚举先归一为中文战法词，再与 setup 内嵌的中文战法词
+# （信号侧 setup 形如「首板打板/连板半路/高位低吸」）统一口径后路由。
+# 边界：半路族(BANLU)当前无独立执行策略，归入「打板族」由 chase 策略的顶板/强开买条件二次把关
+#       （未顶板/未强开则各策略自行判弃，故归类保守、不会凭空追买）；如需独立半路战法须新增策略并在此调整。
+_FAMILY_EN_TO_CN = {
+    "DABAN": "打板",
+    "BANLU": "半路",
+    "DIXI": "低吸",
+}
+
+
+def _normalize_family(family_raw: str) -> str:
+    """把信号侧英文枚举 strategy_family 归一为中文战法词；非枚举值（中文/自由文本）原样返回。
+
+    口径：仅对精确等于 DABAN/BANLU/DIXI（忽略大小写与首尾空白）的值做翻译，避免误伤含这些子串的
+    自由文本；中文输入（旧口径/单测）原样透传，保证向后兼容。
+    """
+    key = (family_raw or "").strip().upper()
+    return _FAMILY_EN_TO_CN.get(key, family_raw)
+
+
 # —— (strategy_family, setup) → action 路由表（§4.2 路由维度）——
 # 业务口径：先按战法大类 + 形态精确匹配；未命中再按战法大类粗匹配（_FAMILY_DEFAULT）。
 # 键用「关键词包含」匹配（信号侧用语可能带前后缀），故存为关键词对而非精确等值。
@@ -188,27 +213,38 @@ class EntryRouter:
         """按 (family, setup) 推建仓 action（§4.2 路由维度）。
 
         口径（关键词包含匹配，兼容信号侧用语带前后缀）：
-          - 打板 / 连板接力 → CHASE_LIMIT_UP；打板 + 竞价 / 首板（竞价定方向）→ CHASE_AUCTION_STRONG。
+          - 打板 / 半路 / 连板接力 → CHASE_LIMIT_UP；打板 + 竞价 / 首板（竞价定方向）→ CHASE_AUCTION_STRONG。
           - 低吸 / 均线 / 回踩 → DIP_BUY_MA。
           - 龙回头 / 龙头 + 高位回踩 / 分歧转一致 → LEADER_PULLBACK。
           - 未匹配任何战法 → SKIP（不臆造动作）。
+
+        评审修复：
+          - P0-A1：family 先经 _normalize_family 把英文枚举(DABAN/BANLU/DIXI)归一为中文战法词，
+            否则信号侧英文枚举对中文关键词全不命中 → 全部 SKIP；同时把 setup 内嵌的中文战法词
+            （首板打板/连板半路/高位低吸…）并入匹配源 hay，使 family 与 setup 互为兜底。
+          - P2(路由「板」过宽)：去掉裸 `"板" in family` 兜底，改用受控词表(打板/连板/半路)，
+            避免「板块轮动」等含「板」自由文本被误路由到打板跟买。
         """
-        family = _family_of(plan)
+        # family 归一：英文枚举→中文战法词；中文/自由文本原样保留（向后兼容旧口径与单测）。
+        family = _normalize_family(_family_of(plan))
         setup = _setup_of(plan)
+        # 匹配源：归一后的战法词 + setup（信号侧 setup 已含中文战法词，二者互为补充/兜底）。
+        hay = f"{family} {setup}"
 
         # —— 低吸族 ——
-        if ("低吸" in family) or ("均线" in setup) or ("回踩" in setup and "龙" not in family):
+        if ("低吸" in hay) or ("均线" in setup) or ("回踩" in setup and "龙" not in hay):
             return EntryAction.DIP_BUY_MA
 
-        # —— 龙回头族 ——
+        # —— 龙回头族 ——（角色类，按 family/ setup 的龙头语义匹配）
         if ("龙回头" in family) or ("龙" in family and ("高位回踩" in setup or "分歧" in setup)):
             return EntryAction.LEADER_PULLBACK
 
-        # —— 打板族：竞价定方向（首板 / 竞价）走竞价强开追，连板接力走打板跟买。——
-        if "打板" in family or "连板" in family or "板" in family:
+        # —— 打板 / 半路族：竞价定方向（首板 / 竞价）走竞价强开追，连板接力 / 半路走打板跟买。——
+        # 受控词表（不含裸「板」）：打板 / 连板 / 半路。
+        if ("打板" in hay) or ("连板" in hay) or ("半路" in hay):
             if "竞价" in setup or "首板" in setup:
                 return EntryAction.CHASE_AUCTION_STRONG
-            # 连板接力 / 其余打板形态 → 打板跟买。
+            # 连板接力 / 半路 / 其余打板形态 → 打板跟买。
             return EntryAction.CHASE_LIMIT_UP
 
         # —— 未匹配战法：不臆造动作，直接放弃。——
