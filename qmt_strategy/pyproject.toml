@@ -10,7 +10,10 @@ requires-python = ">=3.9"
 # 说明：运行期真实依赖 xtquant（xttrader/xtdata），仅 Windows + miniQMT 可用，
 #       故不写入 install_requires；本仓库通过 Protocol 抽象 xtquant，单测用 fake 对象，
 #       可在任意平台（含 macOS/Linux）跑通逻辑与单测，详见 README 与 doc/04 开发计划。
-dependencies = []
+# tzdata：本项目时间口径用 zoneinfo.ZoneInfo("Asia/Shanghai")。Windows 无系统 IANA 时区库，
+#         zoneinfo 需 tzdata 包兜底（否则 import time_utils 即 ZoneInfoNotFoundError）；
+#         在 Linux/macOS 上 zoneinfo 优先用系统库，tzdata 仅作无害兜底。执行侧目标机是 Windows，故列为硬依赖。
+dependencies = ["tzdata"]
 
 [project.optional-dependencies]
 # 直连 MySQL 写库（方案 A）时需要；CI/单测默认用内存仓储，不强依赖。

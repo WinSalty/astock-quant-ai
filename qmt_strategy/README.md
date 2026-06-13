@@ -45,6 +45,10 @@ qmt_strategy/
 
 数据流（doc/05）：盘前信号侧 watchlist 同步入本机 SQLite → 盘中内存权威 + 异步落盘（不阻塞交易）→ 盘后幂等同步回远端 MySQL。
 
+> **Windows 必装 `tzdata`**：时间口径用 `zoneinfo.ZoneInfo("Asia/Shanghai")`，Windows 无系统 IANA 时区库，
+> 需 `tzdata` 兜底（已列入 pyproject `dependencies`；`pip install -e .` 或 `pip install tzdata` 即可）。
+> 否则 `import time_utils` 即 `ZoneInfoNotFoundError`。
+
 ## 运行单测
 
 ```bash
