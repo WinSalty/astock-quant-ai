@@ -25,6 +25,7 @@ from ..config.settings import Settings
 from ..contracts.enums import (
     EntryAction,
     OrderPhase,
+    PositionState,
     RiskVerdict,
     SellActionType,
     TradeSide,
@@ -123,11 +124,13 @@ class Engine:
         )
 
         # —— 回调（落库 + 台账 + 持仓建仓回写 + 断线补采钩子）——
+        # position_sink：评审 P0-A2 修复——把成交回报回写持仓状态机，否则永远空集、永不卖出。
         self._callback = ExecCallback(
             self._data_writer, self._ledger, deps.logger,
             account_id=deps.account_id,
             trade_date_provider=self._today_provider,
             on_disconnected_hook=self.on_reconnect_backfill,
+            position_sink=self._apply_trade_to_position,
         )
 
         # —— 收盘 / 补采 + 对账 ——
@@ -193,6 +196,55 @@ class Engine:
             if entry.market_state is not None:
                 return entry.market_state
         return None
+
+    # ------------------------------------------------------------------
+    # 成交回报 → 持仓状态机回写（评审 P0-A2 修复）
+    # ------------------------------------------------------------------
+    def _apply_trade_to_position(self, rec: Any) -> None:
+        """把规整后的成交回报（TradeRecord）落地到持仓状态机。
+
+        业务意图：成交是唯一事实源，买入成交必须回写为 PositionUnit（守 T+1、跨日转 HOLDING、
+        供 sellable_units 卖出），卖出成交必须扣减持仓推进状态。原实现回调只落库 + 入台账，
+        从不回写持仓 → PositionManager 永远空集、run_sell_pass 永不卖出（裸奔扛单）。
+
+        口径：
+        - ts_code 用 rec.ts_code（归一码），与盘口 books / 计划行 / QMT 快照一致。
+        - today/买入日 取 rec.trade_date（东八区自然日）；跨午夜补采的口径细化见评审 x-time，另行处理。
+        - 幂等：BUY 由 mark_position_on_fill 按 traded_id 去重；SELL 在此按 traded_id 去重（券商重投/
+          断线重放不重复扣减持仓）。
+        - 防御：rec 字段缺失时不抛断回调主链（成交已落库 + 已入台账），仅记日志。
+        """
+        try:
+            side = getattr(rec, "trade_side", None)
+            ts_code = getattr(rec, "ts_code", None)
+            traded_id = getattr(rec, "traded_id", None)
+            traded_volume = getattr(rec, "traded_volume", None)
+            if ts_code is None:
+                return
+            if side == TradeSide.BUY:
+                # 买入：建/加仓（mark_position_on_fill 内部按 traded_id 去重、守 T+1）。
+                self._position.mark_position_on_fill(
+                    rec, rec.trade_date, account_id=self._account_id, ts_code=ts_code
+                )
+            elif side == TradeSide.SELL:
+                # 卖出：扣减对应单元（无该单元则忽略——手工单/非本系统单）。
+                unit = self._position.get_unit(self._account_id, ts_code)
+                if unit is None:
+                    return
+                # 卖出成交按 traded_id 去重（复用单元去重集合），防券商重投/断线重放重复扣减。
+                if traded_id is not None:
+                    if traded_id in unit.counted_trade_ids:
+                        return
+                    unit.counted_trade_ids.add(traded_id)
+                if traded_volume:
+                    self._position.apply_sell_fill(unit, int(traded_volume))
+        except Exception as exc:  # noqa: BLE001 回写失败不得吞掉成交落库/台账事实，仅告警
+            self._logger.error(
+                "position_writeback_failed",
+                account_id=self._account_id,
+                ts_code=getattr(rec, "ts_code", None),
+                error=str(exc),
+            )
 
     # ------------------------------------------------------------------
     # 竞价轮询（§3 / §4 建仓链路）
@@ -261,6 +313,13 @@ class Engine:
         """
         sold: List[str] = []
         for unit in self._position.sellable_units(today):
+            # —— 在途卖单跳过（评审 P0-C2 修复）——
+            # sellable_units 含 SELLING（在途已发卖单）单元，原实现每 tick 仍对其二次决策，
+            # 命中 CLEAR/REDUCE 时会在 order_stock 已发第二张卖单之后才在 mark_selling 抛错，
+            # 造成「重复下卖单 + 抛错中断本轮其余持仓的应卖决策」。这里在决策前显式跳过在途单元，
+            # 等成交回报推进出 SELLING 后下一轮再评（卖出成交回写见 _apply_trade_to_position）。
+            if unit.state == PositionState.SELLING:
+                continue
             # 风控闸门：行情/下单中断 → FREEZE 跳过；空仓 SELL_ONLY_HOLD 不影响卖出。
             verdict = self._risk.gate(
                 market_state=self._market_state,
@@ -293,6 +352,14 @@ class Engine:
         """
         if self._settings.kill_switch:
             self._logger.warn("engine_sell_kill_switch", ts_code=unit.ts_code)
+            return False
+        # —— 状态防御（评审 P0-C2）：仅对可发卖单态（HOLDING/PART_SOLD）下卖单——
+        # run_sell_pass 已跳过 SELLING，这里再做一道防御：避免任何路径在 order_stock 已发出之后
+        # 才在 mark_selling 抛错（先发单后抛错会造成重复卖单 / 中断本轮）。非可卖态直接不下单留痕。
+        if unit.state not in (PositionState.HOLDING, PositionState.PART_SOLD):
+            self._logger.info(
+                "engine_sell_state_not_sellable", ts_code=unit.ts_code, state=str(unit.state)
+            )
             return False
         if action_type == SellActionType.CLEAR:
             decision_vol = unit.can_use_volume

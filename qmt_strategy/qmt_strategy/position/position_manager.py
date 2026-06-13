@@ -60,15 +60,20 @@ class PositionManager:
     # ------------------------------------------------------------------
     # 买入成交回报落地（§5.6 mark_position_on_fill）
     # ------------------------------------------------------------------
-    def mark_position_on_fill(self, fill: Any, today: date, *, account_id: str) -> PositionUnit:
+    def mark_position_on_fill(
+        self, fill: Any, today: date, *, account_id: str, ts_code: Optional[str] = None
+    ) -> PositionUnit:
         """买入成交回报落地：建立/更新持仓单元，打最早可卖日标记。
 
         业务意图：守 T+1——买入当日 B（= today）不可卖，最早 trade_cal_next(B) 才可卖。
         入参：
-        - fill：成交回报对象（XtTrade 形态），读取 stock_code / traded_id / traded_price /
+        - fill：成交回报对象（XtTrade 或规整后的 TradeRecord），读取 traded_id / traded_price /
           traded_volume。用 getattr 容忍版本字段差异（§6.3）。
         - today：当前交易日，即买入日 B（= target_trade_date = T+1）。
         - account_id：账户号（关键字参数，强制显式传入，避免与 fill 内字段口径混淆）。
+        - ts_code：可选的归一证券代码（评审 P0-A2）。回调侧应传入 normalize 后的 ts_code，
+          使持仓单元键与盘口 books / 计划行 plan_map / QMT 快照口径一致（均为归一码，如 600000.SH）；
+          缺省 None 时回退读 fill.stock_code（兼容直接喂 XtTrade 的单测口径）。
 
         边界：
         - earliest_sellable_date = calendar.next_open(B)，经交易日历映射（禁自然日 +1）。
@@ -80,12 +85,13 @@ class PositionManager:
         FIFO 合并成本：avg_cost = (原成本×原量 + 本次价×本次量) / 总量。
         """
         # —— 读取成交回报字段（容忍版本差异，缺失即异常数据，按 0/空处理）——
-        ts_code = getattr(fill, "stock_code", None)
+        # ts_code 优先用显式传入的归一码（回调侧口径），缺省回退 fill.stock_code（XtTrade 原始码）。
+        ts_code = ts_code if ts_code is not None else getattr(fill, "stock_code", None)
         traded_id = getattr(fill, "traded_id", None)
         traded_price_raw = getattr(fill, "traded_price", None)
         traded_volume_raw = getattr(fill, "traded_volume", None)
         if ts_code is None:
-            raise ValueError("mark_position_on_fill: 成交回报缺少 stock_code，无法定位持仓单元")
+            raise ValueError("mark_position_on_fill: 成交回报缺少证券代码，无法定位持仓单元")
 
         # 价位一律走 Decimal（禁 float 累加比较）；成交量取 int。
         traded_price = Decimal(str(traded_price_raw)) if traded_price_raw is not None else Decimal("0")

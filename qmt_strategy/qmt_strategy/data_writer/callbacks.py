@@ -76,6 +76,7 @@ class ExecCallback:
         on_disconnected_hook: Callable[[], None] = _no_op,
         side_resolver: SideResolver = normalize.default_side_resolver,
         status_resolver: StatusResolver = normalize.default_status_resolver,
+        position_sink: Optional[Callable[[Any], None]] = None,
     ):
         self._dw = data_writer
         self._ledger = ledger
@@ -85,6 +86,10 @@ class ExecCallback:
         self._on_disconnected_hook = on_disconnected_hook
         self._side_resolver = side_resolver
         self._status_resolver = status_resolver
+        # 持仓回写下沉（评审 P0-A2 修复）：成交回报除落库 + 台账累计外，还需回写持仓状态机
+        # （买入建/加仓守 T+1、卖出扣减推进状态），否则 PositionManager 永远空集、永不卖出。
+        # 由 Engine 注入一个接收规整后 TradeRecord 的回调；缺省 None 表示不回写（离线/单测兼容）。
+        self._position_sink = position_sink
 
     # ------------------------------------------------------------------
     # 成交回报：唯一事实源，绝不可丢（§6.2.1 on_stock_trade）
@@ -118,6 +123,11 @@ class ExecCallback:
             getattr(t, "traded_volume", None),
             getattr(t, "traded_price", None),
         )
+        # 回写持仓状态机（评审 P0-A2）：用规整后的 rec（含归一 ts_code / 方向 / trade_date / traded_*），
+        # BUY 建/加仓（守 T+1）、SELL 扣减推进。回写失败不应吞掉「成交已落库 + 已入台账」的事实，
+        # 故置于最后并交由 sink 自身处理异常；缺省无 sink 时跳过（离线/单测兼容）。
+        if self._position_sink is not None:
+            self._position_sink(rec)
 
     # ------------------------------------------------------------------
     # 委托状态变化：已报 / 部成 / 已成 / 已撤 / 废单（§6.2.1 on_stock_order）

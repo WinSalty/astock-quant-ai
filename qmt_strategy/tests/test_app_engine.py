@@ -182,3 +182,83 @@ def test_run_sell_pass_no_sellable_units():
     eng = build_engine(deps)
     eng.prewarm(T_BUY)
     assert eng.run_sell_pass(T_BUY, books={}, session="intraday") == []
+
+
+# ---------------------------------------------------------------------------
+# 评审 P0-A2 / P0-C2：买入成交回写持仓 → 次日可卖 → 卖出 → 在途不重复卖（端到端闭环）
+# ---------------------------------------------------------------------------
+def test_buy_fill_writes_position_then_sellable_next_day_and_no_double_sell():
+    from qmt_strategy.contracts.models import OrderBook
+    from qmt_strategy.contracts.enums import PositionState
+    from qmt_strategy.contracts.xt_objects import FakeXtTrade
+
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+
+    # (1) 买入成交回报经回调落地持仓状态机（评审 P0-A2：原实现从不回写，此前恒空集）。
+    fill = FakeXtTrade(
+        account_id="acc1", stock_code="600036.SH", traded_id="TR1", order_id=1,
+        traded_price=11.00, traded_volume=1000,
+    )
+    eng.callback.on_stock_trade(fill)
+    unit = eng._position.get_unit("acc1", "600036.SH")
+    assert unit is not None and unit.volume == 1000
+    # 守 T+1：买入当日不可卖（LOCKED_T1，can_use_volume=0）。
+    assert unit.state == PositionState.LOCKED_T1
+    assert eng.run_sell_pass(T_BUY, books={"600036.SH": OrderBook(ts_code="600036.SH", broke_board=True)}) == []
+
+    # (2) 次日推进 → HOLDING、可卖量放开 → sellable_units 非空（此前恒空、永不卖出）。
+    next_day = deps.calendar.next_open(T_BUY)
+    eng._position.refresh_state(next_day)
+    assert len(eng._position.sellable_units(next_day)) == 1
+
+    # (3) 炸板盘口 → CLEAR → 下且仅下一张卖单，单元转 SELLING。
+    book = OrderBook(ts_code="600036.SH", broke_board=True, is_sealed=False, last_price=Decimal("10.50"))
+    sold = eng.run_sell_pass(next_day, books={"600036.SH": book})
+    assert sold == ["600036.SH"]
+    sell_calls = [c for c in deps.trader.order_calls if c[1] == 24]  # otype=24 卖出
+    assert len(sell_calls) == 1
+    assert eng._position.get_unit("acc1", "600036.SH").state == PositionState.SELLING
+
+    # (4) 同一在途 SELLING 单元再跑一轮 → 跳过、不重复下卖单、不抛错（评审 P0-C2）。
+    sold2 = eng.run_sell_pass(next_day, books={"600036.SH": book})
+    assert sold2 == []
+    sell_calls2 = [c for c in deps.trader.order_calls if c[1] == 24]
+    assert len(sell_calls2) == 1   # 仍只有 1 张卖单，未重复
+
+
+def test_sell_fill_reduces_position_idempotently():
+    """卖出成交回报回写：扣减持仓、推进 SOLD/PART_SOLD；同一 traded_id 重投不重复扣减。"""
+    from qmt_strategy.contracts.enums import PositionState, TradeSide
+    from qmt_strategy.contracts.xt_objects import FakeXtTrade
+
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    # 先买入建仓并推进到次日可卖。
+    eng.callback.on_stock_trade(FakeXtTrade(
+        account_id="acc1", stock_code="600036.SH", traded_id="B1", order_id=1,
+        traded_price=11.00, traded_volume=1000,
+    ))
+    next_day = deps.calendar.next_open(T_BUY)
+    eng._position.refresh_state(next_day)
+    unit = eng._position.get_unit("acc1", "600036.SH")
+    unit.state = PositionState.SELLING  # 模拟已发卖单在途
+
+    # 卖出成交回报（offset_flag 触发 SELL 方向）：部分成交 600 → PART_SOLD。
+    sell = FakeXtTrade(
+        account_id="acc1", stock_code="600036.SH", traded_id="S1", order_id=2,
+        traded_price=10.50, traded_volume=600, order_type=24, offset_flag=48,
+    )
+    # 强制方向为 SELL（规整层方向映射为占位实测值，这里直接断言回写按 rec.trade_side 分流）：
+    # 用引擎内部分流函数直接喂一个 SELL 方向的轻量记录，避免依赖占位 side_resolver。
+    class _Rec:
+        ts_code = "600036.SH"; trade_side = TradeSide.SELL; traded_id = "S1"
+        traded_volume = 600; traded_price = 10.50
+        trade_date = next_day
+    eng._apply_trade_to_position(_Rec())
+    assert eng._position.get_unit("acc1", "600036.SH").volume == 400
+    # 同一 traded_id 重投 → 不重复扣减。
+    eng._apply_trade_to_position(_Rec())
+    assert eng._position.get_unit("acc1", "600036.SH").volume == 400
