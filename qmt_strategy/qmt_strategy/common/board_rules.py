@@ -48,7 +48,9 @@ def budget_prices(row: SelectedStockRow) -> PriceBudget:
     边界：signal_close 也缺失且涨停价/高开区间均缺 → price_source=MISSING（上游据此把该票转观察名单，§2.6）。
     """
     board = board_of(row.ts_code)
-    # board 判不出（非目标段）时，沿用主板比例兜底以免崩溃；该票本应已被 universe_filter 剔除。
+    # board 判不出（科创 688 / 北交 8xx / 未知段）：本项目只做主板 + 创业板，这类标的本应已被
+    # universe_filter 剔除。eff_board 仅用于「信号侧已给权威价位」时的 board 记录，绝不再用它对
+    # 这类标的兜底现算涨停价（评审 P0-F1：默认主板 10% 会对 20%/30% 板算错、对 ST 算错）。
     eff_board = board if board is not None else Board.MAIN
 
     has_signal_limit = row.limit_up_price is not None
@@ -57,7 +59,7 @@ def budget_prices(row: SelectedStockRow) -> PriceBudget:
     )
 
     if has_signal_limit and has_signal_range:
-        # 信号侧价位齐全，直接采用（最高优先级）。
+        # 信号侧价位齐全，直接采用（最高优先级）。信号侧按其板块/ST 元数据算过，含科创/北交/ST 均正确。
         return PriceBudget(
             limit_up_price=row.limit_up_price,
             reasonable_open_low=row.reasonable_open_high_low,
@@ -66,8 +68,23 @@ def budget_prices(row: SelectedStockRow) -> PriceBudget:
             price_source=PriceSource.SIGNAL,
         )
 
+    # 评审 P0-F1：board 判不出且信号侧未给涨停价 → 无法可信现算（科创/北交 20%/30%、ST 5% 各不同），
+    # 不再按主板 10% 兜底（会算出错误涨停价进而误挂单 / 误判顶板），降级 MISSING 转观察名单。
+    # 注：ST 票若落在 600/000 前缀会被 board_of 判为主板（执行侧 row 无 is_st 标志，无法识别）——
+    #     ST 的正确 5% 口径依赖信号侧 universe_filter 排除 + 信号侧已给 limit_up_price；
+    #     供数契约补 is_st 后可在此对主板 ST 改用 5%（见评审 F1 / 批次 3.4）。
+    if board is None and not has_signal_limit:
+        return PriceBudget(
+            limit_up_price=Decimal("0"),
+            reasonable_open_low=Decimal("0"),
+            reasonable_open_high=Decimal("0"),
+            board=Board.MAIN,
+            price_source=PriceSource.MISSING,
+        )
+
     if row.signal_close is not None:
-        # 用收盘价 + board 规则兜底现算涨停价；合理高开区间优先用信号侧给的，缺则用一段保守默认。
+        # 用收盘价 + board 规则兜底现算涨停价（仅主板/创业板，board 已非 None 或已有信号涨停价）；
+        # 合理高开区间优先用信号侧给的，缺则用一段保守默认。
         lup = row.limit_up_price if has_signal_limit else limit_up_price(row.signal_close, eff_board)
         low, high = _fallback_open_range(row, eff_board)
         return PriceBudget(

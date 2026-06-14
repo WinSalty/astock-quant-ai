@@ -87,6 +87,28 @@ def test_budget_prices_missing():
     assert pb.price_source == PriceSource.MISSING
 
 
+def test_budget_prices_non_target_board_degrades_missing():
+    """评审 P0-F1：科创 688/北交等非主板创业板段、且信号侧未给涨停价
+    → 降级 MISSING（不再按主板 10% 兜底现算出错误涨停价）。"""
+    row = make_selected_row(ts_code="688981.SH", signal_close=Decimal("10.00"))
+    pb = budget_prices(row)
+    assert pb.price_source == PriceSource.MISSING
+    assert pb.limit_up_price == Decimal("0")     # 此前会错误算成 11.00(=10×1.1)
+
+
+def test_budget_prices_non_target_board_uses_signal_limit_when_given():
+    """非主板创业板段但信号侧已给齐价位 → 仍采用信号侧权威价位（科创/北交/ST 由信号侧算对）。"""
+    row = make_selected_row(
+        ts_code="688981.SH", signal_close=Decimal("10.00"),
+        limit_up_price=Decimal("12.00"),                 # 信号侧按科创 20% 给
+        reasonable_open_high_low=Decimal("10.40"),
+        reasonable_open_high_high=Decimal("11.60"),
+    )
+    pb = budget_prices(row)
+    assert pb.price_source == PriceSource.SIGNAL
+    assert pb.limit_up_price == Decimal("12.00")
+
+
 # —— universe 过滤 ——
 @pytest.mark.parametrize(
     "code,allowed",
