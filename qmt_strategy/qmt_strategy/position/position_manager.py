@@ -87,7 +87,9 @@ class PositionManager:
         # —— 读取成交回报字段（容忍版本差异，缺失即异常数据，按 0/空处理）——
         # ts_code 优先用显式传入的归一码（回调侧口径），缺省回退 fill.stock_code（XtTrade 原始码）。
         ts_code = ts_code if ts_code is not None else getattr(fill, "stock_code", None)
-        traded_id = getattr(fill, "traded_id", None)
+        # traded_id 归一为 str（评审 P1#7）：与台账去重 / 持久化口径一致，避免 int/str 混用导致去重失效。
+        traded_id_raw = getattr(fill, "traded_id", None)
+        traded_id = str(traded_id_raw) if traded_id_raw is not None else None
         traded_price_raw = getattr(fill, "traded_price", None)
         traded_volume_raw = getattr(fill, "traded_volume", None)
         if ts_code is None:

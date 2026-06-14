@@ -70,6 +70,30 @@ def test_add_fill_dedup_by_traded_id():
     assert got.state == OrderState.PART_TRADED
 
 
+def test_add_fill_dedup_int_then_str_traded_id():
+    """评审 P1#7：traded_id int 与其 str 形态视为同一笔（持久化统一 str，重启 round-trip 后仍去重）。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 11
+    led.insert(e)
+    led.add_fill(11, 12345, 600, Decimal("11.00"))     # 内存态 int（实测 miniQMT 常为 int）
+    led.add_fill(11, "12345", 600, Decimal("11.00"))   # 重启后回读为 str，同一笔
+    got = led.get_by_order_id(11)
+    assert got.filled_volume == 600                    # 不翻倍
+
+
+def test_add_fill_dedup_when_traded_id_missing():
+    """评审 P1#8：traded_id 缺失时用合成键 (order_id|vol|price) 兜底去重，重投不翻倍。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 12
+    led.insert(e)
+    led.add_fill(12, None, 600, Decimal("11.00"))
+    led.add_fill(12, None, 600, Decimal("11.00"))      # 同形态重投
+    got = led.get_by_order_id(12)
+    assert got.filled_volume == 600                    # 不翻倍
+
+
 def test_add_fill_ignores_non_positive_volume():
     """异常/撤单回报带 traded_volume<=0 时忽略，不污染累计量（评审 low#2）。"""
     led = InMemoryLocalLedger()

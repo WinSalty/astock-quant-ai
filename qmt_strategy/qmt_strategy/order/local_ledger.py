@@ -115,11 +115,21 @@ class InMemoryLocalLedger:
         vol = int(traded_volume) if traded_volume is not None else 0
         if vol <= 0:
             return
-        # traded_id 去重：已计入则直接返回，不重复累计（§low#1/§6.5）。
-        if traded_id is not None:
-            if traded_id in e.counted_trade_ids:
-                return
-            e.counted_trade_ids.add(traded_id)
+        # 成交去重键归一（评审 P1#7 / P1#8）：
+        # - P1#7：traded_id 一律 str 化。miniQMT 的 traded_id 实测常为 int，而落盘(mappers)统一 str，
+        #   原实现内存存原始 int、回读全是 str → 重启后 int≠str 去重失效、filled_volume 被二次累计。
+        #   在去重边界统一 str，使内存态与持久化 round-trip 后类型一致，重启后仍能去重。
+        # - P1#8：traded_id 缺失(异常回报)时不再"裸累加"，改用合成键 (order_id|vol|price) 兜底去重，
+        #   避免同一帧重投把建仓量翻倍。宁可漏计一笔形态完全相同的成交，也不超计——账实不符里
+        #   "多报持仓"风险更大（会高估可卖量、误判 TRADED）。
+        dedup_key = (
+            str(traded_id)
+            if traded_id is not None
+            else f"_noid_{order_id}_{vol}_{traded_price}"
+        )
+        if dedup_key in e.counted_trade_ids:
+            return
+        e.counted_trade_ids.add(dedup_key)
         prev_vol = e.filled_volume
         prev_amt = (e.avg_filled_price or Decimal("0")) * Decimal(prev_vol)
         add_price = Decimal(str(traded_price)) if traded_price is not None else Decimal("0")

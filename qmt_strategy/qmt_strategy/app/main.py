@@ -284,7 +284,8 @@ class Engine:
         try:
             side = getattr(rec, "trade_side", None)
             ts_code = getattr(rec, "ts_code", None)
-            traded_id = getattr(rec, "traded_id", None)
+            _tid = getattr(rec, "traded_id", None)
+            traded_id = str(_tid) if _tid is not None else None  # 与台账/持仓去重口径一致(评审 P1#7)
             traded_volume = getattr(rec, "traded_volume", None)
             if ts_code is None:
                 return
