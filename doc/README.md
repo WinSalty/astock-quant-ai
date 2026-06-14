@@ -78,13 +78,15 @@
 
 | 部分 | 状态 |
 |---|---|
-| 执行引擎（连接/竞价/建仓/持仓/风控/回流/对账） | ✅ 已落地、单测通过 |
-| 执行侧本地化（单进程+SQLite 异步持久化） | ✅ 已落地、对抗式评审修复、测试通过 |
-| 调度器 + xtquant 适配器模板 + 真实入口骨架 | ✅ 已落地（待目标机填 `TODO(实测)`） |
-| 信号侧 HTTP 双接口 + `qmt_*` 表/迁移 + 客户端 | ✅ 已落地 |
+| 执行引擎（连接/竞价/建仓/持仓/风控/回流/对账） | ✅ 已落地；**2026-06 正式评审发现并修复多处致命断裂**（路由全 SKIP 不开仓 / 持仓不回写不卖出 / 买入绕过风控 / go-no-go 闸门缺失等），见 §8 |
+| 执行侧本地化（单进程+SQLite 异步持久化） | ✅ 已落地；评审修复发单前同步落盘等幂等缺口（§8） |
+| 调度器 + xtquant 适配器模板 + 真实入口骨架 | ✅ 已落地（待目标机填 `TODO(实测)`）；交易日历已改 fail-closed（§8 上线须知） |
+| 信号侧 HTTP 双接口 + `qmt_*` 表/迁移 + 客户端 | ✅ 已落地；评审补回流信封一致校验、watchlist 竞价两因子供数（§8） |
 | 实盘对接（miniQMT/xtquant + 调度任务计划 + 实测） | ⬜ 待 QMT 客户端到位 |
 
 代码仓库：执行侧 [github.com/WinSalty/astock-quant-ai](https://github.com/WinSalty/astock-quant-ai)。
+
+> ⚠️ 上线前务必先看 §8「上线须知」——本轮修复引入了两个必须的部署动作（信号侧跑迁移 0054、执行侧提供交易日清单文件）。
 
 ---
 
@@ -101,3 +103,54 @@
 | [`archive/07-提供侧执行侧HTTP数据交互-方案与说明`](archive/07-提供侧执行侧HTTP数据交互-方案与说明.md) | 两侧 HTTP 双接口契约与交互 |
 | [`archive/07-QMT执行侧服务器部署运维清单`](archive/07-QMT执行侧服务器部署运维清单.md) | Windows 部署/保活/安全/磁盘运维清单 |
 | [`archive/08-信号侧与执行侧量化交易代码评审报告`](archive/08-信号侧与执行侧量化交易代码评审报告.md) | 两侧量化/供数代码正式评审（P0/P1/P2 + 优化空间 + 上线硬门槛）；明细见 `archive/08-评审发现明细.json` |
+| [`archive/09-两侧代码修复计划与执行清单`](archive/09-两侧代码修复计划与执行清单.md) | 评审后修复的分批计划与逐项进度台账（含 commit 索引、待确认口径、部署须知） |
+
+---
+
+## 8. 近期评审与修复（2026-06）
+
+针对本项目「真实投入资金」的属性，做了一次正式代码评审（[`archive/08`](archive/08-信号侧与执行侧量化交易代码评审报告.md)，166 条发现，确认 12 critical + 24 high + 63 medium），并据此完成修复（计划与逐项 commit 台账见 [`archive/09`](archive/09-两侧代码修复计划与执行清单.md)）。
+
+### 8.1 修复概要（已全部测试 + 推送）
+
+- **建仓闭环可用**：修 `strategy_family` 英文枚举与执行侧中文路由失配（原全部计划票落 SKIP、永不开仓）；修买入成交从未回写持仓状态机（原 `_units` 恒空、永不卖出、裸奔扛单）；统一 `market_state` 三档/六档口径（谨慎参与=禁开仓）。
+- **风控护栏**：买入接入 `risk.gate` + 喂入账户日内回撤阈值（原买入完全绕过风控、账户熔断对开仓零作用）；情绪闸门 `highest_chain_change`（最高板升降）由 dict 误当标量恒为 0 修复；单日下单次数上限落地。
+- **下单/幂等/唯一下单点**：卖出改走唯一下单点 `OrderExecutor.place_sell` 并落卖单台账（原直连 trader 绕过台账/无单号/不可对账）；在途 SELLING 单元不再重复下卖单；发单前同步落盘堵崩溃窗口重复下单；重启重建 biz 序号防同号覆盖；成交去重键跨重启类型归一 + 缺主键合成键。
+- **价位/时段口径**：board 判不出段（科创/北交/未知）不再按主板 10% 兜底现算涨停价（降级 MISSING）；卖出限价改用盘口现价（原用成本价炸板卖不出）；竞价限价封顶至涨停价；`order_phase` 按时段判定；午休（11:30–13:00）隔离不发撤/卖单。
+- **供数口径**：封流比 `circ_mv` 万元/元单位错配（放大约 1 万倍）修复；竞价虚拟封单 tick 五档归一（原封板场景封单恒 0）；辨识度子分按四维强弱均值分档（原「强恒胜」）；**F3 竞价两因子供数补齐**——契约/ORM/迁移补 `float_mktcap`/`first_board_vol`，执行侧透传 + 量能比阈值重标定。
+- **回测/回流**：回测新增 `go/no-go` 结构化裁决出口（原只产指标、无判定；阈值保守占位待校准）；回流 ingest 校验 `record.data` 的 `account_id/trade_date` 与请求信封一致（防串账户/串日）。
+- **交易日历 fail-closed**：执行侧不再硬编码「仅排周末」的近似日历（节假日会污染 T+1/名单键/对账），改为必须提供真实交易日清单、否则启动期拒绝（见 §8.3）。
+
+### 8.2 上线须知 ①：信号侧跑数据库迁移
+
+F3 给 `limit_up_selected_stock` 新增了 `float_mktcap`、`first_board_vol` 两列（迁移 `0054`）。**信号侧 MySQL 必须执行迁移**，否则选股落表会因缺列报错：
+
+```bash
+cd /path/to/stock-ah-premium-ai/backend && . .venv/bin/activate
+alembic upgrade head
+```
+
+### 8.3 上线须知 ②：执行侧提供交易日清单文件
+
+执行侧交易日历改为 **fail-closed**：必须用与信号侧 `a_trade_calendar` 同源的真实交易日（含法定节假日），否则进程启动期直接拒绝（避免「把节假日当交易日」污染 T+1/名单/对账）。
+
+**导出（信号侧，用本仓库脚本 `backend/scripts/export_trade_calendar.py`）：**
+```bash
+cd /path/to/stock-ah-premium-ai/backend && . .venv/bin/activate
+# 导出 SSE 的 is_open=1 交易日为「每行一个 YYYY-MM-DD」的文件；自动校验是否覆盖到足够未来
+python scripts/export_trade_calendar.py --output /opt/qmt/trade_days.txt --min-future-days 90
+```
+- 脚本复用项目 DB 入口（`app.db.session.SessionLocal`，不硬编码 DSN）；输出不含时间戳、可复现；末日距今不足 `--min-future-days` 会强 WARNING（提示先同步 `a_trade_calendar` 未来日期再导出）。
+- 退出码：0=成功；2=`--start` 非法；3=零交易日（exchange 写错/库未同步）。
+
+**部署（执行侧 Windows 交易机）：** scp 上述文件过去，配环境变量：
+```
+QMT_TRADE_CALENDAR_FILE=C:\qmt\trade_days.txt
+```
+**维护：** 每年新一年节假日安排公布后（Tushare `trade_cal` 更新）重新同步 `a_trade_calendar` → 重新导出 → scp 覆盖；否则跨年后 `next_open` 会越界。**仅离线/联调**可临时 `QMT_ALLOW_WEEKDAY_CALENDAR=true` 退化为周末近似（强告警，**严禁用于实盘**）。
+
+### 8.4 仍待办（非阻塞，多需回测校准 / 目标机实测）
+
+- 上线流程须强制读取回测 `summary['go_no_go']` 裁决（GO/NO_GO/INSUFFICIENT）为放行闸门；其阈值为保守占位，待回测/实盘校准后随版本固化。
+- 目标机 `xtdata.get_full_tick` 五档结构 / `xtconstant` 常量须 `vars()` 实测核对，固化 `auction_factors`/`order_executor`/`normalize` 的 `TODO(实测)` 占位。
+- 回测显著性检验、默认含费净口径、LLM 概率校准、龙头打分全涨停池基准、role 分级消费等优化项见 [`archive/09`](archive/09-两侧代码修复计划与执行清单.md) 剩余项。
