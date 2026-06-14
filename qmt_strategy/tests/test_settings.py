@@ -13,7 +13,9 @@ def test_defaults_auction_timing_off_and_kill_off():
     assert s.kill_switch is False
     assert s.watchlist_source == "DB"
     assert s.auction_poll_interval_sec == 3.0
-    assert s.market_state_block == ["退潮", "冰点", "空仓"]
+    # 评审 2.5：禁开仓集合改为三档真实 market_state（加入「谨慎参与」）+ 退潮/冰点 防御性冗余。
+    assert s.market_state_block == ["空仓", "谨慎参与", "退潮", "冰点"]
+    assert "谨慎参与" in s.market_state_block      # 核心修复：谨慎参与=禁开仓
     assert s.repository_unique_with_trade_date is True
 
 

@@ -97,8 +97,15 @@ class Settings:
     max_orders_per_day: Optional[int] = None          # QMT_MAX_ORDERS_PER_DAY
     per_order_max_amount: Optional[Decimal] = None    # QMT_PER_ORDER_MAX_AMOUNT
     price_deviation_guard_pct: Optional[Decimal] = None  # QMT_PRICE_DEVIATION_GUARD_PCT
-    market_state_block: List[str] = field(            # QMT_MARKET_STATE_BLOCK：禁开仓情绪周期
-        default_factory=lambda: ["退潮", "冰点", "空仓"]
+    # QMT_MARKET_STATE_BLOCK：禁开仓集合（评审 2.5 口径修正）。
+    # 信号侧 watchlist 的 market_state 只有三档：空仓 / 谨慎参与 / 参与（六档情绪周期已在信号侧
+    # _CYCLE_TO_STATE 折叠进这三档；退潮/冰点 → 空仓，分歧/启动 → 谨慎参与，发酵/高潮 → 参与）。
+    # 原默认 ["退潮","冰点","空仓"] 的核心问题：退潮/冰点 是六档周期名、在 market_state 列永不出现
+    # （禁开仓死代码），且「谨慎参与」漏挡照常开仓。修复：
+    #   - 真实三档：加入「谨慎参与」（已确认口径：谨慎参与=禁开仓，仅「参与」开新仓）；
+    #   - 保留 退潮/冰点 作为防御性冗余（正常不出现在 market_state，但契约漂移时仍兜底禁开，无副作用）。
+    market_state_block: List[str] = field(
+        default_factory=lambda: ["空仓", "谨慎参与", "退潮", "冰点"]
     )
     account_drawdown_limit: Optional[Decimal] = None  # 账户级当日回撤阈值（§5.4.1）
     account_loss_limit: Optional[Decimal] = None      # 账户级当日已实现亏损阈值
@@ -166,7 +173,7 @@ class Settings:
             max_orders_per_day=_as_int(g("QMT_MAX_ORDERS_PER_DAY")),
             per_order_max_amount=_as_decimal(g("QMT_PER_ORDER_MAX_AMOUNT")),
             price_deviation_guard_pct=_as_decimal(g("QMT_PRICE_DEVIATION_GUARD_PCT")),
-            market_state_block=split_csv(g("QMT_MARKET_STATE_BLOCK"), ["退潮", "冰点", "空仓"]),
+            market_state_block=split_csv(g("QMT_MARKET_STATE_BLOCK"), ["空仓", "谨慎参与", "退潮", "冰点"]),
             account_drawdown_limit=_as_decimal(g("QMT_ACCOUNT_DRAWDOWN_LIMIT")),
             account_loss_limit=_as_decimal(g("QMT_ACCOUNT_LOSS_LIMIT")),
             stock_float_loss_limit=_as_decimal(g("QMT_STOCK_FLOAT_LOSS_LIMIT")),

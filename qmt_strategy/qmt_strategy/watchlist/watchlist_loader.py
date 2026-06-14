@@ -27,7 +27,10 @@ from ..contracts.models import (
 from ..contracts.enums import PriceSource
 
 # 空仓情绪周期标识（§2.6）：market_state == 该值 → 判为空仓日，禁开新仓。
-# 与信号侧 market_state 统一口径一致（启动/高潮/震荡/退潮/冰点/空仓）。
+# 口径修正（评审 2.5）：信号侧 watchlist 的 market_state 只有三档——空仓 / 谨慎参与 / 参与
+# （六档情绪周期 冰点/退潮/分歧/启动/发酵/高潮 在信号侧已经 _CYCLE_TO_STATE 折叠进这三档，
+#  且只落在 sentiment_cycle 另一列、不在 market_state）。禁开仓集合以 settings.market_state_block
+# 为单一口径（默认 {空仓, 谨慎参与}，仅「参与」开新仓），本常量仅作空仓单值的语义锚点。
 _EMPTY_POSITION_STATE = "空仓"
 
 
@@ -293,14 +296,17 @@ class WatchlistLoader:
         """读 market_state 判空仓闸门（§2.4 _resolve_open_gate / §2.6 保守口径）。
 
         - market_state 取不到（None，含取数列缺失 / 不可解析）→ 返回 False（按空仓保守处理，禁开新仓）；
-        - market_state == '空仓' → 返回 False（情绪冰点/系统性风险，盘中只守仓不开新仓）；
-        - 其余（启动/高潮/震荡/退潮等非空仓态）→ 返回 True（允许按可交易名单开新仓）。
+        - market_state ∈ settings.market_state_block（默认 {空仓, 谨慎参与}）→ 返回 False（禁开新仓）；
+        - 其余（参与）→ 返回 True（允许按可交易名单开新仓）。
 
+        评审 2.5：禁开仓集合统一用 settings.market_state_block（与 entry_router._should_skip /
+        risk.is_open_blocked 同一口径），不再只硬判「空仓」一值——否则信号侧「谨慎参与」日会漏挡、
+        照常开新仓（已确认口径：谨慎参与=禁开仓，仅「参与」开仓）。
         该闸门**只关「开新仓」**，不影响卖出 / 守仓（T+1 已买入持仓仍按既定纪律处置，§2.6）。
         """
         if market_state is None:
             return False
-        if market_state == _EMPTY_POSITION_STATE:
+        if market_state in set(self._settings.market_state_block or []):
             return False
         return True
 

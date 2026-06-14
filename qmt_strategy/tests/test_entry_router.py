@@ -397,6 +397,27 @@ def test_block_keyword_not_overmatched():
     assert decision.action == EntryAction.SKIP
 
 
+def test_market_state_caution_routes_skip():
+    """评审 2.5：谨慎参与日 → 禁开新仓(SKIP)，不再漏挡照常开仓（仅「参与」开仓）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="首板", market_state="谨慎参与")
+    snap = _snap(open_pct=Decimal("0.06"), auction_vol_ratio=Decimal("0.5"),
+                 centroid_trend=CentroidTrend.UP, last_price=Decimal("10.60"))
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.SKIP
+    assert "谨慎参与" in decision.reason
+
+
+def test_market_state_participate_allows_open():
+    """「参与」日 → 正常路由开仓（证明不是无脑禁开）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="首板", market_state="参与")
+    snap = _snap(open_pct=Decimal("0.06"), auction_vol_ratio=Decimal("0.5"),
+                 centroid_trend=CentroidTrend.UP, last_price=Decimal("10.60"))
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.CHASE_AUCTION_STRONG
+
+
 def test_chase_auction_strong_caps_limit_to_limit_up():
     """评审 P1#3：竞价末帧 last_price 高于涨停价 → 限价封顶到涨停价（不挂超涨停价废单）。"""
     router, _, _ = _router()
