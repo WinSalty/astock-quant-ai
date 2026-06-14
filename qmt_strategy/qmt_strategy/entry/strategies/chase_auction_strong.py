@@ -16,7 +16,14 @@ from decimal import Decimal
 from ...config.settings import Settings
 from ...contracts.enums import AuctionPhase, CentroidTrend, EntryAction, OrderPhase
 from ...contracts.models import AuctionSnapshot, PlanRow
-from .base import EntryStrategy, StrategyOutcome, is_auction_degraded, register, resolve_thresholds
+from .base import (
+    EntryStrategy,
+    StrategyOutcome,
+    is_auction_degraded,
+    prior_gate_reason,
+    register,
+    resolve_thresholds,
+)
 
 # 竞价决策时点：9:20（AUCTION_LOCKED 起）后不可撤，竞价单必须在此前定（§3.3）。
 # 据此判定「降级 B 真伪」：9:20 前的单帧 NO_TICK 视为瞬时丢帧（defer 等后续帧），
@@ -46,6 +53,11 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
     """竞价强开追：强开 + 放量 + 越竞越强 → 9:20 前竞价单；弱开 / 走低 → 弃；降级 B → 改判 OPENING。"""
 
     def decide(self, plan: PlanRow, snap: AuctionSnapshot, settings: Settings) -> StrategyOutcome:
+        # —— 先验闸门（评审 P1#1）：龙头强度不足 / 续板概率弱 → 收手（含降级 B 路径前置）。——
+        gate = prior_gate_reason(plan, settings)
+        if gate is not None:
+            return StrategyOutcome(action=EntryAction.SKIP, reason=f"CHASE_AUCTION_STRONG弃:{gate}")
+
         # —— 降级 B 改判（§4.6 / 评审 medium#4）：竞价整体不可得 → 不下竞价单，退化为开盘后追。——
         # 关键：NO_TICK 是逐帧标记，既可能是降级 B（整体长期不可得），也可能是某一轮瞬时丢帧。
         # 故只有「已到 9:20 决策时点（phase >= AUCTION_LOCKED）仍整体不可得」才确认降级 B、改判 OPENING；

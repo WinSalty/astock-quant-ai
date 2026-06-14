@@ -418,6 +418,42 @@ def test_market_state_participate_allows_open():
     assert decision.action == EntryAction.CHASE_AUCTION_STRONG
 
 
+def test_chase_limit_up_prior_gate_blocks_weak_strength():
+    """评审 P1#1：龙头强度低于阈值 → CHASE_LIMIT_UP 收手(SKIP)，不追高接最后一棒。"""
+    router, _, _ = _router()  # leader_strength_min=0.5
+    plan = make_plan_row(strategy_family="打板", setup="连板接力", market_state="启动",
+                         limit_up_price=Decimal("11.00"), leader_strength_score=Decimal("0.3"))
+    snap = _snap(is_limit_up=True, last_price=Decimal("11.00"),
+                 seal_to_float_ratio=Decimal("0.08"), centroid_trend=CentroidTrend.UP)
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.SKIP
+    assert "强度不足" in decision.reason
+
+
+def test_chase_limit_up_prior_gate_passes_strong():
+    """强度达标(>=阈值) + 顶板封单稳 → 正常买（证明先验闸门不是无脑收手）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="连板接力", market_state="启动",
+                         limit_up_price=Decimal("11.00"), leader_strength_score=Decimal("0.8"),
+                         continuation_prob=Decimal("0.5"))
+    snap = _snap(is_limit_up=True, last_price=Decimal("11.00"),
+                 seal_to_float_ratio=Decimal("0.08"), centroid_trend=CentroidTrend.UP)
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.CHASE_LIMIT_UP
+
+
+def test_chase_auction_strong_prior_gate_blocks_weak_continuation():
+    """评审 P1#1：续板概率弱(<0.3，如极低0.10) → CHASE_AUCTION_STRONG 收手(SKIP)。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="首板", market_state="启动",
+                         continuation_prob=Decimal("0.10"))
+    snap = _snap(open_pct=Decimal("0.06"), auction_vol_ratio=Decimal("0.5"),
+                 centroid_trend=CentroidTrend.UP, last_price=Decimal("10.60"))
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.SKIP
+    assert "续板概率弱" in decision.reason
+
+
 def test_chase_auction_strong_caps_limit_to_limit_up():
     """评审 P1#3：竞价末帧 last_price 高于涨停价 → 限价封顶到涨停价（不挂超涨停价废单）。"""
     router, _, _ = _router()

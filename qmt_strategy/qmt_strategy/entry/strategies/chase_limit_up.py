@@ -16,7 +16,7 @@ from decimal import Decimal
 from ...config.settings import Settings
 from ...contracts.enums import AuctionPhase, EntryAction, OrderPhase
 from ...contracts.models import AuctionSnapshot, PlanRow
-from .base import EntryStrategy, StrategyOutcome, register
+from .base import EntryStrategy, StrategyOutcome, prior_gate_reason, register
 
 # 封单稳的封流比下限（占位经验阈值，真实落地以实测为准）：封流比低于此值视为封单偏薄 / 不稳。
 # 注：封流比 None（未达涨停或数据缺）时不据此判稳，由 is_limit_up 主导。
@@ -41,6 +41,11 @@ class ChaseLimitUpStrategy(EntryStrategy):
     """打板跟买：顶板封单稳 → 挂涨停价；炸板 / 封单减 → 弃。"""
 
     def decide(self, plan: PlanRow, snap: AuctionSnapshot, settings: Settings) -> StrategyOutcome:
+        # —— 先验闸门（评审 P1#1）：龙头强度不足 / 续板概率弱 → 收手，不追高接最后一棒。——
+        gate = prior_gate_reason(plan, settings)
+        if gate is not None:
+            return StrategyOutcome(action=EntryAction.SKIP, reason=f"CHASE_LIMIT_UP弃:{gate}")
+
         # —— 弃条件 1：未顶板（虚拟成交价未达涨停价）→ 无板可打，放弃。——
         if not snap.is_limit_up:
             return StrategyOutcome(

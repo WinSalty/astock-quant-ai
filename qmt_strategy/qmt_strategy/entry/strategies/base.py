@@ -118,6 +118,33 @@ def is_auction_degraded(snap: AuctionSnapshot) -> bool:
     return DQ_NO_TICK in (snap.data_quality or [])
 
 
+# 追买类策略的续板概率先验下限（占位经验阈值，真实落地以实测/回测校准为准）。
+_PRIOR_CONTINUATION_MIN = Decimal("0.3")
+
+
+def prior_gate_reason(plan: PlanRow, settings: Settings) -> Optional[str]:
+    """追买类策略的信号侧先验闸门（评审 P1#1）。
+
+    业务意图：让最激进的两类追买（CHASE_LIMIT_UP / CHASE_AUCTION_STRONG）真正消费信号侧龙头增强层
+    产出的「强度 leader_strength_score / 续板概率 continuation_prob」先验，避免对低强度、续板预期弱
+    的票照样挂涨停价追高、接最后一棒——原实现这两类策略完全不读先验，龙头增强 alpha 在最激进路径
+    被旁路。
+    口径（仅在先验【有值】时据其否决；缺数据不在此误杀，交由各策略盘口条件把关，与安全默认
+    「不凭空冻结」一致）：
+    - leader_strength_score 有值且 < settings.leader_strength_min → 收手；
+    - continuation_prob 有值且 < 续板下限 → 收手。
+    返回否决原因（命中即 SKIP）；无否决返回 None。
+    """
+    score = plan.leader_strength_score
+    strength_min = settings.leader_strength_min
+    if score is not None and strength_min is not None and score < strength_min:
+        return f"先验闸门:龙头强度不足 leader_strength_score={score} < leader_strength_min={strength_min}"
+    cont = plan.continuation_prob
+    if cont is not None and cont < _PRIOR_CONTINUATION_MIN:
+        return f"先验闸门:续板概率弱 continuation_prob={cont} < {_PRIOR_CONTINUATION_MIN}"
+    return None
+
+
 class EntryStrategy:
     """建仓策略接口（§4.2）。各 action 一实现，统一 ``decide`` 签名。
 
