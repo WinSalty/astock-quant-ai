@@ -18,7 +18,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Callable, Optional
 
-from ..contracts.enums import DataSource, OrderState, OrderStatus, SnapshotType
+from ..contracts.enums import DataSource, OrderState, OrderStatus, SnapshotType, TradeSide
 from ..contracts.models import OrderRecord
 from ..contracts.protocols import DataWriter, LocalLedger, StructLogger
 from . import normalize
@@ -77,6 +77,7 @@ class ExecCallback:
         side_resolver: SideResolver = normalize.default_side_resolver,
         status_resolver: StatusResolver = normalize.default_status_resolver,
         position_sink: Optional[Callable[[Any], None]] = None,
+        sell_revert_sink: Optional[Callable[[str], None]] = None,
     ):
         self._dw = data_writer
         self._ledger = ledger
@@ -90,6 +91,27 @@ class ExecCallback:
         # （买入建/加仓守 T+1、卖出扣减推进状态），否则 PositionManager 永远空集、永不卖出。
         # 由 Engine 注入一个接收规整后 TradeRecord 的回调；缺省 None 表示不回写（离线/单测兼容）。
         self._position_sink = position_sink
+        # 卖单终态失败复位钩子（评审二轮 P1#31）：卖单被拒/全撤且零成交时，把持仓单元从 SELLING 复位回
+        # HOLDING（供下一轮重挂），否则止损/破位清仓永久失效。由 Engine 注入 (ts_code)->None；缺省不复位。
+        self._sell_revert_sink = sell_revert_sink
+
+    def _maybe_revert_sell_unit(self, order_id: Optional[int]) -> None:
+        """卖单终态失败 → 复位持仓 SELLING 态（评审二轮 P1#31）。
+
+        判据：台账据 order_id 反查到的单元是 SELL 方向、已落终态失败（CANCELLED/REJECTED/ERROR）、
+        且零成交（filled_volume==0）→ 该卖单确未卖出任何量，持仓须从 SELLING 复位回 HOLDING 重挂。
+        部成（filled_volume>0）由 sync_status 收口为 PART_TRADED、持仓由卖出成交回报推进，不在此复位。
+        """
+        if order_id is None or self._sell_revert_sink is None:
+            return
+        entry = self._ledger.get_by_order_id(order_id)
+        if entry is None:
+            return
+        terminal_fail = entry.state in (
+            OrderState.CANCELLED, OrderState.REJECTED, OrderState.ERROR
+        )
+        if entry.side == TradeSide.SELL and terminal_fail and (entry.filled_volume or 0) == 0:
+            self._sell_revert_sink(entry.ts_code)
 
     # ------------------------------------------------------------------
     # 成交回报：唯一事实源，绝不可丢（§6.2.1 on_stock_trade）
@@ -112,22 +134,32 @@ class ExecCallback:
             data_source=DataSource.CALLBACK,
             side_resolver=self._side_resolver,
         )
-        # 成交是唯一事实源：先落库（写端失败会抛出告警，不静默吞）。
-        self._dw.upsert_trade(rec)
-        # 同步台账累计成交：order_id 缺失或台账无此单时由 add_fill 自身忽略，不抛错。
-        # 传 traded_id 供台账按成交编号去重（断线重连回放/券商重投不重复累计，§6.5/§4.4(4)）。
+        # 顺序修正（评审二轮 P2#62）：成交是唯一事实源——必须【先更新内存权威】（台账累计 + 持仓状态机），
+        # 【再写 qmt_* 镜像】。原实现先 upsert_trade，一旦落库异常抛出，add_fill/持仓回写就被跳过，使同一笔
+        # 成交从台账与持仓状态机双双丢失（漏卖 + 幂等失效）。台账 add_fill 是 write-behind（仅入队不阻塞、
+        # 不抛 DB 异常）、持仓回写是纯内存，故二者优先且稳；qmt_trade 镜像（供对账/复盘）置后并隔离其异常，
+        # 即使镜像失败，台账/持仓的权威事实已落定，缺失的 qmt_trade 行可由收盘兜底/断线补采恢复。
         order_id = getattr(t, "order_id", None)
+        # 1) 台账累计成交（按 traded_id 去重，断线重连回放/券商重投不重复累计，§6.5/§4.4(4)）。
         self._ledger.add_fill(
             order_id,
             getattr(t, "traded_id", None),
             getattr(t, "traded_volume", None),
             getattr(t, "traded_price", None),
         )
-        # 回写持仓状态机（评审 P0-A2）：用规整后的 rec（含归一 ts_code / 方向 / trade_date / traded_*），
-        # BUY 建/加仓（守 T+1）、SELL 扣减推进。回写失败不应吞掉「成交已落库 + 已入台账」的事实，
-        # 故置于最后并交由 sink 自身处理异常；缺省无 sink 时跳过（离线/单测兼容）。
+        # 2) 回写持仓状态机（评审 P0-A2）：BUY 建/加仓（守 T+1）、SELL 扣减推进。
         if self._position_sink is not None:
             self._position_sink(rec)
+        # 3) 最后写 qmt_trade 镜像：异常不得回滚已完成的台账/持仓权威更新，单独强告警（待兜底补采恢复）。
+        try:
+            self._dw.upsert_trade(rec)
+        except Exception as exc:  # noqa: BLE001 镜像落库失败不丢成交事实，仅告警
+            self._logger.error(
+                "trade_mirror_upsert_failed",
+                account_id=self._account_id,
+                order_id=order_id,
+                error=str(exc),
+            )
 
     # ------------------------------------------------------------------
     # 委托状态变化：已报 / 部成 / 已成 / 已撤 / 废单（§6.2.1 on_stock_order）
@@ -154,6 +186,8 @@ class ExecCallback:
         if rec.order_id is not None:
             state = _STATUS_TO_STATE.get(rec.order_status, OrderState.REPORTED)
             self._ledger.sync_status(rec.order_id, state, rec.status_msg)
+            # 卖单终态失败 → 复位持仓 SELLING 态（评审二轮 P1#31）：拒单/全撤且零成交时让持仓回 HOLDING 重挂。
+            self._maybe_revert_sell_unit(rec.order_id)
 
     # ------------------------------------------------------------------
     # 下单失败：废单 / 拒单（回调独有，§6.2.1 on_order_error）
@@ -193,6 +227,8 @@ class ExecCallback:
         # 同步台账：把对应计划单推进 ERROR 终态（台账无该 order_id 则 sync_status 自身忽略）。
         if order_id is not None:
             self._ledger.sync_status(order_id, OrderState.ERROR, getattr(e, "error_msg", None))
+            # 卖单废单/拒单 → 复位持仓 SELLING 态（评审二轮 P1#31）。
+            self._maybe_revert_sell_unit(order_id)
 
     # ------------------------------------------------------------------
     # 撤单失败：留痕（回调独有，§6.2.1 on_cancel_error）

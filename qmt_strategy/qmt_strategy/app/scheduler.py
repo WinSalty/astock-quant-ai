@@ -154,6 +154,11 @@ class DailyScheduler:
             self._logger.info("scheduler_run_auction", trade_date=str(today))
             self._engine.run_auction()
         elif action == Action.INTRADAY:
+            # 存储健康周期体检（评审二轮 P0#2）：写线程静默死亡且当轮无 submit 触发 on_failure 时的兜底发现，
+            # 不健康即 engine fail-closed 停开新仓。置于盘中动作首位，使后续 sweep/卖出在已知状态下进行。
+            health_tick = getattr(self._engine, "storage_health_tick", None)
+            if callable(health_tick):
+                health_tick()
             self._engine.sweep_ttl()  # 超时撤单巡检（无需盘口）
             if self._sell_books_provider is not None:
                 # 盘中卖出决策（需实时盘口源；缺省不注入则跳过，属 TODO(实测)）。

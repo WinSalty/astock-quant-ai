@@ -127,6 +127,40 @@ class OrderExecutor:
         self._seq_counter = counter
         self._logger.info("order_seq_counter_rebuilt", keys=len(counter))
 
+    def rebuild_runtime_state(self, now: Optional[datetime] = None) -> None:
+        """进程重启后从已重建的台账重建内存运行态：TTL 截止表 + 单日下单次数计数器
+        （评审二轮 P1#28 / P2#32 / P2#40 / P2#69）。
+
+        背景：_ttl_deadline / _orders_count_by_date 是纯内存，重启清零：
+        - #28：崩溃前 SUBMITTED/REPORTED/PART_TRADED 的在途买单重启后无 TTL 截止 → 永不再被 sweep 撤单，
+          资金/名额永久占用。这里给在途单重建一个"自重启起 order_ttl_seconds"的截止（无法恢复原始截止，
+          取保守新 TTL：重启后给一段宽限再撤，避免刚重启就撤掉可能马上成交的单）。
+        - #32/#40/#69：单日下单次数计数器重启清零 → max_orders_per_day 硬闸被绕过、可超频下单。
+          这里按台账"已真实发出 order_stock"（state 越过 PLANNED）的条数，按 target_trade_date 重建计数。
+
+        注：_decision_by_biz（原决策因子/next_best）无法重建（决策未持久化）——重启后到期单的 miss 归因
+        退化为"排队未成"、转次优链不可用（next_best 本就为死代码，见 #68），不影响"超时必被撤"这一资金安全主目标。
+        """
+        now = now if now is not None else self._clock.now_utc()
+        ttl = timedelta(seconds=self._settings.order_ttl_seconds)
+        in_flight = (OrderState.SUBMITTED, OrderState.REPORTED, OrderState.PART_TRADED)
+        ttl_rebuilt = 0
+        counter: Dict[Any, int] = {}
+        for e in self._ledger.all():
+            # 计数器：凡"已越过 PLANNED"（真实发出过 order_stock，含同步失败 ERROR）的单都占当日下单次数配额。
+            if e.state != OrderState.PLANNED:
+                counter[e.target_trade_date] = counter.get(e.target_trade_date, 0) + 1
+            # TTL：仅对在途且有 order_id 的单重建截止（PLANNED 无 order_id 无从撤；终态无需 TTL）。
+            if e.state in in_flight and e.order_id is not None and e.biz_order_no not in self._ttl_deadline:
+                self._ttl_deadline[e.biz_order_no] = now + ttl
+                ttl_rebuilt += 1
+        self._orders_count_by_date = counter
+        self._logger.info(
+            "order_runtime_state_rebuilt",
+            ttl_rebuilt=ttl_rebuilt,
+            order_count_days=len(counter),
+        )
+
     # ------------------------------------------------------------------
     # (1) 业务唯一单号
     # ------------------------------------------------------------------
@@ -392,6 +426,10 @@ class OrderExecutor:
         # —— 回填 order_id + 推进到 SUBMITTED（已发 order_stock，待回报）——
         # 注意：到此为止状态最多 SUBMITTED；REPORTED/TRADED 由外部回报推进（§4.4(4)）。
         self._ledger.update(biz_no, order_id=order_id, state=OrderState.SUBMITTED, updated_at=self._clock.now_utc())
+        # 发单成功后【同步落盘 order_id】（评审二轮 P1#7）：原实现 order_id 仅异步镜像，崩溃窗口会产生
+        # "券商有单、台账只认 PLANNED（无 order_id）"的孤儿单——重启后无法按 order_id 关联回报/撤单，
+        # 名额永占、可能漏卖。这里阻塞确认 SUBMITTED+order_id 行落盘后再返回（非热路径，可阻塞）。
+        self._sync_persist_before_order()
 
         # —— TTL 截止：竞价单到 9:25 定盘；开盘单 now + order_ttl_seconds（§4.4(3)）——
         self._ttl_deadline[biz_no] = self._compute_ttl_deadline(now, decision.order_phase)
@@ -516,9 +554,17 @@ class OrderExecutor:
                 "order_sell_submit_failed_sync",
                 ts_code=ts_code, account_id=self._account_id, biz_order_no=biz_no, order_id=order_id,
             )
-            return biz_no
+            # 同步失败返回 None（评审二轮 P1#11）：原实现返回 biz_no，编排层据非 None 调 mark_selling 把单元
+            # 置 SELLING，但根本没有活的卖单 → 单元永久卡死无法再卖。返回 None 让编排层不置 SELLING（台账已留
+            # ERROR 痕迹供对账），下一轮卖出巡检可对该单元重新下卖单。
+            return None
 
         self._ledger.update(biz_no, order_id=order_id, state=OrderState.SUBMITTED, updated_at=self._clock.now_utc())
+        # 卖单同样同步落盘 order_id（评审二轮 P1#7）：保证"券商有单"先于台账只认 PLANNED 的孤儿窗口被堵。
+        self._sync_persist_before_order()
+        # 卖单登记 TTL 截止（评审二轮 P1#12）：原实现卖单无 TTL/撤改，挂不到价即全天卡在 SELLING 漏卖。
+        # 这里给卖单同样的存活时限，sweep_expired 到期会撤单（→ CANCELLED 回报触发持仓 revert_selling 重挂）。
+        self._ttl_deadline[biz_no] = self._compute_ttl_deadline(now, order_phase)
         self._logger.info(
             "order_sell_submitted",
             ts_code=ts_code, account_id=self._account_id, biz_order_no=biz_no,
@@ -547,13 +593,16 @@ class OrderExecutor:
         active = OrderState.active()
         total = Decimal("0")
         for e in self._ledger.all_for_date(target_trade_date):
-            if (
-                e.side == TradeSide.BUY
-                and e.state in active
-                and e.plan_price is not None
-                and e.plan_volume
-            ):
-                total += e.plan_price * Decimal(e.plan_volume)
+            if not (e.side == TradeSide.BUY and e.state in active and e.plan_price is not None and e.plan_volume):
+                continue
+            # 已承诺金额按"实际已成 + 剩余在途按计划价"计（评审二轮 P3#92）：
+            # 原实现对部成/已成单仍按 plan_volume×plan_price 全额计入——已成部分应按真实成交均价、未成部分才按
+            # 计划价占用，否则会高估已承诺、误判预算耗尽而少买。filled_volume 钳到 plan_volume 防回报超量污染。
+            filled = min(e.filled_volume or 0, e.plan_volume)
+            remaining = e.plan_volume - filled
+            filled_amt = (e.avg_filled_price or e.plan_price) * Decimal(filled)
+            remaining_amt = e.plan_price * Decimal(remaining)
+            total += filled_amt + remaining_amt
         return total
 
     # ------------------------------------------------------------------
@@ -659,8 +708,12 @@ class OrderExecutor:
             )
             return
 
-        # —— 仅对「在途可撤」状态发撤单：已报 / 部成 ——
-        if entry.state in (OrderState.REPORTED, OrderState.PART_TRADED):
+        # —— 对「在途」状态发撤单：已报 / 部成 / 已提交（评审二轮 P1#8）——
+        # 原实现只撤 REPORTED/PART_TRADED，把 SUBMITTED-到期单丢给 else 分支只留痕、不撤；而 sweep_expired
+        # 仍把它移出 TTL 截止表 → 超时 SUBMITTED 单永不再被撤、资金/名额永久占用。这里把 SUBMITTED 纳入撤单：
+        # 已发 order_stock 拿到 order_id 但久无 on_stock_order 回报本身即异常（卡单/丢回报），且 cancel 携 order_id
+        # 对券商安全（无此单则券商自行拒绝），故按 TTL 一并撤单，避免永久占用。
+        if entry.state in (OrderState.SUBMITTED, OrderState.REPORTED, OrderState.PART_TRADED):
             self._trader.cancel_order_stock(self._account, entry.order_id)
             self._ledger.update(biz_no, state=OrderState.CANCELLING, updated_at=now)
             self._logger.info(
@@ -669,9 +722,12 @@ class OrderExecutor:
                 account_id=self._account_id,
                 order_id=entry.order_id,
                 filled_volume=entry.filled_volume,
+                from_state=str(entry.state),
             )
             # —— 撤后若一手未成（filled==0）：一字 / 秒封「买不进」归因 + 转次优（§4.4(7)）——
-            if entry.filled_volume == 0:
+            # 仅买单适用（评审二轮 P1#12）：卖单到期撤单后无"买不进/转次优"语义，撤单回报会触发持仓 revert_selling
+            # 让下一轮重挂，故卖单不走 miss_reason/try_next_best 分支。
+            if entry.side == TradeSide.BUY and entry.filled_volume == 0:
                 miss_reason = self._infer_miss_reason(biz_no)
                 self._ledger.update(biz_no, miss_reason=miss_reason, updated_at=now)
                 self._logger.warn(
@@ -694,7 +750,7 @@ class OrderExecutor:
                 if decision is not None:
                     self.try_next_best(decision)
         else:
-            # SUBMITTED 尚未收到 on_stock_order 回报：保守不盲撤（避免对未确认委托发撤），仅留痕。
+            # 其余态（CANCELLING 已在撤 / 终态）无需再撤，仅留痕。
             self._logger.info(
                 "order_ttl_state_not_cancelable",
                 biz_order_no=biz_no,

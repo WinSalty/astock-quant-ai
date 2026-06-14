@@ -136,8 +136,11 @@ class PersistentLocalLedger:
         但该行尚未 drain 落盘"的窗口崩溃，重启 load_from_db 读不到该行 → 同一计划被重复下单。
         故唯一下单点在 order_stock 之前调用本方法，阻塞等待写队列清空，保证"磁盘有计划单"先于
         "券商收到委托"。仅用于发单前的关键落盘（非回报热路径），返回是否在 timeout 内清空。
+
+        评审二轮 P0#1/#2：必须用 flush_confirm（区分"已 drain"与"已持久 commit 成功"），不能用 flush——
+        flush 对 commit 失败/写线程死亡会误报成功，使发单前落盘保证形同虚设、崩溃后重复下单。
         """
-        return self._wq.flush(timeout)
+        return self._wq.flush_confirm(timeout)
 
     def update(self, biz_order_no: str, **fields: Any) -> None:
         """按字段更新台账行：内存改完后镜像该 biz 的最新 entry。biz 不存在时内存层抛 KeyError（沿用语义）。"""

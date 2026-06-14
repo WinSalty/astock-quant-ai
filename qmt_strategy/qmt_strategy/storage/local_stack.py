@@ -72,6 +72,17 @@ class LocalStorage:
         self._started = True
         self._logger.info("local_storage_started", db_path="***", account_id="***")
 
+    def set_on_failure(self, on_failure) -> None:
+        """补设存储故障告警钩子（评审二轮 P0#2）：写线程死亡/关键落盘失败时回调（→ Engine fail-closed）。
+
+        Engine 在 LocalStorage 之后装配，故构造期无法注入，由装配末尾（run.py）接线到 engine.on_storage_failure。
+        """
+        self._wq.set_on_failure(on_failure)
+
+    def is_healthy(self) -> bool:
+        """写线程健康性（供调度器周期性体检；不健康即应 fail-closed 停开新仓 + 告警，评审二轮 P0#2）。"""
+        return self._wq.is_healthy()
+
     def flush(self, timeout: float = 5.0) -> bool:
         """阻塞至写队列清空（盘后 / 对账前调用，保证读到一致数据）。超时返回 False 供告警。"""
         ok = self._wq.flush(timeout)

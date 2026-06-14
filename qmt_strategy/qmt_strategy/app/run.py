@@ -215,6 +215,13 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     )
     engine = build_engine(deps)
 
+    # —— 存储 fail-closed 接线（评审二轮 P0#2）——
+    # 写线程死亡 / 关键落盘失败 → on_failure 回调 engine.on_storage_failure 置"存储不健康"→停开新仓 + 强告警；
+    # 并注入健康探测器供调度周期体检（静默死亡且当轮无 submit 时的兜底发现）。Engine 在 LocalStorage 之后
+    # 装配，故二者均在此装配末尾接线。
+    stack.set_on_failure(engine.on_storage_failure)
+    engine.set_storage_health_checker(stack.is_healthy)
+
     # —— 连接守护：trader_factory 顺手 set 进 holder；回调用 ABI 适配壳包住引擎 ExecCallback ——
     callback = xt_real.make_trader_callback(engine.callback)    # 触发 xtquant
     trader_factory = xt_real.make_trader_factory(settings.mini_path or "", holder)

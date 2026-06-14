@@ -18,6 +18,7 @@ sell_decider + order 层）。
 
 from __future__ import annotations
 
+import threading
 from datetime import date
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -56,6 +57,11 @@ class PositionManager:
         self._prior_provider = prior_provider
         # 持仓单元表：key = (account_id, ts_code)，保证一股一行聚合。
         self._units: Dict[Tuple[str, str], PositionUnit] = {}
+        # 并发护栏（评审复审 P1 / 二轮 #61 提前）：QMT 回调线程（成交回写 / 断线重连 rebuild）与调度线程
+        # （refresh_state / sellable_units / sweep / 卖出巡检）会并发读写 self._units。本锁保护单元表的
+        # 「结构性增删」与「迭代取快照」，杜绝"迭代中字典 size 改变"的 RuntimeError；可重入(RLock)以便
+        # 同线程内嵌套调用不自锁。注：单元字段级的细粒度数据竞争（脏读/丢更新）在 §阶段E #61 进一步收敛。
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # 买入成交回报落地（§5.6 mark_position_on_fill）
@@ -102,6 +108,18 @@ class PositionManager:
         key = (account_id, ts_code)
         unit = self._units.get(key)
 
+        # —— 再买入命中已关闭(SOLD)单元（评审二轮 P1#13）——
+        # 旧单元已全部卖出、终态关闭；本次买入是【全新建仓】，不能并入旧 SOLD 单元（否则状态停 SOLD、
+        # 新仓永不进卖出决策 = 漏卖）。这里把 unit 视为 None 走"首次建仓"分支重建全新单元；旧单元被覆盖。
+        # 注意须在 traded_id 去重之前重置：新单元应独立去重，不受旧单元 counted_trade_ids 影响。
+        if unit is not None and unit.state == PositionState.SOLD:
+            self._logger.info(
+                "position_rebuy_after_sold_new_unit",
+                account_id=account_id,
+                ts_code=ts_code,
+            )
+            unit = None
+
         # —— 幂等去重：同一 traded_id 已计入则直接返回，不重复加仓（§5.6）——
         # 边界：traded_id 为 None（异常回报）时不进入去重集合，但仍按一次成交合并（保守计入）。
         if unit is not None and traded_id is not None and traded_id in unit.counted_trade_ids:
@@ -129,7 +147,9 @@ class PositionManager:
                 mode=PositionMode.TECH_EXIT,  # 默认纯技术退出，refresh_state 据先验再校正
                 buy_date=today,
             )
-            self._units[key] = unit
+            # 结构性写入加锁（评审复审 P1）：与调度线程的迭代取快照互斥，杜绝迭代中字典 size 改变崩溃。
+            with self._lock:
+                self._units[key] = unit
         else:
             # 加仓合并：FIFO 按量加权成本（原成本×原量 + 本次价×本次量）/ 总量。
             prev_vol = unit.volume
@@ -190,7 +210,10 @@ class PositionManager:
         - SOLD（单元已关闭）/ FROZEN（风控冻结）不在此推进，避免覆盖终态/冻结态。
         - PART_SOLD 的剩余部分由本方法刷回 HOLDING（部成后剩余继续按规则可卖，§5.2.1）。
         """
-        for unit in self._units.values():
+        # 迭代前在锁内取快照（评审复审 P1）：避免回调线程 rebuild/建仓并发改字典 size 致 RuntimeError。
+        with self._lock:
+            units = list(self._units.values())
+        for unit in units:
             # 终态/冻结态不推进：SOLD 已关闭、FROZEN 由风控恢复链路处理。
             if unit.state in (PositionState.SOLD, PositionState.FROZEN):
                 continue
@@ -251,8 +274,11 @@ class PositionManager:
         供上层判定重复下单幂等）。SOLD（已关闭）/ LOCKED_T1（守 T+1）/ FROZEN（风控冻结）不返回。
         """
         sellable_states = (PositionState.HOLDING, PositionState.PART_SOLD, PositionState.SELLING)
+        # 锁内取快照后再筛（评审复审 P1）：迭代期间回调线程并发改字典不致崩溃。
+        with self._lock:
+            units = list(self._units.values())
         result: List[PositionUnit] = []
-        for unit in self._units.values():
+        for unit in units:
             if today >= unit.earliest_sellable_date and unit.state in sellable_states:
                 result.append(unit)
         return result
@@ -277,6 +303,30 @@ class PositionManager:
             account_id=unit.account_id,
             ts_code=unit.ts_code,
             volume=unit.volume,
+        )
+
+    def revert_selling(self, unit: PositionUnit, *, reason: str = "") -> None:
+        """卖单终态失败时把单元从 SELLING 复位回可卖态（评审二轮 P1#11/#12/#31）。
+
+        业务意图：原实现卖单一旦置 SELLING，**唯一**退出路径是"真实卖出成交回报"——卖单同步下单失败 /
+        被券商拒单 / 全撤零成交 / 挂不到价超时这四类"零成交终态失败"都没有复位钩子，单元永久卡死在
+        SELLING，止损/破位清仓永久失效（漏卖裸奔）。本方法是这四类场景的统一复位入口。
+
+        复位口径：
+        - 只对 SELLING 态生效（幂等防御）：若期间已收到部分/全部成交回报，状态已是 PART_SOLD/SOLD，
+          不在此覆盖（避免把已成交事实回退）。
+        - 仍有持仓量(volume>0) → 回 HOLDING，下一轮卖出巡检可重新挂单；volume<=0（理论上不应出现）→ SOLD。
+        - can_use_volume 在 mark_selling 时未扣减（只有 apply_sell_fill 扣减），复位后仍可用，无需恢复。
+        """
+        if unit.state != PositionState.SELLING:
+            return
+        unit.state = PositionState.HOLDING if unit.volume > 0 else PositionState.SOLD
+        self._logger.warn(
+            "position_revert_selling",
+            account_id=unit.account_id,
+            ts_code=unit.ts_code,
+            to_state=str(unit.state),
+            reason=reason,
         )
 
     def apply_sell_fill(self, unit: PositionUnit, traded_volume: int) -> PositionUnit:
@@ -325,7 +375,8 @@ class PositionManager:
     # ------------------------------------------------------------------
     def get_unit(self, account_id: str, ts_code: str) -> Optional[PositionUnit]:
         """按 (account_id, ts_code) 取持仓单元，无则返回 None。"""
-        return self._units.get((account_id, ts_code))
+        with self._lock:
+            return self._units.get((account_id, ts_code))
 
     # ------------------------------------------------------------------
     # 以 QMT 持仓快照校准可卖量（§5.2.2 can_use_volume 量闸为权威）
@@ -353,3 +404,109 @@ class PositionManager:
             can_use_volume=unit.can_use_volume,
         )
         return unit
+
+    # ------------------------------------------------------------------
+    # 以 QMT 权威持仓快照重建 / 校准全部单元（评审二轮 P0#6/#29/#30/#38）
+    # ------------------------------------------------------------------
+    def rebuild_from_broker_positions(
+        self,
+        records: Any,
+        today: date,
+        *,
+        create_missing: bool = True,
+    ) -> int:
+        """用券商(QMT) query_stock_positions 的权威持仓重建 / 校准本地持仓单元。
+
+        业务意图（堵三个相互关联的致命断裂）：
+        - P0#6：持仓状态机纯内存，进程重启后清空 → 隔夜 T+1 持仓永不进卖出决策（裸奔扛单）。
+          单进程系统设计为"每日盘前主动重连 + 异常自动重启"，重启是常态，故启动必须能从券商权威重建。
+        - P1#30：断线期间发生的买入成交只经 query_* 补采落库、不回写持仓状态机 → 同样漏卖。
+          重连补采后调用本方法，券商已反映该持仓即被重建为可卖单元。
+        - P1#29/P2#38：apply_position_snapshot 是死代码、从未被调用 → T+1 可卖量纯本地推算。
+          本方法对已有单元用 QMT 权威值校准 volume/can_use_volume。
+
+        入参 records：可迭代，每项需可取 ts_code / volume / can_use_volume（PositionRecord 或等价对象），
+        avg_price/avg_cost 可选（缺则按 0 记成本，仅影响展示，不影响 T+1 量闸/可卖判定）。
+
+        重建口径（守 T+1，以 QMT 可卖量为权威）：
+        - 已有单元：校准 volume/can_use_volume；若本地为终态 SOLD 而券商仍有量(volume>0) → 视为遗漏，
+          重建为可卖单元（断线期间建仓 / 重启后券商有量但本地已关闭）。
+        - 本地无单元且 create_missing：
+            can_use_volume>0      → HOLDING，earliest_sellable_date=today（隔夜已过 T+1，当日即可卖）；
+            can_use_volume==0     → LOCKED_T1，earliest_sellable_date=next_open(today)（当日新建仓/全冻结，守 T+1）。
+          buy_date：隔夜可卖 → prev_open(today)（已无真实买入日，取上一交易日作保守标签）；当日锁定 → today。
+        - 券商无量(volume<=0)：跳过（不建空单元）。
+        返回重建 / 校准的单元数（供日志 / 断言）。
+        """
+        touched = 0
+        for rec in records or []:
+            ts_code = getattr(rec, "ts_code", None)
+            if ts_code is None:
+                continue
+            vol_raw = getattr(rec, "volume", None)
+            volume = int(vol_raw) if vol_raw is not None else 0
+            cu_raw = getattr(rec, "can_use_volume", None)
+            can_use = int(cu_raw) if cu_raw is not None else 0
+            if volume <= 0:
+                continue  # 券商无持仓量：不建空单元
+            avg_raw = getattr(rec, "avg_price", None)
+            if avg_raw is None:
+                avg_raw = getattr(rec, "avg_cost", None)
+            avg_cost = Decimal(str(avg_raw)) if avg_raw is not None else Decimal("0")
+
+            # account_id 取记录自带（多账户隔离）；normalize_position 已填，缺失则该记录无法定位单元键。
+            rec_account_id = getattr(rec, "account_id", None)
+            if rec_account_id is None:
+                continue
+            key = (rec_account_id, ts_code)
+            unit = self._units.get(key)
+
+            if unit is not None and unit.state != PositionState.SOLD:
+                # 已有活跃单元：以 QMT 权威校准 volume/can_use_volume（保留状态机/成本/buy_date）。
+                unit.volume = volume
+                unit.can_use_volume = can_use
+                touched += 1
+                continue
+
+            if not create_missing and (unit is None or unit.state == PositionState.SOLD):
+                continue
+
+            # 口径边界（评审复审 P2）：以券商快照"量权威"重建的单元 counted_trade_ids 为空——若重建后又收到一笔
+            # 已被该快照 volume 计入的【迟到买入成交回调】，mark_position_on_fill 去重集为空会在权威量上再加一次
+            # （多报持仓）。属"快照量权威 vs 事件量权威"混用的固有边界，概率低（重建多在盘前/重连点、晚于当日成交
+            # 回放窗口），且收盘对账的资产/持仓偏差会兜底告警。如需根治可在拿到券商成交序号时预填去重集。
+            # 新建 / 重建（本地无单元，或本地终态 SOLD 但券商仍有量=遗漏）。
+            if can_use > 0:
+                state = PositionState.HOLDING
+                earliest = today
+                buy_date = self._calendar.prev_open(today)
+            else:
+                state = PositionState.LOCKED_T1
+                earliest = self._calendar.next_open(today)
+                buy_date = today
+            # 结构性写入加锁（评审复审 P1）：断线重连在回调线程批量重建单元，须与调度线程迭代互斥。
+            with self._lock:
+                self._units[key] = PositionUnit(
+                    account_id=key[0],
+                    ts_code=ts_code,
+                    volume=volume,
+                    can_use_volume=can_use,
+                    avg_cost=avg_cost,
+                    earliest_sellable_date=earliest,
+                    state=state,
+                    mode=PositionMode.TECH_EXIT,  # 重建单元默认纯技术退出，refresh_state 据先验再校正
+                    buy_date=buy_date,
+                )
+            touched += 1
+            self._logger.info(
+                "position_rebuilt_from_broker",
+                account_id=key[0],
+                ts_code=ts_code,
+                volume=volume,
+                can_use_volume=can_use,
+                state=str(state),
+                earliest_sellable_date=str(earliest),
+            )
+        if touched:
+            self._logger.info("position_rebuild_done", count=touched, today=str(today))
+        return touched

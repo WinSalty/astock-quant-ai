@@ -25,14 +25,18 @@ from ..common.auction_window import is_lunch_break
 from ..common.time_utils import east8_trade_date
 from ..config.settings import Settings
 from ..contracts.enums import (
+    DataSource,
     EntryAction,
     OrderPhase,
+    OrderState,
     PositionState,
     RiskVerdict,
     SellActionType,
+    SnapshotType,
     TradeSide,
 )
 from ..contracts.models import (
+    AccountRecord,
     AuctionSnapshot,
     EntryDecision,
     OrderBook,
@@ -40,6 +44,7 @@ from ..contracts.models import (
     SignalPrior,
     WatchlistContext,
 )
+from ..data_writer import normalize
 from ..contracts.protocols import (
     Clock,
     QmtRepository,
@@ -142,6 +147,9 @@ class Engine:
         # 重启幂等（评审 P0-C4）：台账已由 LocalStorage.start()→load_from_db 重建，这里据此重置
         # biz 序号计数器，保证重启后新单序号严格大于历史、不与磁盘失败单同号覆盖/重复下单。
         self._order.rebuild_seq_counter()
+        # 重启重建运行态（评审二轮 P1#28/P2#32/#40/#69）：TTL 截止表 + 单日下单次数计数器从台账重建，
+        # 否则崩溃前在途单永不再被 sweep 撤单、单日下单次数硬闸被清零绕过。
+        self._order.rebuild_runtime_state()
 
         # —— 回调（落库 + 台账 + 持仓建仓回写 + 断线补采钩子）——
         # position_sink：评审 P0-A2 修复——把成交回报回写持仓状态机，否则永远空集、永不卖出。
@@ -151,6 +159,8 @@ class Engine:
             trade_date_provider=self._today_provider,
             on_disconnected_hook=self.on_reconnect_backfill,
             position_sink=self._apply_trade_to_position,
+            # 卖单终态失败复位钩子（评审二轮 P1#31）：拒单/全撤零成交 → 持仓从 SELLING 复位回 HOLDING 重挂。
+            sell_revert_sink=self._revert_sell_unit,
         )
 
         # —— 收盘 / 补采 + 对账 ——
@@ -180,6 +190,12 @@ class Engine:
         self._day_open_equity: Optional[Decimal] = None
         # 强度资金权重表：ts_code → 预算占比（prewarm 按当日可交易候选 leader_strength_score 归一）。
         self._strength_weights: Dict[str, Decimal] = {}
+        # 存储健康标志（评审二轮 P0#2）：写线程死亡 / 关键落盘失败时由 on_storage_failure 置 False。
+        # fail-closed 口径：存储不健康 → 停开新仓（持仓事实无法可靠持久 = 重启幂等/对账失效），但不冻结卖出
+        # （保留风险出场能力，与 risk.gate 的"空仓不锁卖出"同口径）。装配末尾由 run.py 接线到 stack.set_on_failure。
+        self._storage_ok = True
+        # 当日已抓基线的交易日（评审二轮 P1#19）：防同日盘中重启 prewarm 重跑覆盖日初回撤基线。
+        self._day_open_equity_date: Optional[date] = None
 
     # ------------------------------------------------------------------
     # 对外暴露（供 main / 连接守护注册回调 / 调度）
@@ -200,6 +216,38 @@ class Engine:
             pass
 
     # ------------------------------------------------------------------
+    # 存储 fail-closed（评审二轮 P0#2）
+    # ------------------------------------------------------------------
+    def on_storage_failure(self, reason: str) -> None:
+        """存储故障入口：写线程死亡 / 关键落盘失败时被 AsyncWriteQueue.on_failure 回调。
+
+        置"存储不健康" → 停开新仓（_open_blocked_by_risk / _router_sink 据此拒开），并强告警。
+        不冻结卖出：持久化失效时仍允许风险出场（与空仓闸门"不锁卖出"同口径，避免被迫扛单）。
+        幂等：重复回调只重复告警，不改变语义。运行期不自动恢复——须人工排查写线程后重启进程。
+        """
+        self._storage_ok = False
+        self._logger.error("engine_storage_fail_closed", reason=reason, account_id=self._account_id)
+
+    def storage_health_tick(self) -> None:
+        """供调度器周期体检调用（评审二轮 P0#2）：探测存储栈健康，不健康即 fail-closed 停开新仓。
+
+        与 on_failure 回调互补：on_failure 是事件驱动（submit 命中死线程时触发），本方法是轮询兜底
+        （写线程静默死亡且当轮无 submit 时也能被发现）。健康探测器由 run.py 装配时注入（缺省 no-op）。
+        """
+        checker = getattr(self, "_storage_health_checker", None)
+        if checker is None:
+            return
+        try:
+            if not checker():
+                self.on_storage_failure("storage_unhealthy_on_tick")
+        except Exception as exc:  # noqa: BLE001 体检异常不得拖垮调度
+            self._logger.warn("engine_storage_health_tick_error", error=str(exc))
+
+    def set_storage_health_checker(self, checker: Callable[[], bool]) -> None:
+        """注入存储健康探测器（返回 True=健康）。由 run.py 接线到 stack.is_healthy。"""
+        self._storage_health_checker = checker
+
+    # ------------------------------------------------------------------
     # 盘前：装载当日 watchlist + 推进持仓状态
     # ------------------------------------------------------------------
     def prewarm(self, today: date) -> WatchlistContext:
@@ -212,8 +260,12 @@ class Engine:
         self._market_state = self._extract_market_state(ctx)
         # 推进持仓状态：跨买入日 LOCKED_T1 → HOLDING，并刷新先验挂接（§5.6）。
         self._position.refresh_state(today)
-        # 抓取日初总资产基线（评审 P0-B2）：供盘中 risk.gate 算账户日内回撤击穿。
-        self._capture_day_open_equity()
+        # 用 QMT 权威持仓重建/校准持仓状态机（评审二轮 P0#6/#29/#30/#38）：重启/断线后隔夜 T+1 持仓
+        # 必定进入卖出决策，且可卖量以 QMT 为权威。须在 refresh_state 之后，保证 QMT can_use 是最终口径。
+        self._rebuild_positions_from_broker(today)
+        # 抓取日初总资产基线（评审 P0-B2 + 二轮 P1#19）：供盘中 risk.gate 算账户日内回撤击穿；
+        # 同日盘中重启复用已持久化的 OPEN 基线，绝不把当前(已亏损)资产当日初基线。
+        self._capture_day_open_equity(today)
         # 计算当日强度资金权重（按 leader_strength_score 给候选分预算占比，强的分得多）。
         self._compute_strength_weights()
         self._logger.info(
@@ -239,15 +291,89 @@ class Engine:
     # ------------------------------------------------------------------
     # 账户级风控输入（评审 P0-B2：喂给 risk.gate，使账户回撤击穿真正触发 FREEZE）
     # ------------------------------------------------------------------
-    def _capture_day_open_equity(self) -> None:
-        """抓取日初总资产作回撤基线（prewarm 调用）。查询失败 → None（不凭空冻结，安全默认）。"""
+    def _rebuild_positions_from_broker(self, today: date) -> None:
+        """盘前 / 重连后用 QMT 权威持仓重建 / 校准持仓状态机（评审二轮 P0#6/#29/#30/#38）。
+
+        业务意图：持仓状态机纯内存，进程重启清空；断线期间建仓只补采落库不回写持仓——二者都会导致隔夜
+        T+1 持仓永不进卖出决策（裸奔扛单）。这里查 QMT query_stock_positions（权威全集）→ 归一 →
+        交 PositionManager.rebuild_from_broker_positions：重建本地缺失的持仓单元、用 QMT 可卖量校准。
+        边界：查询失败不抛断 prewarm（保留现有内存态），仅强告警——重启后无法重建会漏卖，须人工关注。
+        """
+        try:
+            raws = self._deps.trader.query_stock_positions(self._deps.account)
+        except Exception as exc:  # noqa: BLE001 查询失败不阻断盘前装载，但强告警（漏卖风险）
+            self._logger.error("engine_position_rebuild_query_failed", error=str(exc))
+            return
+        records = []
+        for p in raws or []:
+            try:
+                rec = normalize.normalize_position(
+                    p, account_id=self._account_id, trade_date=today, snapshot_type=SnapshotType.OPEN
+                )
+            except Exception:  # noqa: BLE001 单条规整失败跳过，不拖垮整体重建
+                continue
+            if rec.ts_code is None:
+                continue
+            records.append(rec)
+        n = self._position.rebuild_from_broker_positions(records, today)
+        self._logger.info("engine_positions_rebuilt", count=n, queried=len(records))
+
+    def _capture_day_open_equity(self, today: date) -> None:
+        """抓取日初总资产作回撤基线（prewarm 调用），并持久化供同日重启复用（评审 P0-B2 + 二轮 P1#19）。
+
+        盘中崩溃重启后 prewarm 会重跑——若每次都把"当前总资产"当日初基线，已亏损时基线被悄悄抬低，
+        账户日内回撤永远算不出击穿，回撤熔断形同虚设。修复：
+        1) 本进程同日已抓过（_day_open_equity_date==today）→ 不重复抓；
+        2) 否则先读已持久化的当日 OPEN 资产快照作基线（上一进程开盘前落的真实日初值）；
+        3) 都没有才查当前资产作基线，并落 OPEN 快照（供同日后续重启复用）。
+        查询失败 → None（回撤口径降级为 None，不凭空冻结，其它闸门仍生效）。
+        """
+        # 1) 本进程同日已抓过：直接复用，避免重跑覆盖。
+        if self._day_open_equity_date == today and self._day_open_equity is not None:
+            return
+        # 2) 复用已持久化的当日 OPEN 基线（重启复用的关键）。
+        try:
+            existing = self._deps.repository.get_account_daily(
+                self._account_id, today, SnapshotType.OPEN
+            )
+        except Exception:  # noqa: BLE001 读基线失败不致命，回落实时查询
+            existing = None
+        if existing is not None and existing.total_asset is not None and existing.total_asset > 0:
+            self._day_open_equity = Decimal(str(existing.total_asset))
+            self._day_open_equity_date = today
+            self._logger.info("engine_day_open_equity_reused", trade_date=str(today))
+            return
+        # 3) 首次：查当前资产作基线并持久化 OPEN 快照。
         try:
             asset = self._deps.trader.query_stock_asset(self._deps.account)
             ta = getattr(asset, "total_asset", None)
-            self._day_open_equity = Decimal(str(ta)) if ta is not None else None
+            cash = getattr(asset, "cash", None)
         except Exception as exc:  # noqa: BLE001 资产查询失败不阻断盘前装载，回撤口径降级为 None
             self._day_open_equity = None
             self._logger.warn("engine_day_open_equity_failed", error=str(exc))
+            return
+        if ta is None:
+            self._day_open_equity = None
+            return
+        self._day_open_equity = Decimal(str(ta))
+        self._day_open_equity_date = today
+        # 持久化 OPEN 资产基线（供同日盘中重启复用）：不污染净值曲线（复盘只认 CLOSE 快照）。
+        try:
+            rec = AccountRecord(
+                account_id=self._account_id,
+                trade_date=today,
+                total_asset=Decimal(str(ta)),
+                cash=Decimal(str(cash)) if cash is not None else Decimal("0"),
+                snapshot_type=SnapshotType.OPEN,
+                data_source=DataSource.QUERY,
+            )
+            self._data_writer.upsert_account_daily(rec, SnapshotType.OPEN)
+            # 尽量 drain 落盘（prewarm 非热路径，可阻塞）：flush_hook 为普通 flush（仅等队列清空，不强确认
+            # commit 成功），故只是尽力把基线尽快落盘；万一未及落盘即崩溃，重启时回落"重新抓当前资产"老口径，
+            # 仅退化、不致命（回撤基线不如下单关键，无需 flush_confirm 级强保证）。
+            self._deps.flush_hook()
+        except Exception as exc:  # noqa: BLE001 基线持久化失败不致命，退化为本进程内存基线
+            self._logger.warn("engine_day_open_equity_persist_failed", error=str(exc))
 
     def _account_drawdown(self) -> Optional[Decimal]:
         """账户日内回撤 = max(0, (日初总资产 − 当前总资产) / 日初总资产)，正数表示亏损幅度。
@@ -278,6 +404,10 @@ class Engine:
         注意：本闸门只管「开新仓」；卖出（风险减仓）不受账户回撤/空仓闸门影响，避免冻结必要的止损出场，
         故 run_sell_pass 的 gate 仍只用行情/下单中断口径（不喂账户回撤）。
         """
+        # —— 存储 fail-closed（评审二轮 P0#2）：持久化失效则禁开新仓（重启幂等/对账依赖可信落盘）——
+        if not self._storage_ok:
+            self._logger.error("engine_open_blocked_storage_unhealthy", ts_code=ts_code)
+            return True
         verdict = self._risk.gate(
             market_state=self._market_state,
             market_feed_ok=self._market_feed_ok,
@@ -431,6 +561,17 @@ class Engine:
                 error=str(exc),
             )
 
+    def _revert_sell_unit(self, ts_code: str) -> None:
+        """卖单终态失败（拒单/全撤零成交）的持仓复位（评审二轮 P1#31，由 callbacks 经 sell_revert_sink 调用）。
+
+        把对应 (account_id, ts_code) 持仓单元从 SELLING 复位回 HOLDING，使下一轮卖出巡检可重新挂单，
+        止损/破位清仓不再因一次挂单失败而永久失效。无该单元（手工/非本系统）则忽略。
+        """
+        unit = self._position.get_unit(self._account_id, ts_code)
+        if unit is None:
+            return
+        self._position.revert_selling(unit, reason="sell_order_terminal_failed")
+
     # ------------------------------------------------------------------
     # 竞价轮询（§3 / §4 建仓链路）
     # ------------------------------------------------------------------
@@ -527,35 +668,54 @@ class Engine:
             return []
         sold: List[str] = []
         for unit in self._position.sellable_units(today):
-            # —— 在途卖单跳过（评审 P0-C2 修复）——
-            # sellable_units 含 SELLING（在途已发卖单）单元，原实现每 tick 仍对其二次决策，
-            # 命中 CLEAR/REDUCE 时会在 order_stock 已发第二张卖单之后才在 mark_selling 抛错，
-            # 造成「重复下卖单 + 抛错中断本轮其余持仓的应卖决策」。这里在决策前显式跳过在途单元，
-            # 等成交回报推进出 SELLING 后下一轮再评（卖出成交回写见 _apply_trade_to_position）。
-            if unit.state == PositionState.SELLING:
-                continue
-            # 风控闸门：行情/下单中断 → FREEZE 跳过；空仓 SELL_ONLY_HOLD 不影响卖出。
-            verdict = self._risk.gate(
-                market_state=self._market_state,
-                market_feed_ok=self._market_feed_ok,
-                trade_conn_ok=self._trade_conn_ok,
-            )
-            if verdict.verdict == RiskVerdict.FREEZE:
-                self._logger.warn("engine_sell_frozen", ts_code=unit.ts_code, reason=verdict.reason)
-                continue
-            prior = self._deps.prior_provider(unit.ts_code, today)
-            book = books.get(unit.ts_code)
-            if book is None:
-                # 无执行侧盘口：安全默认不主动卖（§5.4.3，没有可信盘口不做实时卖出决策）。
-                continue
-            if session == "auction":
-                action = self._sell.decide_auction(unit, prior, book, risk_verdict=verdict.verdict)
-            else:
-                action = self._sell.decide_intraday(unit, prior, book, risk_verdict=verdict.verdict)
-            if action.action in (SellActionType.REDUCE, SellActionType.CLEAR):
-                if self._place_sell(unit, action.action, action.reduce_ratio, action.reason, book, today):
+            # 单票评估/下单异常隔离（评审复审 P1 / 二轮 #90）：任一单只票的盘口/决策/下单异常只跳过该票，
+            # 绝不中断整轮卖出巡检——否则一只票失败会让其余该卖的票全部漏卖（裸奔扛单）。
+            try:
+                if self._evaluate_and_sell_unit(unit, today, books, session):
                     sold.append(unit.ts_code)
+            except Exception as exc:  # noqa: BLE001 单票失败不拖垮整轮卖出
+                self._logger.error(
+                    "engine_sell_unit_failed", ts_code=getattr(unit, "ts_code", None), error=str(exc)
+                )
         return sold
+
+    def _evaluate_and_sell_unit(self, unit, today, books, session) -> bool:
+        """对单只可卖单元评估并（必要时）下卖单，返回是否发出卖单。
+
+        由 run_sell_pass 以 per-unit try/except 调用，保证单票异常不拖垮整轮巡检（评审复审 P1）。
+        """
+        # —— 在途卖单跳过（评审 P0-C2 修复）——
+        # sellable_units 含 SELLING（在途已发卖单）单元，原实现每 tick 仍对其二次决策，命中 CLEAR/REDUCE 时
+        # 会在 order_stock 已发第二张卖单之后才在 mark_selling 抛错。这里在决策前显式跳过在途单元，等成交回报
+        # 推进出 SELLING 后下一轮再评（卖出成交回写见 _apply_trade_to_position）。
+        if unit.state == PositionState.SELLING:
+            return False
+        # 风控闸门：行情/下单中断 → FREEZE 跳过；空仓 SELL_ONLY_HOLD 不影响卖出。
+        verdict = self._risk.gate(
+            market_state=self._market_state,
+            market_feed_ok=self._market_feed_ok,
+            trade_conn_ok=self._trade_conn_ok,
+        )
+        if verdict.verdict == RiskVerdict.FREEZE:
+            self._logger.warn("engine_sell_frozen", ts_code=unit.ts_code, reason=verdict.reason)
+            return False
+        # 先验取数异常隔离（评审二轮 P3#90）：单票 prior_provider 抛错按"无先验"处理（不拖垮整轮）。
+        try:
+            prior = self._deps.prior_provider(unit.ts_code, today)
+        except Exception as exc:  # noqa: BLE001 单票先验失败不拖垮整轮卖出
+            self._logger.warn("engine_sell_prior_failed", ts_code=unit.ts_code, error=str(exc))
+            prior = None
+        book = books.get(unit.ts_code)
+        if book is None:
+            # 无执行侧盘口：安全默认不主动卖（§5.4.3，没有可信盘口不做实时卖出决策）。
+            return False
+        if session == "auction":
+            action = self._sell.decide_auction(unit, prior, book, risk_verdict=verdict.verdict)
+        else:
+            action = self._sell.decide_intraday(unit, prior, book, risk_verdict=verdict.verdict)
+        if action.action in (SellActionType.REDUCE, SellActionType.CLEAR):
+            return self._place_sell(unit, action.action, action.reduce_ratio, action.reason, book, today)
+        return False
 
     def _place_sell(self, unit, action_type, reduce_ratio, reason, book=None, today=None) -> bool:
         """发出卖出委托（守 T+1 量闸 + kill_switch + 价位取实时盘口）。
@@ -581,10 +741,13 @@ class Engine:
             )
             return False
         if action_type == SellActionType.CLEAR:
+            # 清仓卖全部可用量（含不足整手的零股——A 股允许一次性清掉零股余额）。
             decision_vol = unit.can_use_volume
         else:
+            # 减仓须为整手（评审二轮 P2#37）：按比例算出的减仓量【向下取整到 100 股】，否则奇数股卖单被券商
+            # 拒为废单（部分卖出会留下余仓，必须整手；清仓才允许零股）。不足一手则减仓量为 0、本轮不卖。
             ratio = reduce_ratio if reduce_ratio is not None else Decimal("0.5")
-            decision_vol = int(unit.can_use_volume * ratio)
+            decision_vol = (int(unit.can_use_volume * ratio) // 100) * 100
         sell_vol = self._risk.clamp_sell_volume(decision_vol, unit.can_use_volume)
         if sell_vol <= 0:
             return False
@@ -610,7 +773,15 @@ class Engine:
         )
         if biz_no is None:
             return False
-        self._position.mark_selling(unit)
+        # mark_selling 竞态防御（评审复审 P1）：place_sell 内含同步落盘确认，发单到此处之间 QMT 回调线程可能已
+        # 把该单元推进（刚发卖单秒成 → PART_SOLD/SOLD，或并发推进）。仅当单元仍处可发卖态才 mark_selling，避免对
+        # 已被回调推进的单元强行改写而抛 ValueError 中断整轮卖出（持仓事实以回调推进为准）。
+        if unit.state in (PositionState.HOLDING, PositionState.PART_SOLD):
+            self._position.mark_selling(unit)
+        else:
+            self._logger.info(
+                "engine_sell_unit_already_advanced", ts_code=unit.ts_code, state=str(unit.state)
+            )
         self._logger.info(
             "engine_sell_placed", ts_code=unit.ts_code, volume=sell_vol, reason=reason, biz_order_no=biz_no
         )
@@ -624,6 +795,9 @@ class Engine:
         self._trade_conn_ok = False
         try:
             self._snapshot.run_backfill()
+            # 补采后用 QMT 权威持仓重建持仓状态机（评审二轮 P1#30）：断线期间发生的买入成交只被 query_*
+            # 补采落库、不回写持仓状态机 → 会漏卖；这里据 QMT 当前持仓重建/校准单元，使其进入卖出决策。
+            self._rebuild_positions_from_broker(self._today_provider())
         finally:
             # 补采尝试后恢复通道标志（真实重连成功与否由连接守护判定，这里乐观置回）。
             self._trade_conn_ok = True

@@ -50,6 +50,14 @@ class AsyncWriteQueue:
         self._failed = threading.Event()
         # 边沿触发的积压告警水位（评审 low#1：避免取模相等在并发下漏报）。
         self._warn_level = depth_warn
+        # 「本批 commit 全成功」标志（仅写线程读写：任一任务 commit 失败置 False，屏障任务读后复位 True）。
+        # 业务意图（评审二轮 P0#1）：flush()/unfinished_tasks 只表示"队列已 drain"，不感知 commit 成败——
+        # 写任务 commit 抛错被 rollback 后仍 task_done()，使 flush 对落盘失败误报成功，发单前落盘保证失效。
+        # flush_confirm 投递一个"屏障任务"（单写线程 FIFO，屏障必在此前所有任务执行完后才运行），屏障读取
+        # 本标志即可判定"自上次确认以来这批写是否全部 commit 成功"，从而区分"已 drain"与"已持久"。
+        # 单调复位口径：屏障读取后复位为 True，故 flush_confirm 设计为由单一调用方串行调用（下单/收盘等
+        # 非热路径），并发调用至多偏保守（把别的批的失败算到本批，多判一次失败），绝不漏判。
+        self._batch_ok = True
 
     def start(self, ready_timeout: float = 5.0) -> None:
         """启动写线程并【同步等待】其成功打开写连接。重复调用幂等。
@@ -99,6 +107,14 @@ class AsyncWriteQueue:
         """写线程健康性（供 local_stack / Engine 周期性健康检查）。"""
         return self._started and not self._failed.is_set() and self._thread is not None and self._thread.is_alive()
 
+    def set_on_failure(self, on_failure: Optional[Callable[[str], None]]) -> None:
+        """装配后补设存储故障告警钩子（评审二轮 P0#2）。
+
+        业务意图：on_failure 须指向 Engine 的 fail-closed 入口（置"存储不健康"→停开新仓+强告警），
+        但 Engine 在 LocalStorage 之后才装配，构造期无法注入，故提供本 setter 在装配末尾接线。
+        """
+        self._on_failure = on_failure
+
     def _run(self) -> None:
         """写线程主循环：串行取任务、执行、commit；任一异常只吞不传播（交易不受影响）。"""
         try:
@@ -127,6 +143,8 @@ class AsyncWriteQueue:
                     self._conn.rollback()
                 except Exception:
                     pass
+                # 标记本批存在 commit 失败（评审二轮 P0#1）：供 flush_confirm 的屏障任务据此判失败。
+                self._batch_ok = False
                 self._logger.error("async_write_failed", error=repr(e), name=self._name)
             finally:
                 self._q.task_done()
@@ -147,6 +165,47 @@ class AsyncWriteQueue:
                 return False
             time.sleep(0.005)
         return True
+
+    def flush_confirm(self, timeout: float = 5.0) -> bool:
+        """阻塞等队列清空并【确认这批任务全部 commit 成功】（评审二轮 P0#1 / P0#2）。
+
+        与 flush() 的区别：flush() 只看"队列已 drain"（unfinished_tasks==0），对 commit 失败无感知；
+        本方法投递一个"屏障任务"——单写线程 FIFO，屏障必在此前所有任务执行完后才运行——屏障在写线程内
+        读取标志 self._batch_ok（任一前序任务 commit 失败时已被置 False），并复位为 True 供下一批：
+        - 屏障读到 _batch_ok==False → 这批里有任务落盘失败 → 返回 False（调用方据此 fail-closed / 拒发单）；
+        - 屏障读到 _batch_ok==True  → 全部 commit 成功 → 返回 True。
+
+        写线程已死/未建连：直接判失败（不必等超时）并触发 on_failure 告警 → 屏障不入队，返回 False。
+        即"写线程死亡 + 关键落盘"场景下本方法必判失败，绝不误报成功。
+
+        线程安全：本方法设计为由单一调用方（下单/收盘等非热路径）串行调用；屏障读取 _batch_ok 后复位 True，
+        故并发调用至多偏保守（把别批失败算到本批），绝不漏判。
+        """
+        if not self._started:
+            return False
+        # 写线程已死：直接判失败（不必等超时），并触发故障告警钩子（→ 上层 fail-closed）。
+        if self._failed.is_set() or (self._thread is not None and not self._thread.is_alive()):
+            self._logger.error("write_queue_dead_on_confirm", name=self._name)
+            if self._on_failure is not None:
+                try:
+                    self._on_failure("write_queue_dead")
+                except Exception:  # noqa: BLE001 告警钩子异常不得影响调用方
+                    pass
+            return False
+        ev = threading.Event()
+        box: dict = {}
+
+        def _barrier(_conn: Any) -> None:
+            # 在写线程内、此前所有任务执行后运行：抓拍"本批 commit 是否全成功"，并复位标志供下一批，唤醒等待方。
+            box["ok"] = self._batch_ok
+            self._batch_ok = True
+            ev.set()
+
+        self._q.put_nowait(_barrier)
+        if not ev.wait(timeout):
+            return False
+        # 屏障执行时本批无 commit 失败 → 这批关键写全部已持久。
+        return bool(box.get("ok", False))
 
     def _pending(self) -> int:
         """未完成任务数（含已取出未 task_done 的在途任务）。"""
