@@ -123,6 +123,9 @@ class Engine:
         self._order = OrderExecutor(
             deps.trader, deps.account, deps.account_id, self._ledger, s, deps.clock, deps.logger
         )
+        # 重启幂等（评审 P0-C4）：台账已由 LocalStorage.start()→load_from_db 重建，这里据此重置
+        # biz 序号计数器，保证重启后新单序号严格大于历史、不与磁盘失败单同号覆盖/重复下单。
+        self._order.rebuild_seq_counter()
 
         # —— 回调（落库 + 台账 + 持仓建仓回写 + 断线补采钩子）——
         # position_sink：评审 P0-A2 修复——把成交回报回写持仓状态机，否则永远空集、永不卖出。

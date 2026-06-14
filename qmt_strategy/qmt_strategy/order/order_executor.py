@@ -84,6 +84,32 @@ class OrderExecutor:
         self._orders_count_by_date: Dict[Any, int] = {}
 
     # ------------------------------------------------------------------
+    # 重启幂等：从台账重建 biz 序号计数器（评审 P0-C4）
+    # ------------------------------------------------------------------
+    def rebuild_seq_counter(self) -> None:
+        """进程重启后按已重建的台账重置 biz_order_no 序号计数器。
+
+        背景：load_from_db 重建了台账，但本类 _seq_counter 仍从 0 起算。若某 (target,ts_code,family)
+        当日唯一一笔是终态失败（CANCELLED/REJECTED/ERROR，不在 active 集），重启后该计划被再次推送时
+        find_active 返回 None → 继续 place，build_biz_order_no 又产出 _001 与磁盘失败单同号 →
+        INSERT OR REPLACE 覆盖原失败留痕、甚至重复下单。这里按台账已存在的最大 seq 重建计数器，
+        保证新单序号严格大于历史，杜绝同号覆盖。
+        口径：seq 取 biz_order_no 最后一个 `_` 段（格式 {date}_{ts_code}_{family}_{seq:03d}，
+        family 可能含下划线如 EntryAction.XXX，故用 rsplit 取末段最稳）。
+        """
+        counter: Dict[Tuple[Any, str, str], int] = {}
+        for e in self._ledger.all():
+            try:
+                seq = int(e.biz_order_no.rsplit("_", 1)[1])
+            except (ValueError, IndexError, AttributeError):
+                continue  # 非本类格式的单号（手工/历史脏数据）跳过，不影响计数
+            key = (e.target_trade_date, e.ts_code, e.strategy_family)
+            if seq > counter.get(key, 0):
+                counter[key] = seq
+        self._seq_counter = counter
+        self._logger.info("order_seq_counter_rebuilt", keys=len(counter))
+
+    # ------------------------------------------------------------------
     # (1) 业务唯一单号
     # ------------------------------------------------------------------
     def build_biz_order_no(self, decision: EntryDecision) -> str:

@@ -433,6 +433,27 @@ def test_max_orders_per_day_blocks_overtrading(clock_0916):
     assert "order_max_orders_per_day_block" in logger.events()
 
 
+def test_rebuild_seq_counter_avoids_same_no_after_restart(clock_0916):
+    """评审 P0-C4：重启后 _seq_counter 按台账已存在的最大 seq 重建，新单号严格大于历史，
+    不与磁盘上的终态失败单同号覆盖。"""
+    from qmt_strategy.contracts.enums import OrderState, TradeSide
+    from qmt_strategy.contracts.models import LedgerEntry
+
+    led = InMemoryLocalLedger()
+    # 模拟上一进程留下的终态失败单 _003（CANCELLED 不在 active 集，重启后会被重新推送）。
+    led.insert(LedgerEntry(
+        biz_order_no=f"{T_BUY:%Y%m%d}_600036.SH_打板_003",
+        account_id="acc1", target_trade_date=T_BUY, ts_code="600036.SH",
+        strategy_family="打板", side=TradeSide.BUY, plan_volume=1000,
+        plan_price=Decimal("11.00"), order_remark="LUP|2026-06-11|600036.SH",
+        signal_trade_date=T_SIGNAL, state=OrderState.CANCELLED,
+    ))
+    ex = _executor(FakeTrader(), clock_0916, ledger=led)
+    ex.rebuild_seq_counter()
+    # 新单号必须接在 _003 之后（_004），而非从 _001 起算覆盖历史失败单。
+    assert ex.build_biz_order_no(_decision()).endswith("_004")
+
+
 def test_max_orders_per_day_idempotent_hit_not_counted(clock_0916):
     """幂等命中（重复推同一计划）不占下单次数配额：上限 1 时同标的二次推仍返回既有单。"""
     trader = FakeTrader()
