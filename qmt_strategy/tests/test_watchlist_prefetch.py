@@ -63,6 +63,7 @@ def test_item_mapping_full():
         "close": 45.2, "continuation_prob": "0.6", "next_day_premium_prob": 0.55,
         "strategy_family": "打板", "setup": "首板", "boost_conditions": ["竞价高开3-5%"],
         "fail_conditions": ["炸板"], "market_state": "高潮",
+        "first_board_vol": 1234500, "float_mktcap": "1000000000",
     }
     row = watchlist_item_to_selected(item, date(2026, 6, 13))
     assert row.ts_code == "300750.SZ"
@@ -79,9 +80,11 @@ def test_item_mapping_full():
     assert row.boost == ["竞价高开3-5%"]
     assert row.fail_conditions == ["炸板"]
     assert row.market_state == "高潮"
-    # 信号侧 watchlist 契约不给价位/因子，留空由 board_rules 兜底
+    # 价位仍由 board_rules 兜底（契约暂不含）
     assert row.limit_up_price is None
-    assert row.first_board_vol is None
+    # 评审 F3：竞价两因子分母透传（不再写死 None）
+    assert row.first_board_vol == 1234500
+    assert row.float_mktcap == Decimal("1000000000")
 
 
 def test_item_mapping_non_tradable_and_missing_fields():

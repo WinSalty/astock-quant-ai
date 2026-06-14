@@ -30,8 +30,11 @@ from .base import (
 # 9:20 及以后仍整体不可得才确认降级 B → 改判开盘后追（§4.6 / 评审 medium#4）。
 _DECISION_DEADLINE_PHASES = (AuctionPhase.PRE_AUCTION, AuctionPhase.AUCTION_CANCELABLE)
 
-# 竞价量能比达标下限（占位经验阈值，真实落地以实测为准）：竞价放出首板爆量相当比例方算强承接。
-_VOL_RATIO_MIN = Decimal("0.1")
+# 竞价量能比达标下限（低保真占位，待回测标定，评审 F3）。
+# 口径说明：量能比 = 竞价段累计量 / first_board_vol(信号日全天量)。竞价 10 分钟的量天然只占全天的
+# 1–5%，故下限应在 ~0.02–0.05 量级（原 0.1=要求竞价量达全天 10%，几乎永不达标、会把强票全弃）。
+# 终态：分钟数据到位后分母改用"首板日竞价量"(量纲对等)再重定阈值（见 doc/archive/09）。
+_VOL_RATIO_MIN = Decimal("0.02")
 
 
 def _cap_to_limit_up(price, limit_up_price):

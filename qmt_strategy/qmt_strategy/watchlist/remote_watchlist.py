@@ -49,6 +49,15 @@ def _to_decimal(v: Any) -> Optional[Decimal]:
         return None
 
 
+def _to_int(v: Any) -> Optional[int]:
+    """JSON 数值/字符串 → int；None/空/非法 → None（不臆造）。
+
+    评审 F3：first_board_vol 等整数量字段透传用；先经 Decimal 容忍 "123.0"/"1e3" 等浮点表示再取整。
+    """
+    d = _to_decimal(v)
+    return int(d) if d is not None else None
+
+
 def _to_date(v: Any) -> Optional[date]:
     """ISO 字符串/date → date；None/空 → None。"""
     if v is None:
@@ -102,12 +111,14 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
         boost=item.get("boost_conditions"),
         fail_conditions=item.get("fail_conditions"),
         signal_close=_to_decimal(item.get("close")),
-        # 信号侧 watchlist 契约不含理论涨停价/合理高开区间/首板量/流通市值：留空，由 board_rules 兜底现算。
+        # 理论涨停价/合理高开区间：信号侧 watchlist 契约暂不含，留空由 board_rules 兜底现算。
         limit_up_price=None,
         reasonable_open_high_low=None,
         reasonable_open_high_high=None,
-        first_board_vol=None,
-        float_mktcap=None,
+        # 评审 F3：竞价两因子分母——信号侧契约已补 first_board_vol/float_mktcap，这里透传（不再写死 None），
+        # 使执行侧封流比/量能比因子不再结构性恒降级。缺字段(老契约/未回填)仍为 None → 因子走降级。
+        first_board_vol=_to_int(item.get("first_board_vol")),
+        float_mktcap=_to_decimal(item.get("float_mktcap")),
         strategy_family=item.get("strategy_family"),
         setup=item.get("setup"),
     )
