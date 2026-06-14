@@ -21,6 +21,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional
 
+from ..common.auction_window import is_lunch_break
 from ..common.time_utils import east8_trade_date
 from ..config.settings import Settings
 from ..contracts.enums import (
@@ -386,6 +387,10 @@ class Engine:
         REDUCE/CLEAR 则按 clamp_sell_volume(决策量, can_use_volume) 下卖单（绝不超量，§5.4.3）。
         返回本轮发出卖单的 ts_code 列表。
         """
+        # 午休停牌跳过（评审 P1#11）：11:30–13:00 撮合停止，向停牌时段发卖单无法成交（废单/与复牌竞态），
+        # 本轮不做卖出决策，仅等午后复牌再评（盘口只读快照不受影响）。
+        if is_lunch_break(self._clock.now_utc()):
+            return []
         sold: List[str] = []
         for unit in self._position.sellable_units(today):
             # —— 在途卖单跳过（评审 P0-C2 修复）——

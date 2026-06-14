@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, Optional, Tuple
 
-from ..common.auction_window import is_cancel_forbidden
+from ..common.auction_window import is_cancel_forbidden, is_lunch_break
 from ..common.time_utils import east8_now_from_utc
 from ..config.settings import Settings
 from ..contracts.enums import EntryAction, OrderPhase, OrderState, OrderStatus, TradeSide
@@ -368,6 +368,9 @@ class OrderExecutor:
         now = now if now is not None else self._clock.now_utc()
         # 锁定段整体跳过：此段不撤单，保留所有 TTL 截止待定盘后处理。
         if is_cancel_forbidden(now):
+            return []
+        # 午休停牌整体跳过（评审 P1#11）：午休撮合停止，撤单无法成交，保留 TTL 待午后复牌再处理。
+        if is_lunch_break(now):
             return []
         handled = []
         # 先收集到期 biz（避免遍历中修改字典）。

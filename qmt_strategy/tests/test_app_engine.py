@@ -251,6 +251,27 @@ def test_buy_fill_writes_position_then_sellable_next_day_and_no_double_sell():
     assert len(sell_calls2) == 1   # 仍只有 1 张卖单，未重复
 
 
+def test_run_sell_pass_skips_during_lunch():
+    """评审 P1#11：午休(11:30–13:00)整轮跳过卖出决策，不向停牌时段下卖单。"""
+    from qmt_strategy.common.time_utils import FakeClock
+    from qmt_strategy.contracts.models import OrderBook
+    from qmt_strategy.contracts.xt_objects import FakeXtTrade
+
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    eng.callback.on_stock_trade(FakeXtTrade(
+        account_id="acc1", stock_code="600036.SH", traded_id="B1", order_id=1,
+        traded_price=11.00, traded_volume=1000))
+    next_day = deps.calendar.next_open(T_BUY)
+    eng._position.refresh_state(next_day)
+    # 把引擎时钟拨到午休 12:00 → 即便炸板盘口想清仓，也整轮跳过、不下卖单。
+    eng._clock = FakeClock(utc_at_east8(next_day, 12, 0, 0))
+    book = OrderBook(ts_code="600036.SH", broke_board=True)
+    assert eng.run_sell_pass(next_day, books={"600036.SH": book}) == []
+    assert [c for c in deps.trader.order_calls if c[1] == 24] == []   # 无卖单
+
+
 def test_sell_fill_reduces_position_idempotently():
     """卖出成交回报回写：扣减持仓、推进 SOLD/PART_SOLD；同一 traded_id 重投不重复扣减。"""
     from qmt_strategy.contracts.enums import PositionState, TradeSide

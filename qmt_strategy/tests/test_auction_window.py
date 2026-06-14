@@ -4,11 +4,26 @@ from __future__ import annotations
 
 from datetime import date
 
-from qmt_strategy.common.auction_window import is_cancel_forbidden, resolve_phase
+from qmt_strategy.common.auction_window import (
+    is_cancel_forbidden,
+    is_lunch_break,
+    resolve_phase,
+)
 from qmt_strategy.contracts.enums import AuctionPhase
 from tests.conftest import utc_at_east8
 
 D = date(2026, 6, 12)
+
+
+def test_is_lunch_break_boundaries():
+    """评审 P1#11：午休停牌段 11:30:00 ≤ t < 13:00:00（闭左开右）。"""
+    assert is_lunch_break(utc_at_east8(D, 11, 29, 59)) is False
+    assert is_lunch_break(utc_at_east8(D, 11, 30, 0)) is True
+    assert is_lunch_break(utc_at_east8(D, 12, 0, 0)) is True
+    assert is_lunch_break(utc_at_east8(D, 12, 59, 59)) is True
+    assert is_lunch_break(utc_at_east8(D, 13, 0, 0)) is False     # 复牌即非午休
+    assert is_lunch_break(utc_at_east8(D, 10, 0, 0)) is False
+    assert is_lunch_break(utc_at_east8(D, 14, 0, 0)) is False
 
 
 def test_phase_boundaries():
