@@ -84,6 +84,20 @@ class OrderExecutor:
         # 只计真实 order_stock 发出（含同步失败，二者都占「下单次数」配额），幂等命中不计。
         self._orders_count_by_date: Dict[Any, int] = {}
 
+    def _sync_persist_before_order(self) -> None:
+        """发单前同步落盘关键台账行（评审 P0-C3）。
+
+        write-behind 下 insert 仅入队即返回；若在"已发券商委托、但 PLANNED 行尚未落盘"的窗口崩溃，
+        重启 load_from_db 读不到该行 → 重复下单。故在 order_stock 之前阻塞等待写队列清空，保证
+        "磁盘有计划单"先于"券商收到委托"。内存台账（无写队列/已即时持久）无 flush_pending → no-op。
+        """
+        flush = getattr(self._ledger, "flush_pending", None)
+        if callable(flush):
+            ok = flush()
+            if ok is False:
+                # 落盘超时：仍继续下单（不下单会漏掉信号），但强告警——崩溃窗口未被完全堵住，需排查写线程。
+                self._logger.warn("order_ledger_flush_timeout_before_order", account_id=self._account_id)
+
     # ------------------------------------------------------------------
     # 重启幂等：从台账重建 biz 序号计数器（评审 P0-C4）
     # ------------------------------------------------------------------
@@ -252,6 +266,8 @@ class OrderExecutor:
             updated_at=now,
         )
         self._ledger.insert(entry)
+        # 发单前同步落盘（评审 P0-C3）：保证"磁盘有计划单"先于"券商收到委托"，堵崩溃窗口重复下单。
+        self._sync_persist_before_order()
 
         # —— 唯一下单点：限价单（不挂市价，避免滑点失控，§4.4(3)）——
         # price 转 float 仅在调用 trader 边界，Decimal 留作台账/计算口径。
@@ -375,6 +391,8 @@ class OrderExecutor:
             updated_at=now,
         )
         self._ledger.insert(entry)
+        # 发单前同步落盘（评审 P0-C3）：卖单同样保证"磁盘有台账"先于"券商收到委托"。
+        self._sync_persist_before_order()
 
         # —— 唯一下单点：限价卖单 ——
         order_id = self._trader.order_stock(

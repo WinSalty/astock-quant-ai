@@ -440,6 +440,29 @@ def test_place_sell_via_unique_point_with_ledger(clock_0916):
     assert biz2 is not None and biz2.endswith("_SELL_002")
 
 
+def test_place_flushes_ledger_before_order(clock_0916):
+    """评审 P0-C3：发单前同步落盘——flush_pending 在 order_stock 之前被调用（堵崩溃窗口重复下单）。"""
+    events = []
+
+    class SpyLedger(InMemoryLocalLedger):
+        def insert(self, entry):
+            events.append("insert")
+            super().insert(entry)
+
+        def flush_pending(self, timeout=5.0):
+            events.append("flush")
+            return True
+
+    class SpyTrader(FakeTrader):
+        def order_stock(self, *a, **k):
+            events.append("order")
+            return super().order_stock(*a, **k)
+
+    ex = _executor(SpyTrader(), clock_0916, ledger=SpyLedger())
+    ex.place(_decision(plan_volume=1000))
+    assert events.index("insert") < events.index("flush") < events.index("order")
+
+
 def test_place_sell_kill_switch_blocks(clock_0916):
     """kill_switch=True → place_sell 不下单、返回 None。"""
     trader = FakeTrader()
