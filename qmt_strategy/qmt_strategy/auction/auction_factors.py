@@ -46,6 +46,20 @@ def _to_decimal(value: object) -> Optional[Decimal]:
     return d
 
 
+def _best_level(value: object) -> object:
+    """从可能是五档数组的盘口字段取 best 档标量（评审 F4）。
+
+    业务意图：真实 xtdata.get_full_tick 的 bidVol/bidPrice/askVol/askPrice 为五档 list（best 在 [0]），
+    原实现把它当标量直接喂 _to_decimal → Decimal(str(list)) 抛 InvalidOperation 被吞→None，导致一字/
+    竞价封板（bidVol 实为大数组）时虚拟封单恒为 0。这里统一取 best 档：list/tuple 取首元素、标量原样、
+    空/None 返回 None。
+    实测口径：目标机用 vars(tick) 核对 get_full_tick 实际键名与五档结构后固化（键名仍为占位）。
+    """
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value
+
+
 def open_pct(auction_price: Optional[Decimal], pre_close: Optional[Decimal]) -> Optional[Decimal]:
     """竞价高开幅度 = (虚拟成交价 − 昨收) / 昨收（§3.4 因子 1）。
 
@@ -167,8 +181,10 @@ def virtual_seal(
         return info
 
     # 已达涨停：尝试取买一档（一档即虚拟封单）。
-    bid_vol = _to_decimal(tick.get("bidVol"))
-    bid_price = _to_decimal(tick.get("bidPrice"))
+    # 评审 F4：bidVol/bidPrice 真实为五档 list，先经 _best_level 取 best 档再转 Decimal，
+    # 否则一字/竞价封板（数组）会被 _to_decimal 吞成 None、虚拟封单恒 0。
+    bid_vol = _to_decimal(_best_level(tick.get("bidVol")))
+    bid_price = _to_decimal(_best_level(tick.get("bidPrice")))
     if bid_vol is None or bid_price is None:
         # 达涨停但买一量/价取不到 → 封单额无法计算，标 NO_SEAL_VOL 走降级。
         info.data_quality.append(DQ_NO_SEAL_VOL)

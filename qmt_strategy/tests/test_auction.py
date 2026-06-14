@@ -234,6 +234,17 @@ def test_virtual_seal_limit_up_with_bidvol():
     assert DQ_NO_SEAL_VOL not in info.data_quality
 
 
+def test_virtual_seal_limit_up_with_five_level_array_bidvol():
+    """评审 F4：bidVol/bidPrice 为五档数组(真实 xtdata 形态)时，取 best 档算封单额，而非恒 0。"""
+    # 一字/竞价封板：买一巨量封死涨停（五档数组，best 在 [0]）。
+    tick = {"lastPrice": 11.0, "bidVol": [1000, 500, 0, 0, 0], "bidPrice": [11.0, 10.99, 0, 0, 0]}
+    info = virtual_seal(tick, Decimal("11.00"), Decimal("110000"))
+    assert info.is_limit_up is True
+    assert info.virtual_seal_amount == Decimal("11000")  # best 档 1000 × 11.0，而非 0
+    assert info.seal_to_float_ratio == Decimal("0.1")
+    assert DQ_NO_SEAL_VOL not in info.data_quality
+
+
 def test_virtual_seal_not_limit_up():
     """未达涨停 → 封单额 0、is_limit_up False、封流比 None（正常态）。"""
     tick = {"lastPrice": 10.50, "bidVol": 1000, "bidPrice": 10.50}
