@@ -144,12 +144,25 @@ python scripts/export_trade_calendar.py --output /opt/qmt/trade_days.txt --min-f
 - 退出码：0=成功；2=`--start` 非法；3=零交易日（exchange 写错/库未同步）。
 
 **部署（执行侧 Windows 交易机）：** scp 上述文件过去，配环境变量：
+
 ```
 QMT_TRADE_CALENDAR_FILE=C:\qmt\trade_days.txt
 ```
 **维护：** 每年新一年节假日安排公布后（Tushare `trade_cal` 更新）重新同步 `a_trade_calendar` → 重新导出 → scp 覆盖；否则跨年后 `next_open` 会越界。**仅离线/联调**可临时 `QMT_ALLOW_WEEKDAY_CALENDAR=true` 退化为周末近似（强告警，**严禁用于实盘**）。
 
-### 8.4 仍待办（非阻塞，多需回测校准 / 目标机实测）
+### 8.4 买入资金分配口径（按强度加权，2026-06 新增）
+
+有限资金 + 多只候选时，**按 `leader_strength_score` 强度加权分配**（强的分得多、不被弱的抢光）：
+
+- 盘前按当日可交易候选的强度归一为预算权重 `w_i = 强度_i / Σ强度`（缺强度的票用候选最小强度兜底，全缺则等权）；权重盘前一次性算定、**与触发时序无关**——弱票即使买点先达标，也只吃自己的小份额，强票份额被保留。
+- 每只票下单时计划金额 = `min( 可用现金, 总预算上限 − 已承诺, 总预算上限×w, 单笔上限, 单票上限 )`，再 ÷ 限价向下取整到 100 股；算出不足 1 手则不下单。
+- **总预算上限** = 日初权益 × `QMT_TARGET_POSITION_RATIO`（默认 `1.0`=用全部日初权益；调小可留现金，如 `0.8`），并与 `QMT_MAX_TOTAL_EXPOSURE`（绝对总敞口，可选）取小。
+- **已承诺** = 当日活跃买单（在途+已成）金额之和，下单前从预算扣减 → 避免券商 `frozen_cash` 未及时刷新时多单各按全额现金测算而**超额废单**（修复评审 2.3余/B3余）。
+- 持仓继续持有（昨买涨停今不卖）的资金已是 `market_value` 占用、不在可用现金里；不卖不回笼，新票只用剩余现金。
+
+> 关键开关：`QMT_TARGET_POSITION_RATIO`（目标总仓位比）、`QMT_PER_ORDER_MAX_AMOUNT`（单笔金额上限）、`QMT_MAX_POSITION_PER_STOCK`（单票金额上限）、`QMT_MAX_TOTAL_EXPOSURE`（总敞口上限）。
+
+### 8.5 仍待办（非阻塞，多需回测校准 / 目标机实测）
 
 - 上线流程须强制读取回测 `summary['go_no_go']` 裁决（GO/NO_GO/INSUFFICIENT）为放行闸门；其阈值为保守占位，待回测/实盘校准后随版本固化。
 - 目标机 `xtdata.get_full_tick` 五档结构 / `xtconstant` 常量须 `vars()` 实测核对，固化 `auction_factors`/`order_executor`/`normalize` 的 `TODO(实测)` 占位。
