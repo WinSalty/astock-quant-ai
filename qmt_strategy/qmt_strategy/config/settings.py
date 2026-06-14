@@ -67,6 +67,14 @@ class Settings:
     writeback_token: Optional[str] = None     # QMT_WRITEBACK_TOKEN
     ingest_token: Optional[str] = None        # QMT_INGEST_TOKEN（/ingest 服务端校验）
 
+    # —— 交易日历（评审 P0-E1/3.1）：生产须用与信号侧 a_trade_calendar 同源的真实交易日 ——
+    # trade_calendar_file：交易日清单文件路径（每行一个 ISO 日期 YYYY-MM-DD，从信号侧 a_trade_calendar
+    #   导出/同步）。配置后用 StaticTradeCalendar 读取，含法定节假日，T+1/名单键/对账才正确。
+    # allow_weekday_calendar：未提供日历文件时是否允许退化为「仅排周末」的 WeekdayTradeCalendar。
+    #   默认 False=fail-closed（拒绝启动），强制生产提供真实日历；仅离线/测试可显式置 True。
+    trade_calendar_file: Optional[str] = None  # QMT_TRADE_CALENDAR_FILE
+    allow_weekday_calendar: bool = False       # QMT_ALLOW_WEEKDAY_CALENDAR
+
     # —— watchlist 契约来源（§1.2.1 二选一，默认 A 直读表）——
     watchlist_source: str = "DB"              # QMT_WATCHLIST_SOURCE：DB（A）/ HTTP（B）
     watchlist_api_url: Optional[str] = None   # QMT_WATCHLIST_API_URL：B 方案只读接口地址
@@ -153,6 +161,8 @@ class Settings:
             writeback_token=g("QMT_WRITEBACK_TOKEN") or None,
             ingest_token=g("QMT_INGEST_TOKEN") or None,
             watchlist_source=(g("QMT_WATCHLIST_SOURCE") or "DB").upper(),
+            trade_calendar_file=g("QMT_TRADE_CALENDAR_FILE") or None,
+            allow_weekday_calendar=_as_bool(g("QMT_ALLOW_WEEKDAY_CALENDAR") or "false"),
             watchlist_api_url=g("QMT_WATCHLIST_API_URL") or None,
             signal_base_url=g("QMT_SIGNAL_BASE_URL") or None,
             signal_internal_token=g("QMT_SIGNAL_INTERNAL_TOKEN") or None,

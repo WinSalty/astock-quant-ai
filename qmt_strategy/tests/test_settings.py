@@ -45,3 +45,39 @@ def test_redacted_hides_sensitive():
     red = s.redacted()
     assert red["account_id"] == "***REDACTED***"
     assert red["mysql_dsn"] == "***REDACTED***"
+
+
+# ---------------------------------------------------------------------------
+# 评审 P0-E1/3.1：交易日历 fail-closed（生产禁止静默用周末近似日历）
+# ---------------------------------------------------------------------------
+def test_build_calendar_fail_closed_without_file():
+    import pytest
+    from qmt_strategy.app.run import _build_calendar
+    from qmt_strategy.common.logger import RecordingLogger
+
+    s = Settings.from_env({})  # 无日历文件、allow_weekday=False
+    with pytest.raises(RuntimeError):
+        _build_calendar(s, RecordingLogger())
+
+
+def test_build_calendar_allows_weekday_when_opted_in():
+    from qmt_strategy.app.run import _build_calendar
+    from qmt_strategy.common.logger import RecordingLogger
+    from qmt_strategy.common.trade_calendar import WeekdayTradeCalendar
+
+    s = Settings.from_env({"QMT_ALLOW_WEEKDAY_CALENDAR": "true"})
+    assert isinstance(_build_calendar(s, RecordingLogger()), WeekdayTradeCalendar)
+
+
+def test_build_calendar_static_from_file(tmp_path):
+    from datetime import date
+    from qmt_strategy.app.run import _build_calendar
+    from qmt_strategy.common.logger import RecordingLogger
+    from qmt_strategy.common.trade_calendar import StaticTradeCalendar
+
+    f = tmp_path / "cal.txt"
+    f.write_text("# trading days\n2026-06-12\n2026-06-15\n", encoding="utf-8")
+    s = Settings.from_env({"QMT_TRADE_CALENDAR_FILE": str(f)})
+    cal = _build_calendar(s, RecordingLogger())
+    assert isinstance(cal, StaticTradeCalendar)
+    assert cal.is_open(date(2026, 6, 12)) and not cal.is_open(date(2026, 6, 13))

@@ -22,7 +22,7 @@ from ..adapters import xt_real
 from ..auction.tick_source import XtdataTickSource
 from ..common.logger import StructLoggerImpl
 from ..common.time_utils import SystemClock
-from ..common.trade_calendar import WeekdayTradeCalendar
+from ..common.trade_calendar import StaticTradeCalendar, WeekdayTradeCalendar
 from ..config.settings import Settings
 from ..connection.connection_guard import ConnectionGuard
 from ..storage.local_stack import LocalStorage
@@ -90,6 +90,61 @@ def _make_session_id_provider():
     return lambda: next(seq)
 
 
+def _load_trade_calendar_days(path: str) -> list:
+    """从交易日清单文件读取交易日（每行一个 ISO 日期 YYYY-MM-DD，# 开头或空行忽略）。
+
+    文件由信号侧 a_trade_calendar（is_open=1）导出/同步而来，含法定节假日，是执行侧 T+1/名单键/
+    对账日推算的权威来源。解析失败的行跳过；得到空集时由调用方按"无可用日历"处理。
+    """
+    days: list = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            try:
+                days.append(date.fromisoformat(s))
+            except ValueError:
+                continue
+    return days
+
+
+def _build_calendar(settings: Settings, logger):
+    """装配交易日历（评审 P0-E1/3.1：生产禁止静默用周末近似日历）。
+
+    口径（fail-closed）：
+    1) 配了 trade_calendar_file 且能读到 ≥1 个交易日 → StaticTradeCalendar（与信号侧 a_trade_calendar
+       同源、含节假日），日推算正确；
+    2) 未配/读空：
+       - allow_weekday_calendar=True（仅离线/测试显式开）→ WeekdayTradeCalendar + 强告警；
+       - 否则 → 直接抛 RuntimeError 拒绝启动，强制生产提供真实交易日历，绝不让"节假日当交易日"的
+         近似日历静默进实盘（会致 T+1 可卖日偏早、跨假日名单键/对账错位）。
+    """
+    path = settings.trade_calendar_file
+    if path:
+        try:
+            days = _load_trade_calendar_days(path)
+        except OSError as exc:
+            raise RuntimeError(f"交易日历文件无法读取: {path} ({exc})") from exc
+        if days:
+            logger.info("trade_calendar_loaded", source=path, days=len(days))
+            return StaticTradeCalendar(days)
+        logger.error("trade_calendar_file_empty", source=path)
+
+    if settings.allow_weekday_calendar:
+        logger.warn(
+            "trade_calendar_weekday_fallback",
+            reason="未提供 QMT_TRADE_CALENDAR_FILE，退化为仅排周末的近似日历（节假日会被当交易日，仅限测试）",
+        )
+        return WeekdayTradeCalendar()
+
+    raise RuntimeError(
+        "未配置真实交易日历（QMT_TRADE_CALENDAR_FILE 缺失/为空）。生产禁止用周末近似日历"
+        "（会把节假日当交易日，致 T+1 可卖日偏早/名单键/对账错位）。请提供与信号侧 a_trade_calendar"
+        "同源的交易日清单文件；仅离线测试可设 QMT_ALLOW_WEEKDAY_CALENDAR=true 显式放行。"
+    )
+
+
 def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalStorage, ConnectionGuard, SystemClock, object]:
     """装配真实引擎：本地 SQLite 栈 + xtquant 适配器 + Engine + 连接守护。
 
@@ -110,8 +165,7 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     holder = xt_real.TraderHolder()
     account = xt_real.make_stock_account(account_id)            # 触发 xtquant（缺则清晰报错）
     tick_source = XtdataTickSource(xt_real.import_xtdata())     # 触发 xtquant
-    # TODO(实测/落地)：换成读信号侧 a_trade_calendar 的 DbTradeCalendar；WeekdayTradeCalendar 会把节假日当交易日。
-    calendar = WeekdayTradeCalendar()
+    calendar = _build_calendar(settings, logger)
 
     # TODO(落地)：prior_provider 读当日本机 watchlist 表得续板先验（SignalPrior）；缺省 None=纯技术退出。
     deps = EngineDeps(
