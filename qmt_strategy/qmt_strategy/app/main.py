@@ -419,15 +419,20 @@ class Engine:
             else:
                 action = self._sell.decide_intraday(unit, prior, book, risk_verdict=verdict.verdict)
             if action.action in (SellActionType.REDUCE, SellActionType.CLEAR):
-                if self._place_sell(unit, action.action, action.reduce_ratio, action.reason):
+                if self._place_sell(unit, action.action, action.reduce_ratio, action.reason, book):
                     sold.append(unit.ts_code)
         return sold
 
-    def _place_sell(self, unit, action_type, reduce_ratio, reason) -> bool:
-        """发出卖出委托（守 T+1 量闸 + kill_switch + 价位由 QMT 自定）。
+    def _place_sell(self, unit, action_type, reduce_ratio, reason, book=None) -> bool:
+        """发出卖出委托（守 T+1 量闸 + kill_switch + 价位取实时盘口）。
 
         卖量 = clamp(决策量, can_use_volume)，绝不超量（§5.4.3）；CLEAR 卖全部可用，
-        REDUCE 按 reduce_ratio（缺省半仓）卖部分。价位本编排用现价占位（真实由盘口/滑点控制自定，§5.3）。
+        REDUCE 按 reduce_ratio（缺省半仓）卖部分。
+        价位（评审 P2 修复）：取实时盘口 book.last_price（当前市价），而非持仓成本 avg_cost——
+        炸板/破位 CLEAR 时成本价往往远高于现价，挂成本价的卖单成交不了（等于下了单卖不出去），
+        与 CLEAR=立即出场相悖。无盘口现价时回退 avg_cost 并告警（应尽量避免）。
+        注：更优的对手价/跌停保成交价 + 滑点下保护需盘口买一价，依赖目标机 get_full_tick 实测，
+        本次先用 last_price 消除"挂成本价卖不出"的硬伤。
         边界：kill_switch=True 只采集不下单；可卖量 0 跳过。
         """
         if self._settings.kill_switch:
@@ -449,8 +454,16 @@ class Engine:
         sell_vol = self._risk.clamp_sell_volume(decision_vol, unit.can_use_volume)
         if sell_vol <= 0:
             return False
-        # 价位由 QMT 执行侧自定：此处用持仓现价占位（real：结合实时盘口 + 滑点控制）。
-        price = float(unit.avg_cost)
+        # 价位取实时盘口现价（评审 P2）：优先 book.last_price；缺失才回退成本价并告警。
+        if book is not None and getattr(book, "last_price", None) is not None:
+            price = float(book.last_price)
+        else:
+            price = float(unit.avg_cost)
+            self._logger.warn(
+                "engine_sell_price_fallback_avg_cost",
+                ts_code=unit.ts_code,
+                reason="盘口 last_price 缺失，回退成本价(可能挂不出)，应排查盘口源",
+            )
         self._deps.trader.order_stock(
             self._deps.account, unit.ts_code, XT_ORDER_TYPE_SELL, sell_vol,
             XT_PRICE_TYPE_FIX, price, "", f"SELL|{reason}",

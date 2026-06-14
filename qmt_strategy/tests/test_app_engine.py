@@ -45,9 +45,11 @@ class _FakeTrader:
     def __init__(self, cash=1_000_000):
         self._cash = cash
         self.order_calls: List[tuple] = []
+        self.order_prices: List[float] = []   # 与 order_calls 同序，记录每次下单限价
 
     def order_stock(self, account, code, otype, vol, ptype, price, sname, remark):
         self.order_calls.append((code, otype, vol))
+        self.order_prices.append(price)
         return 100 + len(self.order_calls)
 
     def cancel_order_stock(self, account, order_id):
@@ -240,8 +242,10 @@ def test_buy_fill_writes_position_then_sellable_next_day_and_no_double_sell():
     book = OrderBook(ts_code="600036.SH", broke_board=True, is_sealed=False, last_price=Decimal("10.50"))
     sold = eng.run_sell_pass(next_day, books={"600036.SH": book})
     assert sold == ["600036.SH"]
-    sell_calls = [c for c in deps.trader.order_calls if c[1] == 24]  # otype=24 卖出
-    assert len(sell_calls) == 1
+    sell_idx = [i for i, c in enumerate(deps.trader.order_calls) if c[1] == 24]  # otype=24 卖出
+    assert len(sell_idx) == 1
+    # 评审 P2：卖出限价取盘口现价 10.50（而非成本价 avg_cost=11.00，挂成本价炸板卖不出）。
+    assert deps.trader.order_prices[sell_idx[0]] == 10.50
     assert eng._position.get_unit("acc1", "600036.SH").state == PositionState.SELLING
 
     # (4) 同一在途 SELLING 单元再跑一轮 → 跳过、不重复下卖单、不抛错（评审 P0-C2）。
