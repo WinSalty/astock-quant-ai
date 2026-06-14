@@ -430,6 +430,29 @@ class OrderExecutor:
         return biz_no
 
     # ------------------------------------------------------------------
+    # 已承诺买入资金（在途 + 已成）—— 供资金分配/总敞口闸扣减（评审 2.3余/B3余）
+    # ------------------------------------------------------------------
+    def committed_amount(self, target_trade_date: Any) -> Decimal:
+        """当日已承诺买入资金估算 = Σ 活跃买单 plan_volume×plan_price（读台账，权威且含重启重建）。
+
+        业务意图：发单前从可用预算里扣减已承诺，避免券商 frozen_cash 未及时刷新时多只票各按"全额现金"
+        测算而超额下单废单；并作为总敞口闸 max_total_exposure 的已用额度。
+        口径：只计 BUY 方向且处于活跃态（PLANNED..TRADED/CANCELLING）的单；终态失败
+        （CANCELLED/REJECTED/ERROR）不占用资金故不计。同一计划当日多单各自计入（与下单事实一致）。
+        """
+        active = OrderState.active()
+        total = Decimal("0")
+        for e in self._ledger.all_for_date(target_trade_date):
+            if (
+                e.side == TradeSide.BUY
+                and e.state in active
+                and e.plan_price is not None
+                and e.plan_volume
+            ):
+                total += e.plan_price * Decimal(e.plan_volume)
+        return total
+
+    # ------------------------------------------------------------------
     # 计划股数现算（§4.4(6) 资金口径）
     # ------------------------------------------------------------------
     def _plan_volume(self, decision: EntryDecision, limit_price: Optional[Decimal]) -> int:
@@ -446,6 +469,13 @@ class OrderExecutor:
         if cash is None:
             return 0
         budget = Decimal(str(cash))
+        # 总敞口闸 + 在途扣减（评审 2.3余/B3余）：可用预算再受「总敞口上限 − 已承诺(在途+已成)」约束，
+        # 避免券商 frozen_cash 未及时刷新时多单各看全额现金而超额下单废单。
+        committed = self.committed_amount(decision.target_trade_date)
+        if self._settings.max_total_exposure is not None:
+            remaining_total = Decimal(str(self._settings.max_total_exposure)) - committed
+            if remaining_total < budget:
+                budget = remaining_total
         # 单票 / 单笔金额上限：取已配置项中的较小值收紧（None 视为不限制）。
         for cap in (self._settings.per_order_max_amount, self._settings.max_position_per_stock):
             if cap is not None and Decimal(str(cap)) < budget:

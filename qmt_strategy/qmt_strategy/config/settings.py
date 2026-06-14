@@ -104,6 +104,9 @@ class Settings:
     max_total_exposure: Optional[Decimal] = None      # QMT_MAX_TOTAL_EXPOSURE
     max_orders_per_day: Optional[int] = None          # QMT_MAX_ORDERS_PER_DAY
     per_order_max_amount: Optional[Decimal] = None    # QMT_PER_ORDER_MAX_AMOUNT
+    # 强度加权资金分配（按 leader_strength_score 分预算，强的分得多）：可分配总预算上限 = 日初权益×本比例。
+    # 默认 1.0=用全部日初权益作上限（强度权重在候选间归一分配）；可调小以留现金（如 0.8 只用八成仓）。
+    target_position_ratio: Decimal = Decimal("1.0")   # QMT_TARGET_POSITION_RATIO
     price_deviation_guard_pct: Optional[Decimal] = None  # QMT_PRICE_DEVIATION_GUARD_PCT
     # QMT_MARKET_STATE_BLOCK：禁开仓集合（评审 2.5 口径修正）。
     # 信号侧 watchlist 的 market_state 只有三档：空仓 / 谨慎参与 / 参与（六档情绪周期已在信号侧
@@ -182,6 +185,7 @@ class Settings:
             max_total_exposure=_as_decimal(g("QMT_MAX_TOTAL_EXPOSURE")),
             max_orders_per_day=_as_int(g("QMT_MAX_ORDERS_PER_DAY")),
             per_order_max_amount=_as_decimal(g("QMT_PER_ORDER_MAX_AMOUNT")),
+            target_position_ratio=_as_decimal(g("QMT_TARGET_POSITION_RATIO")) or Decimal("1.0"),
             price_deviation_guard_pct=_as_decimal(g("QMT_PRICE_DEVIATION_GUARD_PCT")),
             market_state_block=split_csv(g("QMT_MARKET_STATE_BLOCK"), ["空仓", "谨慎参与", "退潮", "冰点"]),
             account_drawdown_limit=_as_decimal(g("QMT_ACCOUNT_DRAWDOWN_LIMIT")),

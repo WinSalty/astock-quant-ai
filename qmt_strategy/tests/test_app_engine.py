@@ -159,6 +159,44 @@ def test_empty_position_state_blocks_open():
     assert deps.trader.order_calls == []                # 空仓禁开新仓
 
 
+def _two_candidate_deps(env=None):
+    """两只候选：600036.SH 强度 90、600000.SH 强度 30（用于验证强度加权分配）。"""
+    rows = []
+    for code, strength in (("600036.SH", Decimal("90")), ("600000.SH", Decimal("30"))):
+        r = make_selected_row(
+            ts_code=code, signal_close=Decimal("10.00"), limit_up_price=Decimal("11.00"),
+            reasonable_open_high_low=Decimal("10.20"), reasonable_open_high_high=Decimal("10.80"),
+            market_state="启动", tradable_flag=True, leader_strength_score=strength,
+        )
+        r.strategy_family = "打板"
+        r.setup = "首板"
+        rows.append(r)
+    return _deps(env, source_rows=rows)
+
+
+def test_strength_weighted_budget_allocation():
+    """评审「按强度分」：两只候选，强度 90:30 → 预算/股数约 3:1，强的分得多。"""
+    deps = _two_candidate_deps({"QMT_AUCTION_TIMING_ENABLED": "true"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)  # 日初权益=100万，target_position_ratio 默认 1.0
+    v_strong = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
+    v_weak = eng._strength_budget_volume(eng._plan_map["600000.SH"], Decimal("10.50"))
+    assert v_strong > v_weak > 0
+    assert v_strong == 3 * v_weak          # 90/30=3，预算成比例
+    # 强票预算 ≈ 100万×0.75 = 75万 / 10.50 取整到百股（int() 对正 Decimal 截断=向下取整）
+    assert v_strong == (int(Decimal("750000") / Decimal("10.50")) // 100) * 100
+
+
+def test_total_exposure_ceiling_caps_budget():
+    """max_total_exposure 总敞口闸：可分配上限被压到敞口值，强度份额随之缩小。"""
+    deps = _two_candidate_deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_MAX_TOTAL_EXPOSURE": "100000"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    # ceiling=min(100万, 10万)=10万；强票 w=0.75 → 预算 7.5万 / 10.50 取整
+    v_strong = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
+    assert v_strong == (int(Decimal("75000") / Decimal("10.50")) // 100) * 100
+
+
 def test_buy_blocked_on_account_drawdown_breach():
     """评审 P0-B1/B2：账户日内回撤击穿 → 买入路径经 risk.gate 冻结、不开新仓。
 

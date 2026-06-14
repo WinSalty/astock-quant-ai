@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Dict, List, Optional
 
 from ..common.auction_window import is_lunch_break
@@ -120,7 +120,10 @@ class Engine:
         self._position = PositionManager(deps.calendar, deps.clock, deps.logger, deps.prior_provider)
         self._risk = Risk(s, deps.clock, deps.logger)
         self._sell = SellDecider(s, deps.clock, deps.logger)
-        self._entry = EntryRouter(s, deps.clock, deps.logger, decision_log=[])
+        # position_sizer：按 leader_strength_score 强度加权分配买入资金（强的分得多），评审"按强度分"。
+        self._entry = EntryRouter(
+            s, deps.clock, deps.logger, decision_log=[], position_sizer=self._strength_budget_volume
+        )
         self._order = OrderExecutor(
             deps.trader, deps.account, deps.account_id, self._ledger, s, deps.clock, deps.logger
         )
@@ -163,6 +166,8 @@ class Engine:
         # 日初总资产基线（评审 P0-B2）：prewarm 抓取，供 risk.gate 算账户日内回撤击穿。
         # None 表示未取到基线（查询失败/未装载）→ 回撤口径返回 None，不凭空冻结（其它闸门仍生效）。
         self._day_open_equity: Optional[Decimal] = None
+        # 强度资金权重表：ts_code → 预算占比（prewarm 按当日可交易候选 leader_strength_score 归一）。
+        self._strength_weights: Dict[str, Decimal] = {}
 
     # ------------------------------------------------------------------
     # 对外暴露（供 main / 连接守护注册回调 / 调度）
@@ -187,6 +192,8 @@ class Engine:
         self._position.refresh_state(today)
         # 抓取日初总资产基线（评审 P0-B2）：供盘中 risk.gate 算账户日内回撤击穿。
         self._capture_day_open_equity()
+        # 计算当日强度资金权重（按 leader_strength_score 给候选分预算占比，强的分得多）。
+        self._compute_strength_weights()
         self._logger.info(
             "engine_prewarmed",
             trade_date=str(today),
@@ -267,6 +274,79 @@ class Engine:
             )
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # 强度加权资金分配（评审"按强度/优先级排序分"）
+    # ------------------------------------------------------------------
+    def _compute_strength_weights(self) -> None:
+        """按当日可交易候选的 leader_strength_score 归一为预算权重（强的占比大）。
+
+        口径：w_i = strength_i / Σ strength；缺强度的票用候选最小强度兜底（避免拿不到额度）；全部缺强度
+        时退化为等权(1/N)。权重在 prewarm 一次性算定、不随触发顺序变化——故弱票即使先触发也只吃自己的
+        小份额，强票份额被保留（实现"强的分得多、不被弱的抢光"，且与触发时序无关）。
+        """
+        plans = list(self._plan_map.values())
+        if not plans:
+            self._strength_weights = {}
+            return
+        present = [p.leader_strength_score for p in plans if p.leader_strength_score is not None]
+        floor_score = min(present) if present else None
+        scores: Dict[str, Optional[Decimal]] = {
+            p.ts_code: (p.leader_strength_score if p.leader_strength_score is not None else floor_score)
+            for p in plans
+        }
+        total = sum((s for s in scores.values() if s is not None), Decimal("0"))
+        if total > 0:
+            self._strength_weights = {
+                code: ((s / total) if s is not None else Decimal("0")) for code, s in scores.items()
+            }
+        else:
+            eq = Decimal("1") / Decimal(len(scores))
+            self._strength_weights = {code: eq for code in scores}
+        self._logger.info("engine_strength_weights", count=len(self._strength_weights))
+
+    def _strength_budget_volume(self, plan: PlanRow, limit_price: Decimal) -> int:
+        """按强度权重 + 可用现金 + 总敞口闸 + 在途扣减 测算单票计划股数（评审"按强度分"）。
+
+        预算 = min(当下可用现金, 总预算上限ceiling − 已承诺committed, ceiling×强度权重w,
+                   per_order_max_amount, max_position_per_stock) / 限价，向下取整到 100 股。
+        ceiling = 日初权益×target_position_ratio（无基线退化为当前现金），再与 max_total_exposure 取小。
+        w<=0（缺强度）时不加强度份额约束，退化为"先到先得 + 总敞口闸"。
+        """
+        if limit_price is None or limit_price <= 0:
+            return 0
+        try:
+            asset = self._deps.trader.query_stock_asset(self._deps.account)
+            cash = getattr(asset, "cash", None)
+        except Exception as exc:  # noqa: BLE001 资产查询失败 → 不臆造资金，返回 0 不下单
+            self._logger.warn("engine_sizer_asset_query_failed", ts_code=plan.ts_code, error=str(exc))
+            return 0
+        if cash is None:
+            return 0
+        cash = Decimal(str(cash))
+
+        # 可分配总预算上限：日初权益×目标仓位比（无基线退化为当前现金），再与 max_total_exposure 取小。
+        ceiling = cash
+        if self._day_open_equity is not None and self._day_open_equity > 0:
+            ceiling = self._day_open_equity * self._settings.target_position_ratio
+        if self._settings.max_total_exposure is not None:
+            ceiling = min(ceiling, Decimal(str(self._settings.max_total_exposure)))
+
+        # 总敞口闸 + 在途扣减：可分配上限 − 当日已承诺(在途+已成)买入。
+        committed = self._order.committed_amount(self._today_provider())
+        budget = min(cash, ceiling - committed)
+        # 强度份额：w>0 才加 ceiling×w 约束（强的分得多）；缺强度退化不加此约束。
+        w = self._strength_weights.get(plan.ts_code, Decimal("0"))
+        if w > 0:
+            budget = min(budget, ceiling * w)
+        # 单笔 / 单票金额上限收紧。
+        for cap in (self._settings.per_order_max_amount, self._settings.max_position_per_stock):
+            if cap is not None and Decimal(str(cap)) < budget:
+                budget = Decimal(str(cap))
+        if budget <= 0:
+            return 0
+        raw_shares = (budget / limit_price).to_integral_value(rounding=ROUND_DOWN)
+        return (int(raw_shares) // 100) * 100  # 向下取整到 100 股整手
 
     # ------------------------------------------------------------------
     # 成交回报 → 持仓状态机回写（评审 P0-A2 修复）

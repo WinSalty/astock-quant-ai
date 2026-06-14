@@ -440,6 +440,20 @@ def test_place_sell_via_unique_point_with_ledger(clock_0916):
     assert biz2 is not None and biz2.endswith("_SELL_002")
 
 
+def test_committed_amount_counts_active_buys(clock_0916):
+    """评审 2.3余/B3余：committed_amount = Σ 活跃买单 plan_volume×plan_price，终态失败不计。"""
+    trader = FakeTrader()
+    ledger = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=ledger)
+    assert ex.committed_amount(T_BUY) == Decimal("0")
+    # 下一单：1000 股 × 11.00 = 11000 占用。
+    ex.place(_decision(ts_code="600036.SH", plan_volume=1000, limit_price=Decimal("11.00")))
+    assert ex.committed_amount(T_BUY) == Decimal("11000")
+    # 再下一只不同标的：累计 +5000×9.00=45000 → 56000。
+    ex.place(_decision(ts_code="600000.SH", plan_volume=5000, limit_price=Decimal("9.00")))
+    assert ex.committed_amount(T_BUY) == Decimal("56000")
+
+
 def test_place_flushes_ledger_before_order(clock_0916):
     """评审 P0-C3：发单前同步落盘——flush_pending 在 order_stock 之前被调用（堵崩溃窗口重复下单）。"""
     events = []
