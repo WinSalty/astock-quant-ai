@@ -419,11 +419,11 @@ class Engine:
             else:
                 action = self._sell.decide_intraday(unit, prior, book, risk_verdict=verdict.verdict)
             if action.action in (SellActionType.REDUCE, SellActionType.CLEAR):
-                if self._place_sell(unit, action.action, action.reduce_ratio, action.reason, book):
+                if self._place_sell(unit, action.action, action.reduce_ratio, action.reason, book, today):
                     sold.append(unit.ts_code)
         return sold
 
-    def _place_sell(self, unit, action_type, reduce_ratio, reason, book=None) -> bool:
+    def _place_sell(self, unit, action_type, reduce_ratio, reason, book=None, today=None) -> bool:
         """发出卖出委托（守 T+1 量闸 + kill_switch + 价位取实时盘口）。
 
         卖量 = clamp(决策量, can_use_volume)，绝不超量（§5.4.3）；CLEAR 卖全部可用，
@@ -456,21 +456,29 @@ class Engine:
             return False
         # 价位取实时盘口现价（评审 P2）：优先 book.last_price；缺失才回退成本价并告警。
         if book is not None and getattr(book, "last_price", None) is not None:
-            price = float(book.last_price)
+            price = book.last_price
         else:
-            price = float(unit.avg_cost)
+            price = unit.avg_cost
             self._logger.warn(
                 "engine_sell_price_fallback_avg_cost",
                 ts_code=unit.ts_code,
                 reason="盘口 last_price 缺失，回退成本价(可能挂不出)，应排查盘口源",
             )
-        self._deps.trader.order_stock(
-            self._deps.account, unit.ts_code, XT_ORDER_TYPE_SELL, sell_vol,
-            XT_PRICE_TYPE_FIX, price, "", f"SELL|{reason}",
+        # 卖出走唯一下单点（评审 P0-C1）：生成 biz 单号 + 落台账 + 经 OrderExecutor 唯一出口下卖单，
+        # 不再编排层直连 trader.order_stock（原实现卖单无台账/无 biz 单号/不可对账）。
+        biz_no = self._order.place_sell(
+            ts_code=unit.ts_code,
+            target_trade_date=today if today is not None else unit.buy_date,
+            signal_trade_date=unit.buy_date,
+            sell_vol=sell_vol,
+            price=price,
+            reason=reason,
         )
+        if biz_no is None:
+            return False
         self._position.mark_selling(unit)
         self._logger.info(
-            "engine_sell_placed", ts_code=unit.ts_code, volume=sell_vol, reason=reason
+            "engine_sell_placed", ts_code=unit.ts_code, volume=sell_vol, reason=reason, biz_order_no=biz_no
         )
         return True
 

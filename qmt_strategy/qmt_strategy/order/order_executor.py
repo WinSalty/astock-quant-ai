@@ -37,6 +37,7 @@ from ..contracts.protocols import Clock, LocalLedger, StructLogger, XtTraderLike
 # 此处按设计文档建议先用占位值（STOCK_BUY=23 为常见取值，FIX_PRICE 限价=11 为常见取值），
 # 落地前以实测为准；本类只通过这两个常量与 trader 交互，改动只需调这里。
 XT_ORDER_TYPE_BUY = 23          # 买入方向（占位，实测以 xtconstant.STOCK_BUY 为准）
+XT_ORDER_TYPE_SELL = 24         # 卖出方向（占位，实测以 xtconstant.STOCK_SELL 为准）
 XT_PRICE_TYPE_FIX = 11          # 限价委托（占位，实测以 xtconstant.FIX_PRICE 为准）
 
 # 一字 / 秒封场景下的「整手」单位：A 股最小买入单位 100 股。
@@ -306,6 +307,107 @@ class OrderExecutor:
             biz_order_no=biz_no,
             order_id=order_id,
             plan_volume=plan_volume,
+        )
+        return biz_no
+
+    # ------------------------------------------------------------------
+    # 卖出唯一下单点（评审 P0-C1）
+    # ------------------------------------------------------------------
+    def _build_sell_biz_no(self, ts_code: str, target_trade_date: Any) -> str:
+        """卖出业务单号：``{date}_{ts_code}_SELL_{seq:03d}``。
+
+        与买入单号同构、family 段固定 SELL，便于回流/对账区分买卖。序号按 (date, ts_code, SELL) 维度
+        自增——同票当日多次卖出（如先 REDUCE 后 CLEAR）各自计数、各落一条卖单台账。
+        """
+        key = (target_trade_date, ts_code, "SELL")
+        seq = self._seq_counter.get(key, 0) + 1
+        self._seq_counter[key] = seq
+        return f"{target_trade_date.strftime('%Y%m%d')}_{ts_code}_SELL_{seq:03d}"
+
+    def place_sell(
+        self,
+        ts_code: str,
+        target_trade_date: Any,
+        signal_trade_date: Any,
+        sell_vol: int,
+        price: Optional[Decimal],
+        reason: str,
+        *,
+        order_phase: OrderPhase = OrderPhase.OPENING,
+    ) -> Optional[str]:
+        """卖出唯一下单点（评审 P0-C1）：生成 biz 单号 + 落本地台账 + 经唯一出口下卖单。
+
+        背景：原实现卖出在编排层直连 trader.order_stock，绕过唯一下单点与台账——卖单无 biz_order_no、
+        不落台账、不可对账、无 TTL。这里让卖出与买入共用 trader.order_stock 唯一出口与本地台账，使
+        卖单同样有业务单号、可对账、留痕。
+        幂等口径：卖出幂等以持仓状态机 SELLING 态为主闸（run_sell_pass 已跳过在途单元），本方法不再
+        用 find_active 造台账级幂等——因 TRADED/PART_TRADED 仍属 active，台账级幂等会误挡同票后续
+        合法卖出（先 REDUCE 后 CLEAR）。
+        返回 biz_order_no；kill_switch 或卖量<=0 时返回 None（不下单）。成交累计由外部 add_fill 按
+        order_id 推进本台账行（买卖共用）。
+        """
+        # —— kill_switch 全局熔断：只采集不下单（§7.1.5）——
+        if self._settings.kill_switch:
+            self._logger.warn("order_sell_kill_switch_block", ts_code=ts_code, account_id=self._account_id)
+            return None
+        if sell_vol is None or sell_vol <= 0:
+            return None
+
+        biz_no = self._build_sell_biz_no(ts_code, target_trade_date)
+        now = self._clock.now_utc()
+        remark = f"SELL|{reason}"[:_REMARK_MAX_LEN]
+        # 先落台账（state=PLANNED）再发单，保证可对账（与买入同口径）。
+        entry = LedgerEntry(
+            biz_order_no=biz_no,
+            account_id=self._account_id,
+            target_trade_date=target_trade_date,
+            ts_code=ts_code,
+            strategy_family="SELL",
+            side=TradeSide.SELL,
+            plan_volume=sell_vol,
+            plan_price=price,
+            order_remark=remark,
+            signal_trade_date=signal_trade_date,
+            state=OrderState.PLANNED,
+            order_phase=order_phase,
+            cancelable=not is_cancel_forbidden(now),
+            created_at=now,
+            updated_at=now,
+        )
+        self._ledger.insert(entry)
+
+        # —— 唯一下单点：限价卖单 ——
+        order_id = self._trader.order_stock(
+            self._account,
+            ts_code,
+            XT_ORDER_TYPE_SELL,
+            sell_vol,
+            XT_PRICE_TYPE_FIX,
+            float(price) if price is not None else 0.0,
+            "SELL",
+            remark,
+        )
+        # 单日下单次数 +1（评审 P0-B3）：卖单同样占下单次数配额（含同步失败）。
+        self._orders_count_by_date[target_trade_date] = (
+            self._orders_count_by_date.get(target_trade_date, 0) + 1
+        )
+
+        if order_id is None or order_id < 0:
+            self._ledger.update(
+                biz_no, order_id=order_id, state=OrderState.ERROR,
+                error_msg="sell order_stock 同步下单失败(返回<0)", updated_at=self._clock.now_utc(),
+            )
+            self._logger.error(
+                "order_sell_submit_failed_sync",
+                ts_code=ts_code, account_id=self._account_id, biz_order_no=biz_no, order_id=order_id,
+            )
+            return biz_no
+
+        self._ledger.update(biz_no, order_id=order_id, state=OrderState.SUBMITTED, updated_at=self._clock.now_utc())
+        self._logger.info(
+            "order_sell_submitted",
+            ts_code=ts_code, account_id=self._account_id, biz_order_no=biz_no,
+            order_id=order_id, sell_vol=sell_vol,
         )
         return biz_no
 

@@ -418,6 +418,36 @@ def test_skip_action_no_order(clock_0916):
     assert "order_skip_decision" in logger.events()
 
 
+def test_place_sell_via_unique_point_with_ledger(clock_0916):
+    """评审 P0-C1：place_sell 经唯一下单点下卖单(otype=24) + 落台账(biz单号/side=SELL/SUBMITTED)。"""
+    from qmt_strategy.contracts.enums import TradeSide
+
+    trader = FakeTrader()
+    led = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=led)
+    biz = ex.place_sell(
+        ts_code="600036.SH", target_trade_date=T_BUY, signal_trade_date=T_SIGNAL,
+        sell_vol=1000, price=Decimal("10.50"), reason="炸板CLEAR",
+    )
+    assert biz is not None and biz.endswith("_SELL_001")
+    assert len(trader.order_calls) == 1
+    assert trader.order_calls[0]["order_type"] == 24          # 卖出方向
+    assert trader.order_calls[0]["price"] == 10.50            # 盘口现价限价
+    e = led.get(biz)
+    assert e is not None and e.side == TradeSide.SELL and e.plan_volume == 1000
+    # 同票当日二次卖出(先 REDUCE 后 CLEAR)各落一条，不被台账级幂等误挡。
+    biz2 = ex.place_sell("600036.SH", T_BUY, T_SIGNAL, 500, Decimal("10.40"), "CLEAR")
+    assert biz2 is not None and biz2.endswith("_SELL_002")
+
+
+def test_place_sell_kill_switch_blocks(clock_0916):
+    """kill_switch=True → place_sell 不下单、返回 None。"""
+    trader = FakeTrader()
+    ex = _executor(trader, clock_0916, settings=Settings(kill_switch=True))
+    assert ex.place_sell("600036.SH", T_BUY, T_SIGNAL, 1000, Decimal("10.50"), "x") is None
+    assert len(trader.order_calls) == 0
+
+
 def test_max_orders_per_day_blocks_overtrading(clock_0916):
     """评审 P0-B3：单日下单次数达上限 → 后续新开仓被拦、不再调用 order_stock。"""
     trader = FakeTrader()
