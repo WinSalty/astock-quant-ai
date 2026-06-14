@@ -14,13 +14,26 @@ from __future__ import annotations
 from decimal import Decimal
 
 from ...config.settings import Settings
-from ...contracts.enums import EntryAction, OrderPhase
+from ...contracts.enums import AuctionPhase, EntryAction, OrderPhase
 from ...contracts.models import AuctionSnapshot, PlanRow
 from .base import EntryStrategy, StrategyOutcome, register
 
 # 封单稳的封流比下限（占位经验阈值，真实落地以实测为准）：封流比低于此值视为封单偏薄 / 不稳。
 # 注：封流比 None（未达涨停或数据缺）时不据此判稳，由 is_limit_up 主导。
 _SEAL_RATIO_MIN = Decimal("0.0")
+
+# 竞价段（9:25 定盘前）：挂竞价单 AUCTION；定盘/盘中（>=9:25）：挂开盘后单 OPENING。
+_AUCTION_PHASES = (AuctionPhase.PRE_AUCTION, AuctionPhase.AUCTION_CANCELABLE, AuctionPhase.AUCTION_LOCKED)
+
+
+def _order_phase_for(snap: AuctionSnapshot) -> OrderPhase:
+    """按快照所处时段判定下单时段（评审 P1#4）。
+
+    原实现硬编码 order_phase=AUCTION：竞价择时默认关时，连板打板跟买的 AUCTION 决策会被编排层
+    「只留痕不下单」整类丢弃（核心战法静默失效）；且 9:25 后的盘中顶板跟买本应是 OPENING 也被当
+    竞价单。这里据 snap.phase 区分：定盘前→AUCTION，定盘/盘中→OPENING。
+    """
+    return OrderPhase.AUCTION if snap.phase in _AUCTION_PHASES else OrderPhase.OPENING
 
 
 @register(EntryAction.CHASE_LIMIT_UP)
@@ -59,6 +72,6 @@ class ChaseLimitUpStrategy(EntryStrategy):
                 f"CHASE_LIMIT_UP买:顶板封单稳 is_limit_up=True "
                 f"seal_to_float_ratio={ratio} 挂涨停价={plan.limit_up_price}"
             ),
-            # 打板跟买在竞价即封时按竞价单挂（9:20 前），盘中跟买场景由 order_phase 透传。
-            order_phase=OrderPhase.AUCTION,
+            # 下单时段按快照 phase 判定（评审 P1#4）：竞价即封→AUCTION 竞价单；9:25 后盘中顶板→OPENING。
+            order_phase=_order_phase_for(snap),
         )

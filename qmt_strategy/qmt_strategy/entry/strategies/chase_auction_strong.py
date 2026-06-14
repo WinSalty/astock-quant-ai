@@ -27,6 +27,20 @@ _DECISION_DEADLINE_PHASES = (AuctionPhase.PRE_AUCTION, AuctionPhase.AUCTION_CANC
 _VOL_RATIO_MIN = Decimal("0.1")
 
 
+def _cap_to_limit_up(price, limit_up_price):
+    """买入限价以涨停价封顶（评审 P1#3）。
+
+    竞价末帧虚拟成交价 last_price 在「越竞越强 / 脏数据跳变」时可能 ≥涨停价；若直接当限价挂单，
+    竞价单(9:20 后不可撤)会以超涨停价成交（异常）或被交易所判废单。故对 buy 限价统一取
+    min(候选价, 涨停价)。涨停价缺失时无可信上界，沿用候选价（不臆造上界）。
+    """
+    if price is None:
+        return None
+    if limit_up_price is not None and price > limit_up_price:
+        return limit_up_price
+    return price
+
+
 @register(EntryAction.CHASE_AUCTION_STRONG)
 class ChaseAuctionStrongStrategy(EntryStrategy):
     """竞价强开追：强开 + 放量 + 越竞越强 → 9:20 前竞价单；弱开 / 走低 → 弃；降级 B → 改判 OPENING。"""
@@ -99,8 +113,12 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
             )
 
         # —— 买条件全满足：强开 + 放量 + 越竞越强 → 9:20 前挂竞价买单。——
-        # 限价取末帧虚拟成交价（竞价价），缺失则回退合理上沿，再缺回退涨停价（均不臆造）。
-        limit = snap.last_price or plan.reasonable_open_high or plan.limit_up_price
+        # 限价取末帧虚拟成交价（竞价价），缺失则回退合理上沿，再缺回退涨停价（均不臆造）；
+        # 并以涨停价封顶（评审 P1#3）：避免脏数据/逼近涨停时挂出超涨停价的废单/异常成交。
+        limit = _cap_to_limit_up(
+            snap.last_price or plan.reasonable_open_high or plan.limit_up_price,
+            plan.limit_up_price,
+        )
         return StrategyOutcome(
             action=EntryAction.CHASE_AUCTION_STRONG,
             limit_price=limit,

@@ -397,6 +397,41 @@ def test_block_keyword_not_overmatched():
     assert decision.action == EntryAction.SKIP
 
 
+def test_chase_auction_strong_caps_limit_to_limit_up():
+    """评审 P1#3：竞价末帧 last_price 高于涨停价 → 限价封顶到涨停价（不挂超涨停价废单）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="首板", market_state="启动",
+                         limit_up_price=Decimal("11.00"))
+    snap = _snap(open_pct=Decimal("0.09"), auction_vol_ratio=Decimal("0.5"),
+                 centroid_trend=CentroidTrend.UP, last_price=Decimal("11.50"))  # 高于涨停价
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.CHASE_AUCTION_STRONG
+    assert decision.limit_price == Decimal("11.00")    # 封顶到涨停价
+
+
+def test_chase_limit_up_order_phase_opening_after_settle():
+    """评审 P1#4：9:25 定盘后(SETTLED)盘中顶板跟买 → order_phase=OPENING（不再硬编码 AUCTION）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="连板接力", market_state="启动",
+                         limit_up_price=Decimal("11.00"))
+    snap = _snap(phase=AuctionPhase.SETTLED, is_limit_up=True, last_price=Decimal("11.00"),
+                 seal_to_float_ratio=Decimal("0.08"), centroid_trend=CentroidTrend.UP)
+    decision = router.route(plan, snap)
+    assert decision.action == EntryAction.CHASE_LIMIT_UP
+    assert decision.order_phase == OrderPhase.OPENING
+
+
+def test_chase_limit_up_order_phase_auction_in_cancelable():
+    """竞价可撤段顶板跟买 → 仍 order_phase=AUCTION（竞价单）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="连板接力", market_state="启动",
+                         limit_up_price=Decimal("11.00"))
+    snap = _snap(phase=AuctionPhase.AUCTION_CANCELABLE, is_limit_up=True, last_price=Decimal("11.00"),
+                 seal_to_float_ratio=Decimal("0.08"), centroid_trend=CentroidTrend.UP)
+    decision = router.route(plan, snap)
+    assert decision.order_phase == OrderPhase.AUCTION
+
+
 def test_skip_action_traded_via_strategy_registry():
     """SKIP（买/弃对称的「买」侧不存在）：SKIP 策略实例恒产 SKIP（验证注册表覆盖第五类）。"""
     from qmt_strategy.entry.strategies import base as sb
