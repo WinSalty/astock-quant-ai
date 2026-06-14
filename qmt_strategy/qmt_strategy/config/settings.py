@@ -133,6 +133,13 @@ class Settings:
     # —— 本地化数据栈（doc/05 单进程+SQLite）——
     local_db_path: str = "qmt_local.db"       # QMT_LOCAL_DB_PATH：本机 SQLite 库路径（回流/台账/名单）
 
+    # —— 决策链路采集（复盘用、best-effort、与交易热路径物理隔离，不影响真实交易）——
+    # 默认开：在各决策点非阻塞采集「信号达标→下单/未买→卖出」决策事件，盘后回流信号侧 qmt_decision_log。
+    # 关掉（QMT_DECISION_LOG_ENABLED=false）即降级 no-op（不建队列线程），是该功能的一键回滚开关。
+    decision_log_enabled: bool = True         # QMT_DECISION_LOG_ENABLED：默认 True
+    decision_log_queue_size: int = 2000       # QMT_DECISION_LOG_QUEUE_SIZE：有界队列容量（满即丢）
+    decision_log_batch_size: int = 50         # QMT_DECISION_LOG_BATCH_SIZE：回流攒批大小
+
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> "Settings":
         """从环境变量映射构造配置。
@@ -191,6 +198,9 @@ class Settings:
             account_drawdown_limit=_as_decimal(g("QMT_ACCOUNT_DRAWDOWN_LIMIT")),
             account_loss_limit=_as_decimal(g("QMT_ACCOUNT_LOSS_LIMIT")),
             stock_float_loss_limit=_as_decimal(g("QMT_STOCK_FLOAT_LOSS_LIMIT")),
+            decision_log_enabled=_as_bool(g("QMT_DECISION_LOG_ENABLED") or "true"),
+            decision_log_queue_size=_as_int(g("QMT_DECISION_LOG_QUEUE_SIZE")) or 2000,
+            decision_log_batch_size=_as_int(g("QMT_DECISION_LOG_BATCH_SIZE")) or 50,
             auction_timing_enabled=_as_bool(g("QMT_AUCTION_TIMING_ENABLED") or "false"),
             kill_switch=_as_bool(g("QMT_KILL_SWITCH") or "false"),
             order_ttl_seconds=_as_int(g("QMT_ORDER_TTL_SECONDS")) or 60,

@@ -92,6 +92,9 @@ class EngineDeps:
     # 持久化 flush 钩子（可注入）：本地化方案注入 LocalStorage.flush；
     # close_batch 在对账前调用它，保证「写后异步」的回流已落盘、对账读到一致数据（doc/05 关键不变量）。
     flush_hook: Callable[[], Any] = field(default=lambda: None)
+    # 决策采集器（可注入，可选）：注入 DecisionEmitter 则在各决策点 best-effort 采集决策链路；
+    # 缺省 None → 各组件退化为「不采集」（与历史行为一致，单测/离线无需提供）。与交易热路径物理隔离。
+    decision_emitter: Optional[Any] = None
 
 
 class Engine:
@@ -119,13 +122,22 @@ class Engine:
         )
         self._position = PositionManager(deps.calendar, deps.clock, deps.logger, deps.prior_provider)
         self._risk = Risk(s, deps.clock, deps.logger)
-        self._sell = SellDecider(s, deps.clock, deps.logger)
+        # 决策采集器（可选，注入则各决策点 best-effort 采集；与下单热路径物理隔离，绝不影响交易）。
+        self._decision_emitter = deps.decision_emitter
+        self._sell = SellDecider(
+            s, deps.clock, deps.logger, decision_emitter=self._decision_emitter
+        )
         # position_sizer：按 leader_strength_score 强度加权分配买入资金（强的分得多），评审"按强度分"。
+        # decision_log：注入决策采集器（实现 .append(EntryDecision)）→ 采集 SIGNAL_QUALIFIED/SKIP；
+        # 缺省 []（历史行为：只 logger 留痕，不外采）。
         self._entry = EntryRouter(
-            s, deps.clock, deps.logger, decision_log=[], position_sizer=self._strength_budget_volume
+            s, deps.clock, deps.logger,
+            decision_log=self._decision_emitter if self._decision_emitter is not None else [],
+            position_sizer=self._strength_budget_volume,
         )
         self._order = OrderExecutor(
-            deps.trader, deps.account, deps.account_id, self._ledger, s, deps.clock, deps.logger
+            deps.trader, deps.account, deps.account_id, self._ledger, s, deps.clock, deps.logger,
+            decision_emitter=self._decision_emitter,
         )
         # 重启幂等（评审 P0-C4）：台账已由 LocalStorage.start()→load_from_db 重建，这里据此重置
         # biz 序号计数器，保证重启后新单序号严格大于历史、不与磁盘失败单同号覆盖/重复下单。
@@ -176,6 +188,16 @@ class Engine:
     def callback(self) -> ExecCallback:
         """供连接守护 register_callback 注册到 xttrader 的回调对象。"""
         return self._callback
+
+    def _emit_decision(self, **fields: Any) -> None:
+        """向决策采集器发一条编排层决策事件（全程吞异常，绝不影响编排/下单热路径）。"""
+        em = self._decision_emitter
+        if em is None:
+            return
+        try:
+            em.emit(**fields)
+        except Exception:  # noqa: BLE001 决策采集绝不影响交易
+            pass
 
     # ------------------------------------------------------------------
     # 盘前：装载当日 watchlist + 推进持仓状态
@@ -429,10 +451,24 @@ class Engine:
                 ts_code=decision.ts_code,
                 reason="open_new_position_allowed=False",
             )
+            self._emit_decision(
+                decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                order_phase=decision.order_phase, reason="空仓/降级禁开新仓", reason_code="open_blocked",
+                factors=decision.factors_snapshot,
+            )
             return
         # 风控总闸（评审 P0-B1/B2）：买入也必须过 risk.gate——账户日内回撤击穿 / 行情或下单中断 /
         # 空仓 / 退潮冰点 → 禁开新仓。原实现买入路径完全绕过 gate，账户熔断对开仓零作用。
         if self._open_blocked_by_risk(decision.ts_code):
+            self._emit_decision(
+                decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                order_phase=decision.order_phase, reason="风控总闸禁开新仓", reason_code="risk_block",
+                factors=decision.factors_snapshot,
+            )
             return
         # 竞价择时闸门：竞价单仅在实测开关打开时下单，否则只采集留痕（§7.1.6）。
         if decision.order_phase == OrderPhase.AUCTION and not self._settings.auction_timing_enabled:
@@ -440,6 +476,13 @@ class Engine:
                 "engine_auction_timing_disabled_collect_only",
                 ts_code=decision.ts_code,
                 reason="QMT_AUCTION_TIMING_ENABLED=false",
+            )
+            self._emit_decision(
+                decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                order_phase=decision.order_phase, reason="竞价择时未开,仅采集", reason_code="auction_timing_disabled",
+                factors=decision.factors_snapshot,
             )
             return
         # 通过全部闸门 → 下单（place 内仍有 kill_switch / 幂等 / 资金校验）。

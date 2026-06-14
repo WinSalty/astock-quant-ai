@@ -28,7 +28,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
 from qmt_strategy.config.settings import Settings
 from qmt_strategy.contracts.enums import (
@@ -74,12 +74,15 @@ class SellDecider:
         clock: Clock,
         logger: StructLogger,
         continuation_high: Decimal = _DEFAULT_CONTINUATION_HIGH,
+        decision_emitter: Optional[Any] = None,
     ) -> None:
         self._settings = settings
         self._clock = clock
         self._logger = logger
         # 续板概率「高」阈值：先验是否强到支撑续持基调（§5.3.1）。
         self._continuation_high = continuation_high
+        # 决策采集器（可选）：注入则采集 SELL_HOLD（续持）决策；与交易热路径物理隔离。
+        self._decision_emitter = decision_emitter
 
     # ==================================================================
     # 次日竞价定夺（可卖日 9:15–9:25，§5.3.2）
@@ -401,5 +404,18 @@ class SellDecider:
             state=str(unit.state),
             decided_at=str(decided_at),
         )
+        # 决策采集：仅 HOLD（续持）在此采集——REDUCE/CLEAR 的实际卖出由 place_sell 采为 SELL_SUBMIT，
+        # 避免重复；续持没有对应委托，是「为什么没卖」的唯一事实源。全程吞异常，绝不影响卖出决策。
+        if action == SellActionType.HOLD:
+            em = self._decision_emitter
+            if em is not None:
+                try:
+                    em.emit(
+                        decision_type="SELL_HOLD", decision_stage="SELL", action="HOLD",
+                        ts_code=unit.ts_code, strategy_family="SELL", reason=reason,
+                        reason_code=f"hold_{phase}", decided_at=decided_at,
+                    )
+                except Exception:  # noqa: BLE001 决策采集绝不影响卖出
+                    pass
         # reduce_ratio 一律置 None（= 策略默认），具体减仓比例由 QMT 下单层自定（§5.7 价位不在此处）。
         return SellAction(ts_code=unit.ts_code, action=action, reason=reason, reduce_ratio=None)

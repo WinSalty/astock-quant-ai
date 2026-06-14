@@ -49,6 +49,41 @@ def _build_signal_client(settings: Settings, logger):
     return SignalHttpClient(settings.signal_base_url, token, settings.http_timeout_seconds, logger)
 
 
+def _build_decision_emitter(settings: Settings, logger, account_id: str, clock):
+    """构造并启动决策采集器（复盘用、best-effort、与交易热路径物理隔离）。
+
+    口径：用独立的信号侧 HTTP 客户端做 sink（不与盘后 RemoteSyncJob 的 client 共享），逐行 POST
+        qmt_decision_log；失败由采集器内部 warn 后丢弃（绝不重试到死、绝不影响交易/四表回流/对账）。
+        缺 signal_base_url（无回流通道）或 decision_log_enabled=False → 返回 no-op 采集器（不起线程）。
+    """
+    from ..decision.decision_emitter import DECISION_TABLE, DecisionEmitter
+    from ..storage.http_ingest_repository import INGEST_PATH
+
+    client = _build_signal_client(settings, logger)
+
+    def _sink(rows):
+        # 逐行 POST 决策记录；首个失败上抛 → 采集器 _flush 捕获并 warn 后丢弃该批（数据可丢失）。
+        for row in rows:
+            client.post_json(
+                INGEST_PATH,
+                {
+                    "account_id": row.get("account_id"),
+                    "trade_date": row.get("trade_date"),
+                    "records": [{"table": DECISION_TABLE, "data": row}],
+                },
+            )
+
+    emitter = DecisionEmitter(
+        account_id, clock, logger,
+        sink=(_sink if client is not None else None),
+        enabled=settings.decision_log_enabled,
+        queue_size=settings.decision_log_queue_size,
+        batch_size=settings.decision_log_batch_size,
+    )
+    emitter.start()
+    return emitter
+
+
 def _build_remote_repo(settings: Settings, logger):
     """构造盘后回流的「远端写端」（实现 contracts.QmtRepository），供 RemoteSyncJob 注入。
 
@@ -167,12 +202,16 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     tick_source = XtdataTickSource(xt_real.import_xtdata())     # 触发 xtquant
     calendar = _build_calendar(settings, logger)
 
+    # —— 决策采集器（复盘用、best-effort、与交易热路径物理隔离，整条崩溃也不影响交易）——
+    decision_emitter = _build_decision_emitter(settings, logger, account_id, clock)
+
     # TODO(落地)：prior_provider 读当日本机 watchlist 表得续板先验（SignalPrior）；缺省 None=纯技术退出。
     deps = EngineDeps(
         settings=settings, clock=clock, logger=logger, calendar=calendar,
         trader=holder, account=account, account_id=account_id,
         tick_source=tick_source, selected_source=stack.watchlist_source,
         repository=stack.repository, ledger=stack.ledger, flush_hook=stack.flush,
+        decision_emitter=decision_emitter,
     )
     engine = build_engine(deps)
 

@@ -59,6 +59,7 @@ class OrderExecutor:
         settings: Settings,
         clock: Clock,
         logger: StructLogger,
+        decision_emitter: Optional[Any] = None,
     ) -> None:
         # 依赖注入：trader 是唯一下单/撤单出口；account 为下单/查询入参对象（StockAccount）。
         self._trader = trader
@@ -68,6 +69,8 @@ class OrderExecutor:
         self._settings = settings
         self._clock = clock
         self._logger = logger
+        # 决策采集器（可选）：注入则在下单/未成/卖出/拦截各点 best-effort 采集；与下单热路径物理隔离。
+        self._decision_emitter = decision_emitter
         # biz_order_no 序号自增器：键 = (target_trade_date, ts_code, strategy_family)，
         # 保证同一计划维度下的序号单调递增（§4.4(1) 序号段）。
         self._seq_counter: Dict[Tuple[Any, str, str], int] = {}
@@ -166,6 +169,16 @@ class OrderExecutor:
     # ------------------------------------------------------------------
     # place：核心下单流程（§4.5）
     # ------------------------------------------------------------------
+    def _emit_decision(self, **fields: Any) -> None:
+        """向决策采集器发一条下单/未成/拦截决策事件（全程吞异常，绝不影响下单热路径）。"""
+        em = self._decision_emitter
+        if em is None:
+            return
+        try:
+            em.emit(**fields)
+        except Exception:  # noqa: BLE001 决策采集绝不影响交易
+            pass
+
     def place(self, decision: EntryDecision) -> Optional[str]:
         """承接一条建仓决策并下单，返回 biz_order_no；不下单时返回 None（§4.5）。
 
@@ -194,6 +207,13 @@ class OrderExecutor:
                 "order_kill_switch_block",
                 ts_code=decision.ts_code,
                 account_id=self._account_id,
+            )
+            self._emit_decision(
+                decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                order_phase=decision.order_phase, reason="全局熔断 kill_switch，只采集不下单",
+                reason_code="kill_switch", factors=decision.factors_snapshot,
             )
             return None
 
@@ -224,6 +244,13 @@ class OrderExecutor:
                     placed_today=placed_today,
                     limit=max_orders,
                 )
+                self._emit_decision(
+                    decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                    ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                    trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                    order_phase=decision.order_phase, reason=f"超单日下单上限({placed_today}/{max_orders})",
+                    reason_code="max_orders", factors=decision.factors_snapshot,
+                )
                 return None
 
         limit_price = decision.limit_price
@@ -238,6 +265,13 @@ class OrderExecutor:
                 "order_zero_volume_skip",
                 ts_code=decision.ts_code,
                 account_id=self._account_id,
+            )
+            self._emit_decision(
+                decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                order_phase=decision.order_phase, reason="资金不足/算出 0 股，放弃", reason_code="zero_volume",
+                limit_price=limit_price, factors=decision.factors_snapshot,
             )
             return None
 
@@ -303,6 +337,14 @@ class OrderExecutor:
                 biz_order_no=biz_no,
                 order_id=order_id,
             )
+            self._emit_decision(
+                decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=family,
+                order_phase=decision.order_phase, reason="同步下单失败(order_stock 返回<0)",
+                reason_code="submit_failed", order_id=order_id, biz_order_no=biz_no,
+                limit_price=limit_price, plan_volume=plan_volume,
+            )
             # 不静默：主标的同步下单失败也不放弃整批，尝试次优（§4.4(7)/§4.7）。
             self.try_next_best(decision)
             return biz_no
@@ -323,6 +365,15 @@ class OrderExecutor:
             biz_order_no=biz_no,
             order_id=order_id,
             plan_volume=plan_volume,
+        )
+        # 决策采集：买入已提交（锚定 order_id/biz_order_no，闭环串联 qmt_order/qmt_trade）。
+        self._emit_decision(
+            decision_type="BUY_SUBMIT", decision_stage="ORDER", action=decision.action,
+            ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+            trade_date=decision.target_trade_date, strategy_family=family,
+            order_phase=decision.order_phase, reason=decision.reason, reason_code="order_submitted",
+            limit_price=limit_price, plan_volume=plan_volume, order_id=order_id, biz_order_no=biz_no,
+            factors=decision.factors_snapshot,
         )
         return biz_no
 
@@ -365,6 +416,12 @@ class OrderExecutor:
         # —— kill_switch 全局熔断：只采集不下单（§7.1.5）——
         if self._settings.kill_switch:
             self._logger.warn("order_sell_kill_switch_block", ts_code=ts_code, account_id=self._account_id)
+            self._emit_decision(
+                decision_type="SKIP_ORDER", decision_stage="SELL", action="SKIP",
+                ts_code=ts_code, signal_trade_date=signal_trade_date, trade_date=target_trade_date,
+                strategy_family="SELL", order_phase=order_phase, reason=f"全局熔断,卖出未下单({reason})",
+                reason_code="kill_switch", plan_volume=sell_vol, limit_price=price,
+            )
             return None
         if sell_vol is None or sell_vol <= 0:
             return None
@@ -426,6 +483,13 @@ class OrderExecutor:
             "order_sell_submitted",
             ts_code=ts_code, account_id=self._account_id, biz_order_no=biz_no,
             order_id=order_id, sell_vol=sell_vol,
+        )
+        # 决策采集：卖出已提交（锚定 order_id，闭环串联成交事实）。
+        self._emit_decision(
+            decision_type="SELL_SUBMIT", decision_stage="SELL", action="SELL_SUBMIT",
+            ts_code=ts_code, signal_trade_date=signal_trade_date, trade_date=target_trade_date,
+            strategy_family="SELL", order_phase=order_phase, reason=reason, reason_code="sell_submitted",
+            limit_price=price, plan_volume=sell_vol, order_id=order_id, biz_order_no=biz_no,
         )
         return biz_no
 
@@ -575,6 +639,15 @@ class OrderExecutor:
                     biz_order_no=biz_no,
                     account_id=self._account_id,
                     miss_reason=miss_reason,
+                )
+                # 决策采集：买不进（一字/秒封未成撤单），「为什么没买进」的事实源。
+                self._emit_decision(
+                    decision_type="BUY_MISS", decision_stage="ORDER", action="SKIP",
+                    ts_code=entry.ts_code, signal_trade_date=entry.signal_trade_date,
+                    trade_date=entry.target_trade_date, strategy_family=entry.strategy_family,
+                    order_phase=entry.order_phase, reason=f"未成交撤单({miss_reason})",
+                    reason_code="miss_unfilled", order_id=entry.order_id, biz_order_no=biz_no,
+                    plan_volume=entry.plan_volume, limit_price=entry.plan_price,
                 )
                 # 取原决策尝试次优（主标的买不进不放弃整批，§4.4(7)）。
                 decision = self._decision_by_biz.get(biz_no)
