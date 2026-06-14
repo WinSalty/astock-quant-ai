@@ -179,6 +179,18 @@ class OrderExecutor:
         except Exception:  # noqa: BLE001 决策采集绝不影响交易
             pass
 
+    @staticmethod
+    def _is_position_committed(entry: LedgerEntry) -> bool:
+        """该买单是否占用「建仓只数」名额。
+
+        口径：已有成交（filled_volume>0，含部成/全成）→ 占名额；零成交但仍在途（PLANNED/SUBMITTED/
+        REPORTED/PART_TRADED/CANCELLING）→ 占名额（结果未定，保守占位防超买）；终态零成交
+        （CANCELLED/REJECTED/ERROR 且未成交=一字/秒封买不进、拒单、错误）→ 没买进，释放名额。
+        """
+        if (entry.filled_volume or 0) > 0:
+            return True
+        return entry.state not in (OrderState.CANCELLED, OrderState.REJECTED, OrderState.ERROR)
+
     def place(self, decision: EntryDecision) -> Optional[str]:
         """承接一条建仓决策并下单，返回 biz_order_no；不下单时返回 None（§4.5）。
 
@@ -250,6 +262,34 @@ class OrderExecutor:
                     trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
                     order_phase=decision.order_phase, reason=f"超单日下单上限({placed_today}/{max_orders})",
                     reason_code="max_orders", factors=decision.factors_snapshot,
+                )
+                return None
+
+        # —— 单日建仓「只数」上限：最多 N 只不同标的被买入（区别于上面的下单「次数」上限）——
+        # 放在幂等命中之后：同一标的重复推不新占名额。占名额口径：当日 BUY 台账中「在途/部成/已成」的
+        # 不同标的数（终态零成交=没买进，不占名额）。从台账实时统计 → 重启后仍准（台账已 load_from_db 重建）。
+        max_positions = self._settings.max_positions_per_day
+        if max_positions is not None and max_positions > 0:
+            committed_codes = {
+                e.ts_code
+                for e in self._ledger.all_for_date(decision.target_trade_date)
+                if e.side == TradeSide.BUY and self._is_position_committed(e)
+            }
+            if decision.ts_code not in committed_codes and len(committed_codes) >= max_positions:
+                self._logger.warn(
+                    "order_max_positions_per_day_block",
+                    ts_code=decision.ts_code,
+                    account_id=self._account_id,
+                    distinct=len(committed_codes),
+                    limit=max_positions,
+                )
+                self._emit_decision(
+                    decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                    ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                    trade_date=decision.target_trade_date, strategy_family=family,
+                    order_phase=decision.order_phase,
+                    reason=f"超单日建仓只数上限({len(committed_codes)}/{max_positions})",
+                    reason_code="max_positions", factors=decision.factors_snapshot,
                 )
                 return None
 

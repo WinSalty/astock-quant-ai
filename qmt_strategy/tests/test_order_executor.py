@@ -500,6 +500,46 @@ def test_max_orders_per_day_blocks_overtrading(clock_0916):
     assert "order_max_orders_per_day_block" in logger.events()
 
 
+def test_max_positions_per_day_caps_distinct_stocks(clock_0916):
+    """单日建仓「只数」上限：达上限后新标的被拦（区别于下单「次数」上限）。"""
+    trader = FakeTrader()
+    logger = RecordingLogger()
+    ex = _executor(trader, clock_0916, settings=Settings(max_positions_per_day=2), logger=logger)
+    assert ex.place(_decision(ts_code="600036.SH")) is not None
+    assert ex.place(_decision(ts_code="600000.SH")) is not None
+    assert len(trader.order_calls) == 2
+    # 第 3 只不同标的 → 超建仓只数上限被拦、不下单、留痕。
+    assert ex.place(_decision(ts_code="000001.SZ")) is None
+    assert len(trader.order_calls) == 2
+    assert "order_max_positions_per_day_block" in logger.events()
+
+
+def test_max_positions_unfilled_frees_slot(clock_0916):
+    """买不进（终态零成交）不占建仓名额：撤单零成交后可再开新标的。"""
+    from qmt_strategy.contracts.enums import OrderState
+
+    trader = FakeTrader()
+    led = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=led, settings=Settings(max_positions_per_day=1))
+    biz1 = ex.place(_decision(ts_code="600036.SH"))
+    assert biz1 is not None
+    # 名额=1 已占 → 第 2 只此刻被拦。
+    assert ex.place(_decision(ts_code="600000.SH")) is None
+    # 600036 一字买不进：撤单零成交 → 释放名额。
+    led.update(biz1, state=OrderState.CANCELLED, filled_volume=0)
+    # 名额释放后第 2 只可开。
+    assert ex.place(_decision(ts_code="600000.SH")) is not None
+
+
+def test_max_positions_same_stock_not_double_counted(clock_0916):
+    """同一标的重复推（幂等命中）不重复占名额：上限 1 时同标的二次推仍返回既有单。"""
+    trader = FakeTrader()
+    ex = _executor(trader, clock_0916, settings=Settings(max_positions_per_day=1))
+    biz1 = ex.place(_decision(ts_code="600036.SH"))
+    assert biz1 is not None
+    assert ex.place(_decision(ts_code="600036.SH")) == biz1  # 幂等命中，未被名额闸误拦
+
+
 def test_rebuild_seq_counter_avoids_same_no_after_restart(clock_0916):
     """评审 P0-C4：重启后 _seq_counter 按台账已存在的最大 seq 重建，新单号严格大于历史，
     不与磁盘上的终态失败单同号覆盖。"""

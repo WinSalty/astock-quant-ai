@@ -312,20 +312,29 @@ class Engine:
             self._strength_weights = {}
             return
         present = [p.leader_strength_score for p in plans if p.leader_strength_score is not None]
-        floor_score = min(present) if present else None
-        scores: Dict[str, Optional[Decimal]] = {
-            p.ts_code: (p.leader_strength_score if p.leader_strength_score is not None else floor_score)
-            for p in plans
-        }
-        total = sum((s for s in scores.values() if s is not None), Decimal("0"))
+        floor_score = min(present) if present else Decimal("0")
+
+        def _score(p: PlanRow) -> Decimal:
+            """缺强度的票用候选最小强度兜底参与排序/归一（避免拿不到额度）。"""
+            return p.leader_strength_score if p.leader_strength_score is not None else floor_score
+
+        # 建仓名额优选：按强度降序；若设了单日建仓只数上限 N，仅取强度最高的前 N 只进入买入 universe，
+        # 权重在这 N 只内归一（Σw=1 → 满额部署），其余不进 weights（sizer 据此返 0 不开仓）。
+        # 这样「≤N 只被买入」与「资金按强度满额分配」口径一致——不会把额度摊到买不到的弱票上而闲置现金。
+        ranked = sorted(plans, key=_score, reverse=True)
+        cap = self._settings.max_positions_per_day
+        if cap is not None and cap > 0:
+            ranked = ranked[:cap]
+        scores: Dict[str, Decimal] = {p.ts_code: _score(p) for p in ranked}
+        total = sum(scores.values(), Decimal("0"))
         if total > 0:
-            self._strength_weights = {
-                code: ((s / total) if s is not None else Decimal("0")) for code, s in scores.items()
-            }
+            self._strength_weights = {code: (s / total) for code, s in scores.items()}
         else:
             eq = Decimal("1") / Decimal(len(scores))
             self._strength_weights = {code: eq for code in scores}
-        self._logger.info("engine_strength_weights", count=len(self._strength_weights))
+        self._logger.info(
+            "engine_strength_weights", count=len(self._strength_weights), position_cap=cap
+        )
 
     def _strength_budget_volume(self, plan: PlanRow, limit_price: Decimal) -> int:
         """按强度权重 + 可用现金 + 总敞口闸 + 在途扣减 测算单票计划股数（评审"按强度分"）。
@@ -357,10 +366,12 @@ class Engine:
         # 总敞口闸 + 在途扣减：可分配上限 − 当日已承诺(在途+已成)买入。
         committed = self._order.committed_amount(self._today_provider())
         budget = min(cash, ceiling - committed)
-        # 强度份额：w>0 才加 ceiling×w 约束（强的分得多）；缺强度退化不加此约束。
-        w = self._strength_weights.get(plan.ts_code, Decimal("0"))
-        if w > 0:
-            budget = min(budget, ceiling * w)
+        # 强度份额：仅买入 universe（强度优选 top-N）内的票分配额度，并按 ceiling×w 约束（强的分得多）。
+        w = self._strength_weights.get(plan.ts_code)
+        if w is None:
+            # 不在当日建仓名额内（名额已被更强的票占用）→ 返 0 不开新仓（与单日建仓只数上限口径一致）。
+            return 0
+        budget = min(budget, ceiling * w)
         # 单笔 / 单票金额上限收紧。
         for cap in (self._settings.per_order_max_amount, self._settings.max_position_per_stock):
             if cap is not None and Decimal(str(cap)) < budget:

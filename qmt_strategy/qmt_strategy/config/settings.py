@@ -102,7 +102,12 @@ class Settings:
     # —— 7.1.5 风控阈值（执行侧硬约束，下单前生效）——
     max_position_per_stock: Optional[Decimal] = None  # QMT_MAX_POSITION_PER_STOCK（金额上限）
     max_total_exposure: Optional[Decimal] = None      # QMT_MAX_TOTAL_EXPOSURE
-    max_orders_per_day: Optional[int] = None          # QMT_MAX_ORDERS_PER_DAY
+    max_orders_per_day: Optional[int] = None          # QMT_MAX_ORDERS_PER_DAY（下单「次数」上限，含转次优/卖出）
+    # 单日建仓「只数」上限（不同标的被买入的数量，区别于 max_orders 的下单次数）：
+    # 默认 5——当日最多买入 5 只不同标的。机制：强度优选 top-N 进入买入universe（权重在 N 只内归一、
+    # 满额部署不闲置现金），叠加 order_executor 下单层硬闸（占名额口径：在途/部成/已成占名额，
+    # 终态零成交=没买进不占）双保险。设 0/负数或极大值可放宽（QMT_MAX_POSITIONS_PER_DAY 覆盖）。
+    max_positions_per_day: Optional[int] = 5          # QMT_MAX_POSITIONS_PER_DAY
     per_order_max_amount: Optional[Decimal] = None    # QMT_PER_ORDER_MAX_AMOUNT
     # 强度加权资金分配（按 leader_strength_score 分预算，强的分得多）：可分配总预算上限 = 日初权益×本比例。
     # 默认 1.0=用全部日初权益作上限（强度权重在候选间归一分配）；可调小以留现金（如 0.8 只用八成仓）。
@@ -191,6 +196,12 @@ class Settings:
             max_position_per_stock=_as_decimal(g("QMT_MAX_POSITION_PER_STOCK")),
             max_total_exposure=_as_decimal(g("QMT_MAX_TOTAL_EXPOSURE")),
             max_orders_per_day=_as_int(g("QMT_MAX_ORDERS_PER_DAY")),
+            # 默认 5；显式配置（含 0/负=放宽不限只数）优先，未配则取默认 5。
+            max_positions_per_day=(
+                _as_int(g("QMT_MAX_POSITIONS_PER_DAY"))
+                if g("QMT_MAX_POSITIONS_PER_DAY")
+                else 5
+            ),
             per_order_max_amount=_as_decimal(g("QMT_PER_ORDER_MAX_AMOUNT")),
             target_position_ratio=_as_decimal(g("QMT_TARGET_POSITION_RATIO")) or Decimal("1.0"),
             price_deviation_guard_pct=_as_decimal(g("QMT_PRICE_DEVIATION_GUARD_PCT")),

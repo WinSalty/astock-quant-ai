@@ -187,6 +187,45 @@ def test_strength_weighted_budget_allocation():
     assert v_strong == (int(Decimal("750000") / Decimal("10.50")) // 100) * 100
 
 
+def _three_candidate_deps(env=None):
+    """三只候选：强度 90/60/30（验证单日建仓只数上限 top-N 名额 + 强度归一）。"""
+    rows = []
+    for code, strength in (("600036.SH", Decimal("90")), ("600000.SH", Decimal("60")), ("000001.SZ", Decimal("30"))):
+        r = make_selected_row(
+            ts_code=code, signal_close=Decimal("10.00"), limit_up_price=Decimal("11.00"),
+            reasonable_open_high_low=Decimal("10.20"), reasonable_open_high_high=Decimal("10.80"),
+            market_state="启动", tradable_flag=True, leader_strength_score=strength,
+        )
+        r.strategy_family = "打板"
+        r.setup = "首板"
+        rows.append(r)
+    return _deps(env, source_rows=rows)
+
+
+def test_position_cap_restricts_budget_to_top_n_strength():
+    """单日建仓只数上限 N=2：仅强度 top-2 分配额度（权重在 2 只内归一、满额部署），第 3 只预算 0。"""
+    deps = _three_candidate_deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_MAX_POSITIONS_PER_DAY": "2"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)  # 日初权益=100万，ratio=1.0 → ceiling=100万
+    v1 = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
+    v2 = eng._strength_budget_volume(eng._plan_map["600000.SH"], Decimal("10.50"))
+    v3 = eng._strength_budget_volume(eng._plan_map["000001.SZ"], Decimal("10.50"))
+    assert v3 == 0                                   # 不在 top-2 名额内 → 不开仓
+    assert v1 > v2 > 0
+    # 权重在 top-2 内归一：90/150=0.6、60/150=0.4 → 预算 60万 / 40万（不被第 3 只摊薄、不闲置）
+    assert v1 == (int(Decimal("600000") / Decimal("10.50")) // 100) * 100
+    assert v2 == (int(Decimal("400000") / Decimal("10.50")) // 100) * 100
+
+
+def test_position_cap_unlimited_keeps_all_candidates():
+    """放宽建仓只数上限（设极大）→ 全体候选参与归一（回到「摊到所有候选」口径）。"""
+    deps = _three_candidate_deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_MAX_POSITIONS_PER_DAY": "99"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    v3 = eng._strength_budget_volume(eng._plan_map["000001.SZ"], Decimal("10.50"))
+    assert v3 > 0                                    # 第 3 只也分到额度（30/180）
+
+
 def test_total_exposure_ceiling_caps_budget():
     """max_total_exposure 总敞口闸：可分配上限被压到敞口值，强度份额随之缩小。"""
     deps = _two_candidate_deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_MAX_TOTAL_EXPOSURE": "100000"})
