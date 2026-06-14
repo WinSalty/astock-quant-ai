@@ -61,8 +61,12 @@ class Risk:
              （§5.4.1/§5.4.3：行情断流没有可信盘口、下单断线无法可靠成交，
               二者任一中断都不做实时卖出决策，宁可不交易）。
           2. 账户级击穿：account_drawdown 超 account_drawdown_limit，或
-             account_realized_loss 超 account_loss_limit → FREEZE（全账户冻结，
-             暂停一切新卖出/买入决策，§5.4.1）。阈值为 None（未配置）视为不约束。
+             account_realized_loss 超 account_loss_limit → FREEZE（账户级击穿，§5.4.1）。
+             阈值为 None（未配置）视为不约束。
+             口径澄清（评审二轮 P3#74）：账户级击穿在【开新仓】路径生效（_open_blocked_by_risk 喂
+             account_drawdown → FREEZE 禁开仓）；【卖出】路径**刻意不喂** account_drawdown（run_sell_pass
+             只喂行情/下单中断），以免账户回撤反而冻结必要的止损出场。即"账户击穿冻结买入、不冻结卖出"，
+             由调用方按是否喂入 account_drawdown 决定，gate 本身只做无状态裁决。
           3. 单票级击穿：unit_float_loss 超 stock_float_loss_limit → FREEZE（该票冻结，
              §5.4.1）。
           4. 空仓闸门：market_state == '空仓' → SELL_ONLY_HOLD（只守仓不新开，

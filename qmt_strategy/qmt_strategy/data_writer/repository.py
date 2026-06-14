@@ -32,6 +32,19 @@ class InMemoryQmtRepository:
         self._orders: Dict[tuple, OrderRecord] = {}
         self._positions: Dict[tuple, PositionRecord] = {}
         self._accounts: Dict[tuple, AccountRecord] = {}
+        # 系统标志位 kv（评审二轮 P1#9）：内存版对账阻断标记等，与 SqliteQmtRepository 同接口。
+        self._flags: Dict[str, str] = {}
+
+    def set_flag(self, flag_key: str, flag_value):
+        """设置/清除系统标志位（flag_value=None 清除）。"""
+        if flag_value is None:
+            self._flags.pop(flag_key, None)
+        else:
+            self._flags[flag_key] = str(flag_value)
+
+    def get_flag(self, flag_key: str):
+        """读系统标志位；无则 None。"""
+        return self._flags.get(flag_key)
 
     # —— 唯一键构造 ——
     def _trade_key(self, rec: TradeRecord) -> tuple:

@@ -70,6 +70,8 @@ class SelectedStockRow:
     # 路由维度（§4.2，可由 strategy/role 推导，信号侧给则优先）
     strategy_family: Optional[str] = None          # 战法大类
     setup: Optional[str] = None                    # 技术形态/位置
+    # 证券名称（评审二轮 P1#18/#63）：信号侧契约已含，执行侧据此识别 ST/退市（主板 ST 涨停 5%）并做 live 过滤。
+    name: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

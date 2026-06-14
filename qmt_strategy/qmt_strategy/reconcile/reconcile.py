@@ -254,9 +254,9 @@ class Reconcile:
         """
         matched_order_ids: set = set()
 
-        # 台账→回报：逐条计划单找对应回报。
+        # 台账→回报：逐条计划单找对应回报（matched_order_ids 同时作为"已消费回报"集合，保证一对一）。
         for e in ledger_entries:
-            matched = self._match_ledger_to_order(e, orders_by_id, orders)
+            matched = self._match_ledger_to_order(e, orders_by_id, orders, matched_order_ids)
             if matched is not None:
                 matched_order_ids.add(matched.order_id)
                 report.matched_orders += 1
@@ -327,25 +327,49 @@ class Reconcile:
         e: LedgerEntry,
         orders_by_id: Dict[int, OrderRecord],
         orders: List[OrderRecord],
+        consumed_order_ids: Optional[set] = None,
     ) -> Optional[OrderRecord]:
-        """台账行关联回报：优先 order_id 强关联，缺失时按 order_remark(归一 ts_code + signal T) 弱关联。"""
-        # 强关联：台账已回填 order_id 且回报存在该 order_id。
+        """台账行关联回报：优先 order_id 强关联，缺失时按方向 + (买:remark ts_code+T / 卖:归一 ts_code) 弱关联。
+
+        评审二轮修正：
+        - #36：强 / 弱关联均校验买卖方向一致——order_id 跨交易日可复用，极端下买单台账可能错配卖单回报，
+          串单会污染对账与滑点；方向不一致一律不认。
+        - #35：卖单 order_remark 形如 `SELL|reason`（不含 ts_code / T，与买单 `LUP|T|ts_code` 不同前缀），
+          原弱关联只认 `LUP|` → 缺 order_id 的卖单恒弱关联失败、被误报漏单。卖单改按【归一 ts_code + 方向】弱关联。
+        """
+        # 强关联：台账已回填 order_id 且回报存在该 order_id（并校验方向，#36）。
         if e.order_id is not None and e.order_id in orders_by_id:
-            return orders_by_id[e.order_id]
-        # 弱关联：order_id 缺失时按 order_remark 解析的 ts_code + signal T 匹配（仅非 ERROR 回报）。
+            cand = orders_by_id[e.order_id]
+            if cand.trade_side == e.side:
+                return cand
+            # 方向不符（疑似 order_id 跨日复用串单）：不强配，落入弱关联兜底。
+        # 弱关联：order_id 缺失 / 方向不符时按方向 + 业务键匹配（仅非 ERROR 回报）。
+        consumed = consumed_order_ids if consumed_order_ids is not None else set()
         e_code = _resolve(e.ts_code)
         for o in orders:
             if o.order_status == OrderStatus.ERROR:
                 continue
-            remark_code = self._ledger_biz_from_remark(o.order_remark)
-            remark_t = parse_order_remark(o.order_remark)
-            if (
-                remark_code is not None
-                and remark_code == e_code
-                and remark_t is not None
-                and remark_t == e.signal_trade_date
-            ):
-                return o
+            # 回报独占（评审复审 P2-1）：已被前序台账强/弱关联消费的回报不再参与本条弱关联，避免同标的多笔
+            # 卖单（如先 REDUCE 后 CLEAR）全部弱配到同一条回报 → 掩盖漏单 / 把其余回报误标手工单。
+            if o.order_id is not None and o.order_id in consumed:
+                continue
+            if o.trade_side != e.side:  # #36：方向必须一致，杜绝买台账错配卖回报
+                continue
+            if e.side == TradeSide.BUY:
+                # 买单：按 order_remark(LUP|T|ts_code) 解析的 ts_code + 信号日 T 弱关联。
+                remark_code = self._ledger_biz_from_remark(o.order_remark)
+                remark_t = parse_order_remark(o.order_remark)
+                if (
+                    remark_code is not None
+                    and remark_code == e_code
+                    and remark_t is not None
+                    and remark_t == e.signal_trade_date
+                ):
+                    return o
+            else:
+                # 卖单（#35）：remark 不含 ts_code，按【归一 ts_code + 方向】弱关联（方向上方已校验）。
+                if e_code is not None and _resolve(o.ts_code) == e_code:
+                    return o
         return None
 
     @staticmethod
@@ -440,15 +464,20 @@ class Reconcile:
             return
 
         report.asset_checked = True
-        # 方向一致性粗校验：成交净现金流方向应与账户现金侧变动方向一致（这里用资产变动近似）。
-        # 偏差 = |净额 - 账户变动|，超阈值 + 方向相反才告警，避免费用 / 浮盈浮亏噪声误报。
+        # 偏差 = |成交净现金流 − 账户现金变动|；超阈值即告警（评审二轮 P2#34）。
+        # 口径修正：原实现要求「方向相反」才告警，会漏掉【同向超额】偏差——漏采一笔买入时 net_flow 少算一段
+        # 流出（仍为负、与账户现金下降同向），方向不冲突却金额差一大截，旧逻辑永不报警。改为只要金额偏差超阈值
+        # 就告警（阈值已滤掉费用/浮盈浮亏等小额噪声）；方向是否冲突仅作诊断信息附在 detail。
         deviation = abs(net_flow - account_change)
         direction_conflict = (net_flow > 0 and account_change < 0) or (net_flow < 0 and account_change > 0)
-        if deviation > _ASSET_DEVIATION_THRESHOLD and direction_conflict:
+        if deviation > _ASSET_DEVIATION_THRESHOLD:
             disc = AssetDiscrepancy(
                 expected_net_flow=net_flow,
                 account_asset_change=account_change,
-                detail="成交净额与账户资产变动方向不一致且偏差超阈值：疑似漏采成交 / 资金流水异常",
+                detail=(
+                    "成交净额与账户现金变动偏差超阈值：疑似漏采成交 / 资金流水异常"
+                    + ("（方向亦相反）" if direction_conflict else "（同向超额偏差）")
+                ),
             )
             report.asset_discrepancy = disc
             self._logger.error(
@@ -457,6 +486,7 @@ class Reconcile:
                 expected_net_flow=str(net_flow),
                 account_asset_change=str(account_change),
                 deviation=str(deviation),
+                direction_conflict=direction_conflict,
             )
 
     def _fetch_account_change(self, trade_date: date) -> Optional[Decimal]:

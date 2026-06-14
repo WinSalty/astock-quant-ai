@@ -100,6 +100,8 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
         ts_code=item.get("ts_code"),
         trade_date=_to_date(item.get("trade_date")),
         target_trade_date=target_trade_date,
+        # 证券名称（评审二轮 P1#18/#63）：契约已含 name，透传供执行侧识别 ST/退市（主板 ST 涨停 5%）与 live 过滤。
+        name=item.get("name"),
         leader_strength_score=_to_decimal(item.get("leader_strength_score")),
         role=_first_role(item.get("role_tags")),
         # 信号侧只给 strategy_family/setup（无单值 strategy），strategy 留空，路由按 family+setup。

@@ -13,6 +13,7 @@ from typing import Optional, Tuple
 from ..contracts.enums import Board, PriceSource
 from ..contracts.models import PriceBudget, SelectedStockRow
 from .identity import board_of
+from .universe_filter import is_st_name
 
 _CENT = Decimal("0.01")
 
@@ -21,6 +22,9 @@ _BOARD_LIMIT_RATIO = {
     Board.MAIN: Decimal("0.10"),
     Board.CHINEXT: Decimal("0.20"),
 }
+# 主板 ST / 退市整理股涨跌幅 5%（评审二轮 P1#18）。注意：创业板/科创的 ST 仍按 20%（其无 5% 制度），
+# 故 ST 5% 只对主板生效；非主板 ST 沿用板块比例。
+_ST_MAIN_RATIO = Decimal("0.05")
 
 
 def round_to_cent(v: Decimal) -> Decimal:
@@ -28,16 +32,25 @@ def round_to_cent(v: Decimal) -> Decimal:
     return v.quantize(_CENT, rounding=ROUND_HALF_UP)
 
 
-def limit_up_price(signal_close: Decimal, board: Board) -> Decimal:
-    """按 board 现算理论涨停价 = 收盘价 ×(1+涨幅比例)，四舍五入到 0.01。"""
-    ratio = _BOARD_LIMIT_RATIO[board]
-    return round_to_cent(signal_close * (Decimal("1") + ratio))
+def _limit_ratio(board: Board, is_st: bool) -> Decimal:
+    """涨跌幅比例：主板 ST/退市整理 → 5%（评审二轮 P1#18），否则按板块（主板 10% / 创业板 20%）。"""
+    if is_st and board == Board.MAIN:
+        return _ST_MAIN_RATIO
+    return _BOARD_LIMIT_RATIO[board]
 
 
-def limit_down_price(signal_close: Decimal, board: Board) -> Decimal:
-    """按 board 现算理论跌停价（备用，对称口径）。"""
-    ratio = _BOARD_LIMIT_RATIO[board]
-    return round_to_cent(signal_close * (Decimal("1") - ratio))
+def limit_up_price(signal_close: Decimal, board: Board, is_st: bool = False) -> Decimal:
+    """按 board(+ST) 现算理论涨停价 = 收盘价 ×(1+涨幅比例)，四舍五入到 0.01。
+
+    评审二轮 P1#18：主板 ST/退市整理股涨停 5%，不再恒按 10% 现算（否则挂出超 ST 法定涨停价的废单 /
+    对真实 5% 顶板静默漏买）。is_st 由调用方据证券名称判定（universe_filter.is_st_name）。
+    """
+    return round_to_cent(signal_close * (Decimal("1") + _limit_ratio(board, is_st)))
+
+
+def limit_down_price(signal_close: Decimal, board: Board, is_st: bool = False) -> Decimal:
+    """按 board(+ST) 现算理论跌停价（备用，对称口径）。"""
+    return round_to_cent(signal_close * (Decimal("1") - _limit_ratio(board, is_st)))
 
 
 def budget_prices(row: SelectedStockRow) -> PriceBudget:
@@ -52,6 +65,9 @@ def budget_prices(row: SelectedStockRow) -> PriceBudget:
     # universe_filter 剔除。eff_board 仅用于「信号侧已给权威价位」时的 board 记录，绝不再用它对
     # 这类标的兜底现算涨停价（评审 P0-F1：默认主板 10% 会对 20%/30% 板算错、对 ST 算错）。
     eff_board = board if board is not None else Board.MAIN
+    # ST/退市整理判定（评审二轮 P1#18）：据信号侧透传的证券名称识别；主板 ST 涨停 5%，避免按 10% 算出
+    # 超法定涨停价的废单 / 对真实 5% 顶板漏买。名称缺失 → 非 ST（不阻塞，沿用板块比例）。
+    is_st = is_st_name(row.name)
 
     has_signal_limit = row.limit_up_price is not None
     has_signal_range = (
@@ -82,11 +98,13 @@ def budget_prices(row: SelectedStockRow) -> PriceBudget:
             price_source=PriceSource.MISSING,
         )
 
-    if row.signal_close is not None:
-        # 用收盘价 + board 规则兜底现算涨停价（仅主板/创业板，board 已非 None 或已有信号涨停价）；
+    # signal_close>0 才可现算（评审二轮 P2#45）：原实现 `is not None` 会把 signal_close<=0 现算成涨停价 0
+    # 并标 LOCAL_CALC 进可交易名单（错价/可能 0 价下单）。<=0 属脏数据，应降级 MISSING 转观察名单。
+    if row.signal_close is not None and row.signal_close > 0:
+        # 用收盘价 + board(+ST) 规则兜底现算涨停价（仅主板/创业板，board 已非 None 或已有信号涨停价）；
         # 合理高开区间优先用信号侧给的，缺则用一段保守默认。
-        lup = row.limit_up_price if has_signal_limit else limit_up_price(row.signal_close, eff_board)
-        low, high = _fallback_open_range(row, eff_board)
+        lup = row.limit_up_price if has_signal_limit else limit_up_price(row.signal_close, eff_board, is_st)
+        low, high = _fallback_open_range(row, eff_board, is_st)
         return PriceBudget(
             limit_up_price=lup,
             reasonable_open_low=low,
@@ -105,15 +123,17 @@ def budget_prices(row: SelectedStockRow) -> PriceBudget:
     )
 
 
-def _fallback_open_range(row: SelectedStockRow, board: Board) -> Tuple[Decimal, Decimal]:
+def _fallback_open_range(
+    row: SelectedStockRow, board: Board, is_st: bool = False
+) -> Tuple[Decimal, Decimal]:
     """合理高开区间兜底：信号侧给则用其值；否则以 signal_close 的 [+2%, +涨停] 作保守默认区间。
 
     说明：执行侧不臆造精细高开阈值，这里只给「不为空」的保守占位，真实阈值由配置/信号侧主导；
-    标 LOCAL_CALC 后复盘可识别该区间为兜底现算。
+    标 LOCAL_CALC 后复盘可识别该区间为兜底现算。high 用 board(+ST) 涨停价（评审二轮 P1#18，ST 高沿不超 5%）。
     """
     if row.reasonable_open_high_low is not None and row.reasonable_open_high_high is not None:
         return row.reasonable_open_high_low, row.reasonable_open_high_high
     close = row.signal_close
     low = round_to_cent(close * Decimal("1.02"))
-    high = limit_up_price(close, board)
+    high = limit_up_price(close, board, is_st)
     return low, high

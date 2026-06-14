@@ -71,6 +71,9 @@ from ..watchlist.watchlist_loader import WatchlistLoader
 XT_ORDER_TYPE_SELL = 24
 XT_PRICE_TYPE_FIX = 11
 
+# 对账未通过阻断开仓的持久标志键（评审二轮 P1#9）：置位后次日 prewarm 读到即只守仓不开新仓，人工清除前持续。
+_RECONCILE_BLOCK_FLAG = "reconcile_blocked"
+
 
 @dataclass
 class EngineDeps:
@@ -173,8 +176,10 @@ class Engine:
         )
 
         # —— 竞价轮询（plan_provider 取当日可交易名单的计划行；router_sink 接决策 + 下单 gating）——
+        # feed_health_sink（评审二轮 P1#15）：竞价段 tick 取数成败上报 _market_feed_ok，行情断流走 FREEZE。
         self._poller = AuctionPoller(
-            deps.tick_source, self._plan_provider, self._router_sink, s, deps.clock, deps.logger
+            deps.tick_source, self._plan_provider, self._router_sink, s, deps.clock, deps.logger,
+            feed_health_sink=self.report_market_feed,
         )
 
         # 运行期状态：当日 watchlist 上下文 + 计划行映射（盘中只读）。
@@ -196,6 +201,8 @@ class Engine:
         self._storage_ok = True
         # 当日已抓基线的交易日（评审二轮 P1#19）：防同日盘中重启 prewarm 重跑覆盖日初回撤基线。
         self._day_open_equity_date: Optional[date] = None
+        # 对账未通过阻断开仓标志（评审二轮 P1#9）：prewarm 从持久标志读入；True 则今日只守仓不开新仓。
+        self._reconcile_blocked = False
 
     # ------------------------------------------------------------------
     # 对外暴露（供 main / 连接守护注册回调 / 调度）
@@ -248,10 +255,35 @@ class Engine:
         self._storage_health_checker = checker
 
     # ------------------------------------------------------------------
+    # 行情通道健康（评审二轮 P1#15）
+    # ------------------------------------------------------------------
+    def report_market_feed(self, ok: bool) -> None:
+        """行情源健康上报：行情断流 → ok=False 使 risk.gate 走 FREEZE 安全默认（没有可信盘口不实时卖）。
+
+        原 `_market_feed_ok` 恒 True、无置 False 处 = 死代码（行情断流冻结分支永不触发）。这里提供置位入口：
+        - 竞价段由 AuctionPoller 注入：本轮 get_full_tick 整体失败(降级) → report(False)，成功 → report(True)；
+        - 盘中连续交易段由 sell_books_provider（实时盘口源，TODO实测）在取盘口失败时上报 False（落地见 run.py）。
+        仅在状态翻转时留痕，避免每帧刷日志。
+        """
+        if self._market_feed_ok != ok:
+            self._logger.warn("engine_market_feed_changed", market_feed_ok=ok)
+        self._market_feed_ok = ok
+
+    # ------------------------------------------------------------------
     # 盘前：装载当日 watchlist + 推进持仓状态
     # ------------------------------------------------------------------
     def prewarm(self, today: date) -> WatchlistContext:
         """盘前一次性装载（§2.3）：装 watchlist 上下文、建计划映射、推进持仓状态（守 T+1 转 HOLDING）。"""
+        # 每个交易日开盘前重置行情通道健康为 True（评审二轮 P1#15）：新一天默认行情可用，盘中由竞价轮询/
+        # 盘口源在断流时置 False；避免前一日末轮的 False 状态跨日残留，导致开盘即全程冻结。
+        self._market_feed_ok = True
+        # 对账阻断标记（评审二轮 P1#9）：上一交易日对账未通过且未人工清除 → 今日只守仓不开新仓。
+        self._reconcile_blocked = self._read_reconcile_block()
+        if self._reconcile_blocked:
+            self._logger.error(
+                "engine_prewarm_reconcile_blocked", trade_date=str(today),
+                note="对账未通过未清除,今日只守仓不开新仓;人工核查后删除 system_flags.reconcile_blocked 解除",
+            )
         ctx = self._watchlist.load(today)
         self._context = ctx
         # 计划映射：仅可交易名单进竞价/建仓（观察名单只跟踪不下单，§2.3）。
@@ -408,11 +440,22 @@ class Engine:
         if not self._storage_ok:
             self._logger.error("engine_open_blocked_storage_unhealthy", ts_code=ts_code)
             return True
+        # —— 对账未通过阻断（评审二轮 P1#9）：上一交易日对账有漏单/串单/资产偏差且未人工清除 → 禁开新仓——
+        if self._reconcile_blocked:
+            self._logger.error("engine_open_blocked_reconcile_unconfirmed", ts_code=ts_code)
+            return True
+        # —— 账户回撤 fail-closed（评审二轮 P2#70）：有日初基线但当前资产查询失败 → 无法核验回撤 →
+        # 禁开新仓（不冻结卖出）。原实现 _account_drawdown() 失败返 None → gate 当"无回撤"放行 = 账户级
+        # 止损闸 fail-open。这里在有基线时把"算不出回撤"显式当作"不可放行开仓"。
+        drawdown = self._account_drawdown()
+        if self._day_open_equity is not None and self._day_open_equity > 0 and drawdown is None:
+            self._logger.error("engine_open_blocked_drawdown_unknown", ts_code=ts_code)
+            return True
         verdict = self._risk.gate(
             market_state=self._market_state,
             market_feed_ok=self._market_feed_ok,
             trade_conn_ok=self._trade_conn_ok,
-            account_drawdown=self._account_drawdown(),
+            account_drawdown=drawdown,   # 复用上方已查值（评审二轮 P2#70），避免重复查资产
             account_realized_loss=None,  # 由 total_asset 回撤综合承载，不单列
             unit_float_loss=None,        # 开新仓为全新标的，无既有浮亏
         )
@@ -475,6 +518,10 @@ class Engine:
         w<=0（缺强度）时不加强度份额约束，退化为"先到先得 + 总敞口闸"。
         """
         if limit_price is None or limit_price <= 0:
+            return 0
+        # 目标仓位比 ≤0（空跑/降仓到 0，已在 settings 钳到非负）→ 确定性不开新仓（评审复审 P2-3）：
+        # 不依赖日初基线是否查到——原实现基线查询失败时 ceiling 退化为全额现金，会绕过 ratio=0 的空跑意图。
+        if self._settings.target_position_ratio <= 0:
             return 0
         try:
             asset = self._deps.trader.query_stock_asset(self._deps.account)
@@ -637,8 +684,44 @@ class Engine:
                 factors=decision.factors_snapshot,
             )
             return
+        # 限价合法性 / 偏离防护（评审二轮 P2#67）：下单前校验限价非正/超法定涨停价/偏离盘口过大则拒发，
+        # 防价位口径错误（如 ST 误算成 10%、参考价兜底错位）直发废单或追高失控。
+        sane, why = self._limit_price_sane(decision, plan, snap)
+        if not sane:
+            self._logger.warn("engine_limit_price_rejected", ts_code=decision.ts_code, reason=why)
+            self._emit_decision(
+                decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                order_phase=decision.order_phase, reason=f"限价校验未过:{why}", reason_code="limit_price_guard",
+                limit_price=decision.limit_price, factors=decision.factors_snapshot,
+            )
+            return
         # 通过全部闸门 → 下单（place 内仍有 kill_switch / 幂等 / 资金校验）。
         self._order.place(decision)
+
+    def _limit_price_sane(self, decision: EntryDecision, plan: PlanRow, snap: AuctionSnapshot):
+        """下单前限价合法性 / 偏离校验（评审二轮 P2#67）。返回 (是否通过, 原因)。
+
+        三道校验（任一不过即拒发）：
+        1) 限价非正（None/<=0）→ 拒（无效价位）；
+        2) 超法定涨停价上界：限价 > plan.limit_up_price（board_rules 已按板块/ST 算）→ 拒（必废单）；
+        3) 偏离防护：配了 price_deviation_guard_pct 且有盘口现价时，限价与盘口现价偏离比例 > 阈值 → 拒
+           （价位口径错位 / 追高失控的兜底闸）。
+        """
+        lp = decision.limit_price
+        if lp is None or lp <= 0:
+            return False, "限价非正"
+        cap = plan.limit_up_price
+        if cap is not None and cap > 0 and lp > cap:
+            return False, f"限价{lp}超法定涨停价{cap}"
+        guard = self._settings.price_deviation_guard_pct
+        ref = getattr(snap, "last_price", None)
+        if guard is not None and ref is not None and ref > 0:
+            dev = abs(lp - ref) / ref
+            if dev > guard:
+                return False, f"限价{lp}偏离盘口现价{ref}超{guard}"
+        return True, ""
 
     def run_auction(self, sleep_fn=None, max_loops: Optional[int] = None) -> None:
         """启动竞价轮询主循环（§3.6）。sleep_fn / max_loops 供测试注入有限轮次。"""
@@ -709,6 +792,17 @@ class Engine:
         if book is None:
             # 无执行侧盘口：安全默认不主动卖（§5.4.3，没有可信盘口不做实时卖出决策）。
             return False
+        # 单票浮亏止损（评审二轮 P2#39）：浮亏击穿 stock_float_loss_limit → 强制清仓，优先于常规卖出决策。
+        # 注意口径：单票止损是"该卖"的触发器（应主动卖出），不能喂进 risk.gate 当 FREEZE（那会反而冻结卖出 =
+        # 不止损）。故在此独立判定并直接 CLEAR；gate 的 unit_float_loss 层不用于卖出路径。
+        if self._unit_stop_loss_breached(unit, book):
+            self._logger.warn(
+                "engine_unit_stop_loss_clear",
+                ts_code=unit.ts_code, avg_cost=str(unit.avg_cost),
+                last_price=str(getattr(book, "last_price", None)),
+                limit=str(self._settings.stock_float_loss_limit),
+            )
+            return self._place_sell(unit, SellActionType.CLEAR, None, "单票浮亏止损", book, today)
         if session == "auction":
             action = self._sell.decide_auction(unit, prior, book, risk_verdict=verdict.verdict)
         else:
@@ -716,6 +810,20 @@ class Engine:
         if action.action in (SellActionType.REDUCE, SellActionType.CLEAR):
             return self._place_sell(unit, action.action, action.reduce_ratio, action.reason, book, today)
         return False
+
+    def _unit_stop_loss_breached(self, unit, book) -> bool:
+        """单票浮亏是否击穿止损线（评审二轮 P2#39）：浮亏比例 = (成本 − 现价)/成本 ≥ stock_float_loss_limit。
+
+        边界：阈值未配置 / 无现价 / 无有效成本 → 不触发（不凭空止损）。Decimal 口径，禁 float。
+        """
+        limit = self._settings.stock_float_loss_limit
+        last = getattr(book, "last_price", None)
+        # last<=0 防御（评审复审 P1）：降级/坏 tick 给出 0 价时，(成本-0)/成本=1.0 会"凭空"触发强平并挂 0 价废单。
+        # 现价非正即数据不可信，按"无可信盘口不主动止损"处理（安全默认），返回 False。
+        if limit is None or last is None or last <= 0 or unit.avg_cost is None or unit.avg_cost <= 0:
+            return False
+        float_loss = (unit.avg_cost - last) / unit.avg_cost
+        return float_loss >= limit
 
     def _place_sell(self, unit, action_type, reduce_ratio, reason, book=None, today=None) -> bool:
         """发出卖出委托（守 T+1 量闸 + kill_switch + 价位取实时盘口）。
@@ -751,16 +859,21 @@ class Engine:
         sell_vol = self._risk.clamp_sell_volume(decision_vol, unit.can_use_volume)
         if sell_vol <= 0:
             return False
-        # 价位取实时盘口现价（评审 P2）：优先 book.last_price；缺失才回退成本价并告警。
-        if book is not None and getattr(book, "last_price", None) is not None:
-            price = book.last_price
+        # 价位取实时盘口现价（评审 P2）：优先 book.last_price（须 >0）；缺失/非正才回退成本价并告警。
+        last = getattr(book, "last_price", None) if book is not None else None
+        if last is not None and last > 0:
+            price = last
         else:
             price = unit.avg_cost
             self._logger.warn(
                 "engine_sell_price_fallback_avg_cost",
                 ts_code=unit.ts_code,
-                reason="盘口 last_price 缺失，回退成本价(可能挂不出)，应排查盘口源",
+                reason="盘口 last_price 缺失/非正，回退成本价(可能挂不出)，应排查盘口源",
             )
+        # 价位非正兜底（评审复审 P1）：成本价亦非正（脏数据）则绝不下 0 价废单，放弃本次卖出并告警。
+        if price is None or price <= 0:
+            self._logger.error("engine_sell_invalid_price_skip", ts_code=unit.ts_code, price=str(price))
+            return False
         # 卖出走唯一下单点（评审 P0-C1）：生成 biz 单号 + 落台账 + 经 OrderExecutor 唯一出口下卖单，
         # 不再编排层直连 trader.order_stock（原实现卖单无台账/无 biz 单号/不可对账）。
         biz_no = self._order.place_sell(
@@ -791,16 +904,24 @@ class Engine:
     # 收盘 / 断线补采 / 对账
     # ------------------------------------------------------------------
     def on_reconnect_backfill(self) -> None:
-        """断线重连后补采当日缺口（§6.2.3）：由连接守护 / 回调 on_disconnected 钩子触发。"""
+        """断线重连后补采当日缺口（§6.2.3）：由连接守护 / 回调 on_disconnected 钩子触发。
+
+        通道健康标志口径修正（评审二轮 P1#14）：原实现先置 _trade_conn_ok=False 再在 finally 无条件置回
+        True——即便补采失败（连接其实仍不可用）也"乐观解冻"，FREEZE 安全默认形同虚设（fail-open）。
+        修复：补采+持仓重建【全部成功】才解冻（连接确实可用）；任一异常则保持 False（fail-closed），让
+        行情/下单中断 FREEZE 在重连真正确认前持续生效，并强告警。
+        """
         self._trade_conn_ok = False
         try:
             self._snapshot.run_backfill()
             # 补采后用 QMT 权威持仓重建持仓状态机（评审二轮 P1#30）：断线期间发生的买入成交只被 query_*
             # 补采落库、不回写持仓状态机 → 会漏卖；这里据 QMT 当前持仓重建/校准单元，使其进入卖出决策。
             self._rebuild_positions_from_broker(self._today_provider())
-        finally:
-            # 补采尝试后恢复通道标志（真实重连成功与否由连接守护判定，这里乐观置回）。
-            self._trade_conn_ok = True
+        except Exception as exc:  # noqa: BLE001 补采失败 = 连接仍不可信：保持冻结(fail-closed)，不解冻
+            self._logger.error("engine_reconnect_backfill_failed", error=str(exc))
+            return
+        # 补采 + 持仓重建均成功 → 连接确实可用，解除通道冻结。
+        self._trade_conn_ok = True
 
     def close_batch(self, trade_date: Optional[date] = None) -> None:
         """收盘批次（§6.2.2）：全量明细兜底 + CLOSE 资产/持仓快照，随后触发对账（§6.7）。"""
@@ -810,12 +931,67 @@ class Engine:
         # 否则对账（读本机 SQLite）会读到不完整数据（doc/05 关键不变量「当日完成 / 一致读」）。
         self._deps.flush_hook()
         report = self._reconcile.run(td)
+        # —— 对账结果阻断/补采（评审二轮 P1#9，复审 P1-1 修正）：原实现只打日志、不动作 ——
+        # 1) 成交量不勾稽（needs_backfill）→ 当日内立即补采 + 持仓重建（隔日 query_* 清空不可补），
+        #    补采后【重跑对账】取新 report——避免把"补采即可自愈的瞬时不勾稽"误判为需人工介入的偏差而误阻断。
+        if report.needs_backfill:
+            self._logger.warn("engine_reconcile_needs_backfill", trade_date=str(td))
+            try:
+                self._snapshot.run_backfill(td)
+                self._rebuild_positions_from_broker(td)
+                self._deps.flush_hook()              # 补采落盘后再读，保证重跑对账读到补全数据
+                report = self._reconcile.run(td)      # 用补采后的新结果判定是否真的有残留偏差
+            except Exception as exc:  # noqa: BLE001 补采失败不拖垮收盘流程，但强告警；保留补采前 report
+                self._logger.error("engine_reconcile_backfill_failed", trade_date=str(td), error=str(exc))
+        # 2) （补采后仍残留的）真异常 → 置持久"对账未通过"标记，阻断次日开仓直至人工清除。
+        #    只对【需人工介入的真异常】阻断（评审复审 P1-1）：漏单 missing_report、手工单/串账户 manual_order、
+        #    补采后仍残留的成交量不勾稽 trade_discrepancies、资产偏差 asset_discrepancy；而 order_failed（台账已
+        #    ERROR、本就无回报）是良性已知态，不触发阻断，避免高频误禁开。
+        blocking = (
+            any(d.kind in ("missing_report", "manual_order") for d in report.order_discrepancies)
+            or bool(report.trade_discrepancies)
+            or report.asset_discrepancy is not None
+        )
+        if blocking:
+            self._set_reconcile_block(
+                td, len(report.order_discrepancies), len(report.trade_discrepancies)
+            )
         self._logger.info(
             "engine_close_done",
             trade_date=str(td),
             matched_orders=report.matched_orders,
             discrepancies=len(report.order_discrepancies),
             needs_backfill=report.needs_backfill,
+            reconcile_blocked=self._reconcile_blocked,
+        )
+
+    # ------------------------------------------------------------------
+    # 对账阻断标志的持久读写（评审二轮 P1#9）
+    # ------------------------------------------------------------------
+    def _read_reconcile_block(self) -> bool:
+        """读持久"对账未通过"标志（repository 支持则用之；不支持则视为未阻断）。"""
+        getter = getattr(self._deps.repository, "get_flag", None)
+        if not callable(getter):
+            return False
+        try:
+            return bool(getter(_RECONCILE_BLOCK_FLAG))
+        except Exception as exc:  # noqa: BLE001 读标志失败不致命，按未阻断处理但留痕
+            self._logger.warn("engine_reconcile_flag_read_failed", error=str(exc))
+            return False
+
+    def _set_reconcile_block(self, td: date, n_order: int, n_trade: int) -> None:
+        """置"对账未通过"标志（持久 + 本进程内存），并强告警。人工核查后删除标志方可恢复开仓。"""
+        setter = getattr(self._deps.repository, "set_flag", None)
+        if callable(setter):
+            try:
+                setter(_RECONCILE_BLOCK_FLAG, td.isoformat())
+            except Exception as exc:  # noqa: BLE001 持久化失败仍置内存标志，至少本进程内阻断
+                self._logger.error("engine_reconcile_block_persist_failed", error=str(exc))
+        self._reconcile_blocked = True
+        self._logger.error(
+            "engine_reconcile_block_set",
+            trade_date=str(td), order_discrepancies=n_order, trade_discrepancies=n_trade,
+            note="对账未通过,次日只守仓不开新仓;人工核查后删除 system_flags.reconcile_blocked 解除",
         )
 
 

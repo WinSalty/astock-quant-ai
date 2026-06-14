@@ -60,6 +60,7 @@ class AuctionPoller:
         settings: Settings,
         clock: Clock,
         logger: StructLogger,
+        feed_health_sink: Optional[Callable[[bool], None]] = None,
     ):
         self._tick_source = tick_source
         self._plan_provider = plan_provider
@@ -67,6 +68,9 @@ class AuctionPoller:
         self._settings = settings
         self._clock = clock
         self._logger = logger
+        # 行情健康上报（评审二轮 P1#15）：每轮 get_full_tick 成功=True / 整体失败(降级)=False，
+        # 经此回调通知 Engine 置 _market_feed_ok，使行情断流时 risk.gate 走 FREEZE 安全默认。缺省不上报。
+        self._feed_health_sink = feed_health_sink
         # 每只股票的累积帧序列（算重心用增量），key=ts_code。
         # 仅保留「成功取到的完整 tick」入历史，降级帧（tick=None）不污染重心计算。
         self._history: Dict[str, List[dict]] = {}
@@ -108,6 +112,13 @@ class AuctionPoller:
                 codes=len(codes),
                 error=str(exc),
             )
+
+        # 行情健康上报（评审二轮 P1#15）：本轮取数成败决定 _market_feed_ok。整体降级 → 行情断流 FREEZE。
+        if self._feed_health_sink is not None and codes:
+            try:
+                self._feed_health_sink(not degraded)
+            except Exception:  # noqa: BLE001 健康上报失败不得影响竞价采集
+                pass
 
         # —— 逐 code 计算因子并推下游 ——
         for code in codes:

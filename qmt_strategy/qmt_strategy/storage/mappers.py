@@ -298,6 +298,7 @@ def selected_to_row(r: SelectedStockRow) -> Dict[str, Any]:
         "reasonable_open_high_high": dec_text(r.reasonable_open_high_high),
         "first_board_vol": r.first_board_vol, "float_mktcap": dec_text(r.float_mktcap),
         "strategy_family": r.strategy_family, "setup": r.setup,
+        "name": r.name,  # 评审二轮 P1#18/#63：透传证券名称供执行侧 ST 识别/过滤
     }
 
 
@@ -317,4 +318,5 @@ def row_to_selected(row: Any) -> SelectedStockRow:
         reasonable_open_high_high=text_dec(_g(row, "reasonable_open_high_high")),
         first_board_vol=_g(row, "first_board_vol"), float_mktcap=text_dec(_g(row, "float_mktcap")),
         strategy_family=_g(row, "strategy_family"), setup=_g(row, "setup"),
+        name=_g(row, "name"),  # 评审二轮 P1#18/#63
     )

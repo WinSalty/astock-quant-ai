@@ -135,6 +135,42 @@ class SqliteQmtRepository:
         finally:
             conn.close()  # 读连接由调用方（本方法）负责关闭，避免连接泄漏
 
+    # ------------------------------------------------------------------
+    # 系统标志位 kv（评审二轮 P1#9）：对账未通过阻断次日开仓等跨进程/跨日运行态
+    # ------------------------------------------------------------------
+    def set_flag(self, flag_key: str, flag_value: Optional[str]) -> None:
+        """设置系统标志位（非热路径，直连同步写，立即持久）。flag_value=None 视为清除该标志。"""
+        import sqlite3 as _sqlite3
+
+        conn = _sqlite3.connect(self._db_path)
+        # 等锁 5s（评审复审 P2-2）：直连写与异步写线程存在写-写互斥，默认 busy_timeout=0 会瞬间 database is locked
+        # 致阻断标志写丢失（次日本应禁开却恢复开仓）。设 5s 等锁，与 schema.apply_pragmas 同口径。
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            if flag_value is None:
+                conn.execute("DELETE FROM system_flags WHERE flag_key=?", (flag_key,))
+            else:
+                # updated_at 用调用方可不传的简化口径：这里不引时钟，仅记值；时间留痕由日志承载。
+                conn.execute(
+                    "INSERT INTO system_flags (flag_key, flag_value, updated_at) VALUES (?,?,NULL) "
+                    "ON CONFLICT(flag_key) DO UPDATE SET flag_value=excluded.flag_value",
+                    (flag_key, flag_value),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_flag(self, flag_key: str) -> Optional[str]:
+        """读系统标志位（短读连接）；无该标志返回 None。"""
+        conn = sqlite_sql.read_conn(self._db_path)
+        try:
+            row = conn.execute(
+                "SELECT flag_value FROM system_flags WHERE flag_key=?", (flag_key,)
+            ).fetchone()
+            return row[0] if row is not None else None
+        finally:
+            conn.close()
+
     def get_account_daily(
         self, account_id: str, trade_date: date, snapshot_type: SnapshotType = SnapshotType.CLOSE
     ) -> Optional[AccountRecord]:

@@ -203,7 +203,14 @@ class Settings:
                 else 5
             ),
             per_order_max_amount=_as_decimal(g("QMT_PER_ORDER_MAX_AMOUNT")),
-            target_position_ratio=_as_decimal(g("QMT_TARGET_POSITION_RATIO")) or Decimal("1.0"),
+            # 目标仓位比（评审二轮 P2#33 / 复审 P2-3）：必须区分"未配置"与"显式配 0"。原 `_as_decimal(...) or
+            # Decimal('1.0')` 会把 Decimal('0')（空跑/降仓口径）当假值静默改成满仓 1.0。这里仅在【未配置/空串】
+            # 时取默认 1.0；显式配值保留，且负值钳到 0（与下方注释一致：0=不开新仓的空跑，绝不被悄悄放大成满仓）。
+            target_position_ratio=(
+                max(Decimal("0"), _as_decimal(g("QMT_TARGET_POSITION_RATIO")))
+                if (g("QMT_TARGET_POSITION_RATIO") or "").strip() != ""
+                else Decimal("1.0")
+            ),
             price_deviation_guard_pct=_as_decimal(g("QMT_PRICE_DEVIATION_GUARD_PCT")),
             market_state_block=split_csv(g("QMT_MARKET_STATE_BLOCK"), ["空仓", "谨慎参与", "退潮", "冰点"]),
             account_drawdown_limit=_as_decimal(g("QMT_ACCOUNT_DRAWDOWN_LIMIT")),

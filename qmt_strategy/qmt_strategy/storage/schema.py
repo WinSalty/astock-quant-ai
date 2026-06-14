@@ -79,6 +79,7 @@ TABLE_META: Dict[str, Dict[str, List[str]]] = {
             "market_state", "tradable_flag", "continuation_prob", "next_day_premium_prob", "boost",
             "fail_conditions", "signal_close", "limit_up_price", "reasonable_open_high_low",
             "reasonable_open_high_high", "first_board_vol", "float_mktcap", "strategy_family", "setup",
+            "name",
         ],
         "unique": ["ts_code", "target_trade_date"],
         "coalesce": [],
@@ -154,9 +155,20 @@ _DDL: Dict[str, str] = {
             tradable_flag INTEGER, continuation_prob TEXT, next_day_premium_prob TEXT, boost TEXT,
             fail_conditions TEXT, signal_close TEXT, limit_up_price TEXT,
             reasonable_open_high_low TEXT, reasonable_open_high_high TEXT, first_board_vol INTEGER,
-            float_mktcap TEXT, strategy_family TEXT, setup TEXT,
+            float_mktcap TEXT, strategy_family TEXT, setup TEXT, name TEXT,
             PRIMARY KEY (ts_code, target_trade_date)
         )""",
+    # 系统标志位 kv（评审二轮 P1#9）：跨进程/跨日持久的运行态标记，如对账未通过阻断次日开仓。
+    "system_flags": """
+        CREATE TABLE IF NOT EXISTS system_flags (
+            flag_key TEXT PRIMARY KEY, flag_value TEXT, updated_at TEXT
+        )""",
+}
+
+# 增量列迁移（评审二轮 P1#18/#63）：对已存在的 watchlist 表补 name 列（CREATE TABLE IF NOT EXISTS
+# 不会给旧表加列）。{表: [(列, 列定义), ...]}，init_db 幂等执行（已存在的列跳过）。
+_COLUMN_MIGRATIONS = {
+    "watchlist": [("name", "TEXT")],
 }
 
 # 索引：对账 / 同步按 (trade_date) 查；台账按 (target_trade_date, ts_code, strategy_family) 查活跃单。
@@ -180,11 +192,24 @@ def apply_pragmas(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA busy_timeout=5000")  # 极端并发下等锁 5s，避免「database is locked」直接报错
 
 
+def _apply_column_migrations(conn: sqlite3.Connection) -> None:
+    """对已存在的表补增量列（评审二轮 P1#18/#63）：读 PRAGMA table_info 取现有列，缺则 ALTER TABLE ADD。
+
+    幂等：已有该列则跳过；SQLite ALTER ADD COLUMN 只能加可空/带默认列，本项均为可空 TEXT，安全。
+    """
+    for table, cols in _COLUMN_MIGRATIONS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col, col_def in cols:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表 + 建索引 + 设 pragma（幂等，IF NOT EXISTS）。库启动时调用一次。"""
+    """建表 + 增量列迁移 + 建索引 + 设 pragma（幂等，IF NOT EXISTS）。库启动时调用一次。"""
     apply_pragmas(conn)
     for ddl in _DDL.values():
         conn.execute(ddl)
+    _apply_column_migrations(conn)
     for idx in _INDEXES:
         conn.execute(idx)
     conn.commit()
