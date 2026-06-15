@@ -476,3 +476,59 @@ def test_report_has_discrepancy_aggregate():
     t_ok = _trade_record(traded_id="TR1", order_id=777, traded_volume=1000)
     rec_ok, _l2, _r2, _g2 = _build(ledger_entries=[e_ok], orders=[o_ok], trades=[t_ok])
     assert rec_ok.run(T_BUY).has_discrepancy is False
+
+
+# ===========================================================================
+# 评审三轮 EXEC-DW-02：NULL traded_volume 不崩对账 + 分步隔离
+# ===========================================================================
+def test_reconcile_null_traded_volume_does_not_crash():
+    # 一笔脏成交 traded_volume=None：原实现 int(None) 抛 TypeError 崩整轮对账；现 `or 0` 兜底不崩。
+    order = _order_record(order_id=1, traded_volume=1000, status=OrderStatus.TRADED)
+    dirty = _trade_record(traded_id="t1", order_id=1, traded_volume=None,
+                          traded_amount=Decimal("0"))
+    rec, logger, _repo, _led = _build(orders=[order], trades=[dirty])
+    report = rec.run(T_BUY)  # 不抛 TypeError
+    assert report is not None
+    # 该 order 的成交量和按 0 计 → 视为成交漏采（needs_backfill），仍正常产出报告。
+    assert report.needs_backfill is True
+
+
+def test_reconcile_step_isolation_keeps_other_steps():
+    # 注入一个让 _reconcile_trades 抛错的场景，断言其余步骤仍产出 + 有 reconcile_step_failed 告警。
+    order = _order_record(order_id=1, traded_volume=1000, status=OrderStatus.TRADED)
+    rec, logger, _repo, _led = _build(orders=[order], trades=[])
+
+    def boom(*a, **k):
+        raise RuntimeError("trades step boom")
+
+    rec._reconcile_trades = boom
+    report = rec.run(T_BUY)  # 不抛
+    assert report is not None
+    assert "reconcile_step_failed" in logger.events()
+
+
+# ===========================================================================
+# 评审三轮 EXEC-DW-09 次生回归防护：UNKNOWN 方向不致误报漏单 / 资产偏差
+# ===========================================================================
+def test_reconcile_unknown_side_order_matched_by_order_id_no_missing():
+    # 回报方向 UNKNOWN(order_type 占位表未标定)但 order_id 命中台账 → 强关联认下，不误报 missing_report。
+    from qmt_strategy.contracts.enums import TradeSide as _TS
+    led = _ledger_entry(biz_order_no="B1", order_id=1, side=_TS.BUY, state=OrderState.TRADED)
+    order = _order_record(order_id=1, side=_TS.UNKNOWN, status=OrderStatus.TRADED)
+    trade = _trade_record(traded_id="t1", order_id=1, side=_TS.BUY)
+    rec, logger, _repo, _led = _build(ledger_entries=[led], orders=[order], trades=[trade])
+    report = rec.run(T_BUY)
+    assert not any(d.kind == "missing_report" for d in report.order_discrepancies)
+    assert "reconcile_order_side_unknown_matched_by_order_id" in logger.events()
+
+
+def test_reconcile_unknown_side_trade_degrades_asset_check():
+    # 成交方向 UNKNOWN → 资产对账降级跳过，绝不据不完整净流误报 asset_discrepancy。
+    from qmt_strategy.contracts.enums import TradeSide as _TS
+    order = _order_record(order_id=1, side=_TS.BUY, status=OrderStatus.TRADED)
+    trade = _trade_record(traded_id="t1", order_id=1, side=_TS.UNKNOWN)
+    rec, logger, _repo, _led = _build(orders=[order], trades=[trade])
+    report = rec.run(T_BUY)
+    assert report.asset_discrepancy is None
+    assert report.asset_checked is False
+    assert "reconcile_asset_skipped_unknown_side" in logger.events()

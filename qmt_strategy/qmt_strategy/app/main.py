@@ -715,6 +715,14 @@ class Engine:
                     self._account_id, ts_code, traded_id,
                     int(traded_volume) if traded_volume else 0,
                 )
+            else:
+                # 方向不可判定（评审三轮 EXEC-DW-09）：UNKNOWN（order_type 未命中映射表）绝不臆造改持仓——
+                # 默认当买入会凭空建仓、算反持仓与资金流向。拒绝改持仓 + 强告警（成交已落库留痕供事后核对/补判）。
+                self._logger.error(
+                    "position_writeback_unknown_side_rejected",
+                    account_id=self._account_id, ts_code=ts_code, traded_id=traded_id,
+                    note="成交方向不可判定(order_type 未命中映射表)，拒绝改持仓，需核对 normalize 映射表",
+                )
         except Exception as exc:  # noqa: BLE001 回写失败不得吞掉成交落库/台账事实，仅告警
             self._logger.error(
                 "position_writeback_failed",
@@ -1063,7 +1071,14 @@ class Engine:
         self._snapshot.run_close(td)
         # 对账前 flush 持久化队列：收盘兜底 + 盘中回调都是「写后异步」入队，必须先落盘，
         # 否则对账（读本机 SQLite）会读到不完整数据（doc/05 关键不变量「当日完成 / 一致读」）。
-        self._deps.flush_hook()
+        # flush 成败校验（评审三轮 EXEC-DW-03）：flush_hook 返回 False（commit 失败/写线程死）说明成交镜像批
+        # 可能未全落盘，对账据不完整数据会失真；强告警留痕（write-behind fail-closed 另由 on_storage_failure 兜）。
+        flushed = self._deps.flush_hook()
+        if flushed is False:
+            self._logger.error(
+                "engine_close_flush_incomplete", trade_date=str(td),
+                note="收盘对账前镜像落盘未确认全 commit，对账可能读到不完整数据，须排查写线程/磁盘",
+            )
         report = self._reconcile.run(td)
         # —— 对账结果阻断/补采（评审二轮 P1#9，复审 P1-1 修正）：原实现只打日志、不动作 ——
         # 1) 成交量不勾稽（needs_backfill）→ 当日内立即补采 + 持仓重建（隔日 query_* 清空不可补），

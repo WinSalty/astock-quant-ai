@@ -217,6 +217,21 @@ class ExecCallback:
         order_id = normalize._to_int(getattr(e, "order_id", None))
         qmt_stock_code = getattr(e, "stock_code", None)
         ts_code = normalize.identity.resolve_code(qmt_stock_code)
+        # order_id 缺失的下单失败回报（评审三轮 EXEC-DW-05）：原实现照常构造 OrderRecord 喂 qmt_order
+        # (order_id INTEGER NOT NULL + 唯一键含 order_id)，INSERT 触发 NOT NULL 约束失败被后台写线程静默吞，
+        # 仅一条 async_write_failed 日志 → "下单失败"这一回调独有、隔日 query_* 无法还原的事实彻底丢失。
+        # 这里不喂带 NOT NULL 唯一键的 qmt_order，改为强告警留痕(失败上下文齐全)，杜绝静默吞；台账无 order_id 可
+        # 定位故同样不推进(同步下单失败已由 order_executor 按 biz_no 置 ERROR，见 EXEC-DW-05 核验)。
+        if order_id is None:
+            self._logger.error(
+                "order_error_missing_order_id_not_persisted",
+                account_id=self._account_id,
+                ts_code=ts_code,
+                error_id=normalize._to_int(getattr(e, "error_id", None)),
+                error_msg=getattr(e, "error_msg", None),
+                order_remark=getattr(e, "order_remark", None),
+            )
+            return
         rec = OrderRecord(
             account_id=self._account_id,
             trade_date=self._trade_date_provider(),

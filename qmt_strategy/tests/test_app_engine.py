@@ -301,7 +301,7 @@ def test_buy_fill_writes_position_then_sellable_next_day_and_no_double_sell():
     # (1) 买入成交回报经回调落地持仓状态机（评审 P0-A2：原实现从不回写，此前恒空集）。
     fill = FakeXtTrade(
         account_id="acc1", stock_code="600036.SH", traded_id="TR1", order_id=1,
-        traded_price=11.00, traded_volume=1000,
+        traded_price=11.00, traded_volume=1000, order_type=23,  # 评审三轮 EXEC-DW-09：买回报须带 order_type
     )
     eng.callback.on_stock_trade(fill)
     unit = eng._position.get_unit("acc1", "600036.SH")
@@ -343,7 +343,7 @@ def test_run_sell_pass_skips_during_lunch():
     eng.prewarm(T_BUY)
     eng.callback.on_stock_trade(FakeXtTrade(
         account_id="acc1", stock_code="600036.SH", traded_id="B1", order_id=1,
-        traded_price=11.00, traded_volume=1000))
+        traded_price=11.00, traded_volume=1000, order_type=23))  # 评审三轮 EXEC-DW-09：买回报须带 order_type
     next_day = deps.calendar.next_open(T_BUY)
     eng._position.refresh_state(next_day)
     # 把引擎时钟拨到午休 12:00 → 即便炸板盘口想清仓，也整轮跳过、不下卖单。
@@ -364,12 +364,12 @@ def test_sell_fill_reduces_position_idempotently():
     # 先买入建仓并推进到次日可卖。
     eng.callback.on_stock_trade(FakeXtTrade(
         account_id="acc1", stock_code="600036.SH", traded_id="B1", order_id=1,
-        traded_price=11.00, traded_volume=1000,
+        traded_price=11.00, traded_volume=1000, order_type=23,  # 评审三轮 EXEC-DW-09：买回报须带 order_type
     ))
     next_day = deps.calendar.next_open(T_BUY)
     eng._position.refresh_state(next_day)
-    unit = eng._position.get_unit("acc1", "600036.SH")
-    unit.state = PositionState.SELLING  # 模拟已发卖单在途
+    # 注：apply_sell_fill_by_trade 按 traded_id 去重+扣减，不依赖单元处于 SELLING；故无需(也不能经 get_unit
+    # 深拷贝)预置 SELLING 态（评审三轮 EXEC-position-01：get_unit 返只读快照，写走原子方法）。
 
     # 卖出成交回报（offset_flag 触发 SELL 方向）：部分成交 600 → PART_SOLD。
     sell = FakeXtTrade(

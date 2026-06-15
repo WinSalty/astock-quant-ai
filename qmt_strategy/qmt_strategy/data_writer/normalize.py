@@ -120,6 +120,20 @@ _STATUS_STR_MAP = {s.value: s for s in OrderStatus}
 _SIDE_STR_MAP = {s.value: s for s in TradeSide}
 
 
+# 合成成交键前缀（评审三轮 EXEC-DW-01）：缺 traded_id 的成交用此前缀的合成键，便于回调侧识别并告警。
+SYNTHETIC_TRADE_ID_PREFIX = "SYN|"
+
+
+def _synthetic_trade_id(order_id: Any, traded_volume: Any, traded_price: Any, traded_time_east8: Any) -> str:
+    """缺 traded_id 时的合成键（评审三轮 EXEC-DW-01）。
+
+    用 (order_id, 量, 价, 东八区成交时间) 拼成稳定字符串：同一笔成交重投得同一键（幂等去重），不同笔不相撞，
+    绝不落字面 "None" 撞 NOT NULL 唯一键把多笔成交折叠成一笔。一旦上线不可随意改格式（否则历史重投不再幂等）。
+    """
+    parts = "|".join(str(x) for x in (order_id, traded_volume, traded_price, traded_time_east8))
+    return SYNTHETIC_TRADE_ID_PREFIX + parts
+
+
 def default_side_resolver(order_type: Any, offset_flag: Any) -> TradeSide:
     """默认买卖方向解析（§6.3）。
 
@@ -127,8 +141,10 @@ def default_side_resolver(order_type: Any, offset_flag: Any) -> TradeSide:
     口径优先级：
       1) order_type 已是标准字符串 "BUY"/"SELL" → 直传（兼容上游已规整）；
       2) order_type 命中数值映射表（买 23 / 卖 24，【待实测】）→ 对应方向；
-      3) 兜底：无法判定时默认 BUY（建仓为主链路），并依赖原值 offset_flag 落库供事后核对。
-    边界：order_type 为 None 时走兜底；不抛错（§6.3 不得因脏数据崩溃）。
+      3) 兜底：无法判定时返回 UNKNOWN（评审三轮 EXEC-DW-09），**绝不臆造为 BUY**——默认 BUY 会把方向不明的
+         卖出成交误判为买入凭空建仓、算反持仓与资金流向。返回 UNKNOWN 由 _apply_trade_to_position 拒绝改持仓
+         + 强告警，便于实测期快速发现映射表缺口。
+    边界：order_type 为 None 时走 UNKNOWN；不抛错（§6.3 不得因脏数据崩溃）。
     """
     # 1) 标准字符串直传（大小写不敏感）
     if isinstance(order_type, str):
@@ -142,8 +158,8 @@ def default_side_resolver(order_type: Any, offset_flag: Any) -> TradeSide:
             return TradeSide.BUY
         if ot in _ORDER_TYPE_SELL:
             return TradeSide.SELL
-    # 3) 兜底：默认 BUY，原值 offset_flag 已落库供事后核对（这里不读 offset_flag 判方向，避免误判）
-    return TradeSide.BUY
+    # 3) 兜底：方向不可判定 → UNKNOWN（不臆造 BUY，不凭空建仓）
+    return TradeSide.UNKNOWN
 
 
 def default_status_resolver(order_status: Any) -> OrderStatus:
@@ -207,19 +223,32 @@ def normalize_trade(
     # order_remark 缺失/非法时落 None，由对账阶段经交易日历反推兜底（reconcile.backfill_signal_trade_date）。
     order_remark = getattr(xt, "order_remark", None)
     signal_trade_date = parse_order_remark(order_remark)
+    # traded_id 缺失兜底（评审三轮 EXEC-DW-01）：原实现 str(getattr(...,None)) 产出字面 "None" 字符串，会撞
+    # 成交唯一键 (account_id, trade_date, traded_id) 把同日所有缺 id 的成交折叠成一笔（成交是唯一不可丢事实源）。
+    # 缺失时改用合成键 SYN|order_id|量|价|时间：同一笔重投得同一键（幂等），不同笔不相撞，绝不落字面 "None"。
+    tid_raw = getattr(xt, "traded_id", None)
+    order_id_val = _to_int(getattr(xt, "order_id", None))
+    traded_volume_val = _to_int(getattr(xt, "traded_volume", None))
+    traded_price_val = _to_decimal(getattr(xt, "traded_price", None))
+    if tid_raw is not None:
+        traded_id_val = str(tid_raw)
+    else:
+        traded_id_val = _synthetic_trade_id(
+            order_id_val, traded_volume_val, traded_price_val, traded_time_east8
+        )
     return TradeRecord(
         account_id=account_id,
         trade_date=trade_date,
         ts_code=ts_code,                       # 已归一（可能为 None）
         qmt_stock_code=qmt_stock_code,         # 原值保留
-        traded_id=str(getattr(xt, "traded_id", None)),  # 字符串化，对齐 DDL/幂等键
+        traded_id=traded_id_val,               # 缺失走合成键（SYN| 前缀），绝不落字面 "None"
         trade_side=trade_side,
-        traded_price=_to_decimal(getattr(xt, "traded_price", None)),
-        traded_volume=_to_int(getattr(xt, "traded_volume", None)),
+        traded_price=traded_price_val,
+        traded_volume=traded_volume_val,
         traded_time=traded_time,
         traded_time_east8=traded_time_east8,
         account_type=_to_int(getattr(xt, "account_type", None)),
-        order_id=_to_int(getattr(xt, "order_id", None)),
+        order_id=order_id_val,
         order_sysid=getattr(xt, "order_sysid", None),
         offset_flag=_to_int(offset_flag),      # 原值落库供事后核对
         traded_amount=_to_decimal(getattr(xt, "traded_amount", None)),  # 版本可缺

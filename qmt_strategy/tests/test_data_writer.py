@@ -521,3 +521,48 @@ def test_idempotent_order_status_advances_to_terminal():
     assert len(rows) == 1
     assert rows[0].order_status == OrderStatus.TRADED
     assert rows[0].data_source == DataSource.QUERY_BACKFILL
+
+
+# ===========================================================================
+# 评审三轮 批次4：缺 traded_id 合成键(DW-01) / 方向不可判定 UNKNOWN(DW-09)
+# ===========================================================================
+def _nt(xt):
+    return normalize_trade(
+        xt, account_id=ACCOUNT, trade_date=T_BUY, data_source=DataSource.CALLBACK,
+        side_resolver=default_side_resolver, status_resolver=default_status_resolver,
+    )
+
+
+def test_normalize_trade_missing_traded_id_synthetic_key():
+    # 缺 traded_id：绝不落字面 "None"，走 SYN| 合成键。
+    xt = FakeXtTrade(account_id=ACCOUNT, stock_code="600036.SH", order_id=12345,
+                     order_type=23, traded_price=35.12, traded_volume=200, traded_time=TS_EAST8)
+    rec = _nt(xt)
+    assert rec.traded_id != "None"
+    assert rec.traded_id.startswith("SYN|")
+
+
+def test_normalize_trade_missing_traded_id_no_collision():
+    # 两笔不同的缺 id 成交（order_id/量不同）→ 合成键不相撞（不会折叠成一笔）。
+    a = _nt(FakeXtTrade(account_id=ACCOUNT, stock_code="600036.SH", order_id=1,
+                        order_type=23, traded_price=35.12, traded_volume=200, traded_time=TS_EAST8))
+    b = _nt(FakeXtTrade(account_id=ACCOUNT, stock_code="600036.SH", order_id=2,
+                        order_type=23, traded_price=35.13, traded_volume=300, traded_time=TS_EAST8))
+    assert a.traded_id != b.traded_id
+
+
+def test_normalize_trade_missing_traded_id_idempotent_same_fill():
+    # 同一笔（同 order_id/量/价/时间）缺 id 重投 → 同一合成键（幂等，可去重）。
+    kw = dict(account_id=ACCOUNT, stock_code="600036.SH", order_id=9, order_type=23,
+              traded_price=35.12, traded_volume=200, traded_time=TS_EAST8)
+    assert _nt(FakeXtTrade(**kw)).traded_id == _nt(FakeXtTrade(**kw)).traded_id
+
+
+def test_default_side_resolver_unknown_not_buy():
+    from qmt_strategy.contracts.enums import TradeSide
+    # 未知 order_type（既非 BUY/SELL 字符串、又不在 {23,24}）→ UNKNOWN，绝不臆造 BUY。
+    assert default_side_resolver(999, None) is TradeSide.UNKNOWN
+    assert default_side_resolver(None, None) is TradeSide.UNKNOWN
+    # 已知方向仍正确。
+    assert default_side_resolver(23, None) is TradeSide.BUY
+    assert default_side_resolver(24, None) is TradeSide.SELL

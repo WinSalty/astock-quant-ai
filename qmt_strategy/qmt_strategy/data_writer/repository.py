@@ -173,12 +173,14 @@ class MySqlQmtRepository:
         self._uwd = unique_with_trade_date
 
     # SQL 由 build_* 纯函数生成，便于单测断言 SQL 文本与参数顺序而无需真实 DB。
+    # uwd 透传（评审三轮 EXEC-DW-07）：unique_with_trade_date 开关须真正影响 SQL 的 skip 列布局（唯一键是否含
+    # trade_date），否则开关名实不符、静默失效（配 False 仍按含 trade_date 的 upsert 列布局，与索引定义错位）。
     def upsert_trade(self, rec: TradeRecord) -> None:
-        sql, params = build_trade_upsert(rec)
+        sql, params = build_trade_upsert(rec, uwd=self._uwd)
         self._exec(sql, params)
 
     def upsert_order(self, rec: OrderRecord) -> None:
-        sql, params = build_order_upsert(rec)
+        sql, params = build_order_upsert(rec, uwd=self._uwd)
         self._exec(sql, params)
 
     def upsert_position(self, rec: PositionRecord) -> None:
@@ -192,12 +194,17 @@ class MySqlQmtRepository:
     def mark_cancel_failed(
         self, account_id: str, order_id: int, error_id: Optional[int], error_msg: Optional[str]
     ) -> None:
+        # trade_date 限定（评审三轮 EXEC-DW-06）：QMT order_id 按交易日重置可跨日复用，原 WHERE 只按
+        # (account_id, order_id) 会把【所有】历史同号委托一并误标 cancel_failed；与 SQLite/InMemory 版对齐，
+        # 仅打到该 (account_id, order_id) 的【最新交易日】行（MySQL 同表子查询 UPDATE 需包一层派生表）。
         sql = (
             "UPDATE qmt_order SET cancel_failed=1, "
             "error_id=COALESCE(%s, error_id), error_msg=COALESCE(%s, error_msg) "
-            "WHERE account_id=%s AND order_id=%s"
+            "WHERE account_id=%s AND order_id=%s AND trade_date=("
+            "  SELECT t FROM (SELECT MAX(trade_date) AS t FROM qmt_order"
+            "    WHERE account_id=%s AND order_id=%s) AS d)"
         )
-        self._exec(sql, (error_id, error_msg, account_id, order_id))
+        self._exec(sql, (error_id, error_msg, account_id, order_id, account_id, order_id))
 
     def get_orders(self, account_id: str, trade_date: date) -> List[OrderRecord]:
         raise NotImplementedError("对账只读查询的 ORM 映射由落地阶段按 schema 补全")
@@ -255,20 +262,26 @@ def _build_upsert(table: str, cols: List[str], rec, coalesce_cols: set, skip_upd
     return sql, tuple(vals)
 
 
-def build_trade_upsert(rec: TradeRecord) -> Tuple[str, tuple]:
-    """qmt_trade 成交明细 upsert（对齐 §2.1 DDL 列）。"""
+def build_trade_upsert(rec: TradeRecord, *, uwd: bool = True) -> Tuple[str, tuple]:
+    """qmt_trade 成交明细 upsert（对齐 §2.1 DDL 列）。
+
+    uwd（评审三轮 EXEC-DW-07）：唯一键是否纳入 trade_date。True→唯一键 (account_id,trade_date,traded_id)，
+    skip 含 trade_date（不更新键列）；False→旧唯一键 (account_id,traded_id)，trade_date 不再是键列、应可更新。
+    """
     cols = [
         "account_id", "account_type", "trade_date", "ts_code", "qmt_stock_code", "traded_id",
         "order_id", "order_sysid", "trade_side", "offset_flag", "traded_price", "traded_volume",
         "traded_amount", "traded_time", "traded_time_east8", "strategy_name", "order_remark",
         "signal_trade_date", "data_source",
     ]
-    skip = {"account_id", "trade_date", "traded_id"}  # 唯一键列不更新
+    skip = {"account_id", "traded_id"}  # 唯一键列不更新
+    if uwd:
+        skip.add("trade_date")
     return _build_upsert("qmt_trade", cols, rec, _TRADE_COALESCE, skip)
 
 
-def build_order_upsert(rec: OrderRecord) -> Tuple[str, tuple]:
-    """qmt_order 委托 upsert（对齐 §2.2 DDL 列）。"""
+def build_order_upsert(rec: OrderRecord, *, uwd: bool = True) -> Tuple[str, tuple]:
+    """qmt_order 委托 upsert（对齐 §2.2 DDL 列）。uwd 口径同 build_trade_upsert。"""
     cols = [
         "account_id", "account_type", "trade_date", "ts_code", "qmt_stock_code", "order_id",
         "order_sysid", "trade_side", "offset_flag", "price_type", "order_price", "order_volume",
@@ -276,7 +289,9 @@ def build_order_upsert(rec: OrderRecord) -> Tuple[str, tuple]:
         "cancel_failed", "order_time", "order_time_east8", "strategy_name", "order_remark",
         "signal_trade_date", "data_source",
     ]
-    skip = {"account_id", "trade_date", "order_id"}
+    skip = {"account_id", "order_id"}
+    if uwd:
+        skip.add("trade_date")
     return _build_upsert("qmt_order", cols, rec, _ORDER_COALESCE, skip)
 
 

@@ -22,6 +22,9 @@ class TradeSide(StrEnum):
 
     BUY = "BUY"
     SELL = "SELL"
+    # 方向不可判定（评审三轮 EXEC-DW-09）：order_type 既非 BUY/SELL 字符串、又不命中数值表时的显式未知态。
+    # 绝不臆造为 BUY（凭空建仓）。落库留痕，_apply_trade_to_position 对 UNKNOWN 拒绝改持仓 + 强告警。
+    UNKNOWN = "UNKNOWN"
 
 
 class OrderStatus(StrEnum):

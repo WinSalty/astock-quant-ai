@@ -255,6 +255,18 @@ def test_on_order_error_lands_error_record():
     assert ledger.get_by_order_id(777).state == OrderState.ERROR
 
 
+def test_on_order_error_missing_order_id_not_persisted_but_alerted():
+    """评审三轮 EXEC-DW-05：order_id 缺失的失败回报不喂带 NOT NULL 唯一键的 qmt_order(否则约束失败被静默吞)，
+    改为强告警留痕，杜绝"下单失败"事实静默丢失。"""
+    repo, _w, _l, logger, cb, _h = _build()
+    e = FakeXtOrderError(order_id=None, error_id=-15, error_msg="拒单(无order_id)")
+    cb.on_order_error(e)
+    # 不落 qmt_order（避免 NOT NULL 约束失败被后台写线程静默吞）。
+    assert repo.get_orders(ACCOUNT, T_BUY) == []
+    # 但有强告警留痕（失败上下文齐全）。
+    assert "order_error_missing_order_id_not_persisted" in logger.events()
+
+
 def test_on_order_error_missing_optional_fields_no_attribute_error():
     """版本兼容：XtOrderError 仅 order_id/error_id/error_msg，缺 stock_code 等 → 落 None 不抛错。"""
     repo, _w, _l, _lg, cb, _h = _build()

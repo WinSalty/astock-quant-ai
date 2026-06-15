@@ -229,10 +229,20 @@ class Reconcile:
         # 回报委托按 order_id 建索引，供台账→回报关联与「回报有台账无」反向勾稽。
         orders_by_id: Dict[int, OrderRecord] = {o.order_id: o for o in orders if o.order_id is not None}
 
-        self._reconcile_orders(ledger_entries, orders, orders_by_id, report)
-        self._reconcile_trades(orders, trades, report)
-        self._reconcile_assets(trades, trade_date, report)
-        self._reconcile_slippage(ledger_entries, orders_by_id, trades, report)
+        # 四类勾稽分步隔离（评审三轮 EXEC-DW-02）：对账是漏单/漏采/手工单/资产偏差的最后一道闸，任一子勾稽
+        # 因单条脏数据抛异常都不得连带丢失其余三类检测。每步独立 try/except + 强告警后继续。
+        for step_name, step in (
+            ("orders", lambda: self._reconcile_orders(ledger_entries, orders, orders_by_id, report)),
+            ("trades", lambda: self._reconcile_trades(orders, trades, report)),
+            ("assets", lambda: self._reconcile_assets(trades, trade_date, report)),
+            ("slippage", lambda: self._reconcile_slippage(ledger_entries, orders_by_id, trades, report)),
+        ):
+            try:
+                step()
+            except Exception as exc:  # noqa: BLE001 单步异常隔离，不拖垮其余三类对账
+                self._logger.error(
+                    "reconcile_step_failed", step=step_name, trade_date=str(trade_date), error=str(exc)
+                )
 
         return report
 
@@ -342,6 +352,15 @@ class Reconcile:
             cand = orders_by_id[e.order_id]
             if cand.trade_side == e.side:
                 return cand
+            # UNKNOWN 方向不否决强关联（评审三轮 EXEC-DW-09）：回报方向因 order_type 未命中映射表(实测期占位
+            # 表未标定)而为 UNKNOWN 时，order_id 已是强身份键，不应据此判方向不符落 missing_report 误阻断开仓；
+            # 强关联认下，仅告警提示核对 normalize 方向映射表。
+            if cand.trade_side == TradeSide.UNKNOWN:
+                self._logger.warn(
+                    "reconcile_order_side_unknown_matched_by_order_id",
+                    order_id=e.order_id, ts_code=e.ts_code,
+                )
+                return cand
             # 方向不符（疑似 order_id 跨日复用串单）：不强配，落入弱关联兜底。
         # 弱关联：order_id 缺失 / 方向不符时按方向 + 业务键匹配（仅非 ERROR 回报）。
         consumed = consumed_order_ids if consumed_order_ids is not None else set()
@@ -353,7 +372,9 @@ class Reconcile:
             # 卖单（如先 REDUCE 后 CLEAR）全部弱配到同一条回报 → 掩盖漏单 / 把其余回报误标手工单。
             if o.order_id is not None and o.order_id in consumed:
                 continue
-            if o.trade_side != e.side:  # #36：方向必须一致，杜绝买台账错配卖回报
+            # 方向必须一致(#36)，但 UNKNOWN 不据方向否决(评审三轮 EXEC-DW-09)：身份靠 ts_code+remark 弱关联，
+            # UNKNOWN 仅因 order_type 占位表未标定，不应让真实委托弱关联失败被误报漏单。
+            if o.trade_side != e.side and o.trade_side != TradeSide.UNKNOWN:
                 continue
             if e.side == TradeSide.BUY:
                 # 买单：按 order_remark(LUP|T|ts_code) 解析的 ts_code + 信号日 T 弱关联。
@@ -397,7 +418,9 @@ class Reconcile:
         for t in trades:
             if t.order_id is None:
                 continue
-            trade_vol_by_order[t.order_id] = trade_vol_by_order.get(t.order_id, 0) + int(t.traded_volume)
+            # NULL 量防御（评审三轮 EXEC-DW-02）：traded_volume 可空（脏回报/补采异常成交），int(None) 会
+            # TypeError 崩整轮对账；与同文件其余三处口径对齐用 `or 0` 兜底。
+            trade_vol_by_order[t.order_id] = trade_vol_by_order.get(t.order_id, 0) + int(t.traded_volume or 0)
 
         for o in orders:
             if o.order_id is None or o.order_status == OrderStatus.ERROR:
@@ -440,6 +463,7 @@ class Reconcile:
         """
         # 计算成交净现金流（买为负、卖为正）。
         net_flow = Decimal("0")
+        unknown_side_count = 0
         for t in trades:
             amt = t.traded_amount
             if amt is None:
@@ -449,8 +473,25 @@ class Reconcile:
                 net_flow -= amt        # 买入：现金流出
             elif t.trade_side == TradeSide.SELL:
                 net_flow += amt        # 卖出：现金流入
+            else:
+                # UNKNOWN 方向（评审三轮 EXEC-DW-09）：order_type 未命中映射表，方向不可判定，无法计入买/卖
+                # 现金流；计数后据此降级资产对账（不能凭不完整 net_flow 误报偏差阻断开仓）。
+                unknown_side_count += 1
 
         account_change = self._fetch_account_change(trade_date)
+        # 存在方向 UNKNOWN 的成交 → net_flow 证明不完整，资产方向对账降级跳过（仅 notes 标注 + 告警），
+        # 绝不据不完整净流误报 asset_discrepancy 触发收盘阻断（评审三轮 EXEC-DW-09 次生回归防护）。
+        if unknown_side_count > 0:
+            report.asset_checked = False
+            report.notes.append(
+                f"资产对账降级跳过：{unknown_side_count} 笔成交方向 UNKNOWN(order_type 未命中映射表)，净现金流不完整"
+            )
+            self._logger.error(
+                "reconcile_asset_skipped_unknown_side",
+                trade_date=str(trade_date), unknown_side_count=unknown_side_count,
+                note="成交方向不可判定，须核对 normalize 方向映射表后重对账",
+            )
+            return
         if account_change is None:
             # 无账户数据：跳过资产对账，仅在报告说明，不视为偏差（§6.7「无账户数据时跳过并说明」）。
             report.asset_checked = False
