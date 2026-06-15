@@ -883,12 +883,20 @@ class Engine:
         if price is None or price <= 0:
             self._logger.error("engine_sell_invalid_price_skip", ts_code=unit.ts_code, price=str(price))
             return False
+        # 卖单 signal_trade_date 取原买入信号日 T = prev_open(买入日 B)（评审二轮 P2#65）：
+        # 原实现直接传 unit.buy_date(=买入日 T+1)，把 T+1 错当信号日 T，污染卖出回报的 signal_trade_date 回填与对账。
+        sell_signal_date = None
+        if unit.buy_date is not None:
+            try:
+                sell_signal_date = self._calendar.prev_open(unit.buy_date)
+            except Exception:  # noqa: BLE001 日历异常不阻断卖出，signal_trade_date 留 None（回流可由对账反推）
+                sell_signal_date = None
         # 卖出走唯一下单点（评审 P0-C1）：生成 biz 单号 + 落台账 + 经 OrderExecutor 唯一出口下卖单，
         # 不再编排层直连 trader.order_stock（原实现卖单无台账/无 biz 单号/不可对账）。
         biz_no = self._order.place_sell(
             ts_code=unit.ts_code,
             target_trade_date=today if today is not None else unit.buy_date,
-            signal_trade_date=unit.buy_date,
+            signal_trade_date=sell_signal_date,
             sell_vol=sell_vol,
             price=price,
             reason=reason,

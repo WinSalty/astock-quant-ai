@@ -138,6 +138,7 @@ class DailyScheduler:
                 self._guard.connect_and_subscribe()
             # 先盘前拉取当日 watchlist 落本机 SQLite（失败不抛、降级无名单，详见 WatchlistPrefetcher），
             # 再让 engine.prewarm 从本机库装载——保证 prewarm 读到的是当日最新名单。
+            saved = 0
             if self._watchlist_prefetch is not None:
                 try:
                     saved = self._watchlist_prefetch(today)
@@ -147,8 +148,25 @@ class DailyScheduler:
                         "scheduler_watchlist_prefetch_error", trade_date=str(today), error=repr(exc)
                     )
             self._engine.prewarm(today)
-            self._mark(today, Action.PREWARM)
-            self._logger.info("scheduler_prewarmed", trade_date=str(today))
+            # PREWARM 重试（评审二轮 P2#48）：原实现 prefetch 失败/空也一次性标 fired→整日只守仓不再补拉。
+            # 这里：配了 prefetch 且本次拉到 0 行，且仍在开窗前(< 竞价 9:15)→【不标 fired】，下轮重试再拉
+            # （engine.prewarm 因日初基线复用/持仓重建幂等，重跑安全）；拉到 ≥1 行或已到 9:15 才标 fired 定稿。
+            # clock 缺失（部分离线/单测注入 None）→ 不做时间窗判断，直接标 fired（向后兼容，不重试）。
+            now_t = east8_time_of(self._clock.now_utc()) if self._clock is not None else None
+            should_retry = (
+                self._watchlist_prefetch is not None
+                and saved == 0
+                and now_t is not None
+                and now_t < _AUCTION_START
+            )
+            if not should_retry:
+                self._mark(today, Action.PREWARM)
+                self._logger.info("scheduler_prewarmed", trade_date=str(today), saved=saved)
+            else:
+                self._logger.warn(
+                    "scheduler_prewarm_empty_will_retry", trade_date=str(today),
+                    note="watchlist 拉到 0 行且未到 9:15，下轮重试补拉",
+                )
         elif action == Action.RUN_AUCTION:
             self._mark(today, Action.RUN_AUCTION)  # 先登记再跑（run_auction 阻塞至 09:30，避免重入）
             self._logger.info("scheduler_run_auction", trade_date=str(today))

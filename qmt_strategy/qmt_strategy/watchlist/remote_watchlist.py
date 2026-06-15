@@ -172,6 +172,16 @@ class WatchlistPrefetcher:
                 "watchlist_prefetch_rows_skipped",
                 today=str(today), signal_date=str(signal_t), skipped=skipped,
             )
+        # 买入日一致性校验（评审二轮 P2#64/P3#80）：执行侧落库统一对齐 target_trade_date=today（按 prev_open(today)
+        # 拉的，构造上即今天买入），但信号侧响应顶层 target_trade_date 应等于 today；不一致说明两侧交易日历不同步
+        # （执行侧日历缺节假日等），原实现无条件覆盖会静默错配买入日。这里强告警暴露（仍按 today 落库，不静默吞）。
+        resp_target = _to_date((resp or {}).get("target_trade_date"))
+        if resp_target is not None and resp_target != today:
+            self._logger.warn(
+                "watchlist_prefetch_target_date_mismatch",
+                today=str(today), signal_target=str(resp_target), signal_date=str(signal_t),
+                note="两侧交易日历可能不同步，请核对执行侧 QMT_TRADE_CALENDAR_FILE 是否与信号侧 a_trade_calendar 同源",
+            )
         items = (resp or {}).get("items") or []
         rows: List[SelectedStockRow] = []
         for it in items:

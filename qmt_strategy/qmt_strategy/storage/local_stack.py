@@ -43,7 +43,15 @@ class LocalStorage:
         self._account_id = account_id
         # 单一后台写线程：本机所有 SQLite 写（仓储 upsert / 台账镜像 / 同步标记）共用它，保证单写线程 + WAL。
         # 写线程在其内部自开连接（sqlite3 默认线程绑定），故 conn_factory 用闭包延迟到写线程执行。
-        self._wq = AsyncWriteQueue(lambda: sqlite3.connect(db_path), logger, name="qmt-sqlite-writer")
+        # 写连接须设 busy_timeout（评审二轮 P2#47）：与盘前 watchlist 直连写等并发时，默认 busy_timeout=0 会
+        # 瞬间抛 database is locked 且被写线程吞掉、静默丢写。这里复用 schema.apply_pragmas 设 WAL + 5s 等锁。
+        def _writer_conn():
+            from .schema import apply_pragmas
+            conn = sqlite3.connect(db_path)
+            apply_pragmas(conn)
+            return conn
+
+        self._wq = AsyncWriteQueue(_writer_conn, logger, name="qmt-sqlite-writer")
         # 三个协议实现（被 Engine 以既有协议注入消费）。
         self.repository: QmtRepository = SqliteQmtRepository(db_path, self._wq, logger)
         self.ledger = PersistentLocalLedger(db_path, self._wq, logger)

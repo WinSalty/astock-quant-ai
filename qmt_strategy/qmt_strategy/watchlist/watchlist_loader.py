@@ -89,6 +89,9 @@ class WatchlistLoader:
             )
 
         # —— 2) 取数（主路失败切备路，均失败进降级态，不抛异常）——
+        # 兜底捕获非约定异常（评审二轮 P3#79）：_fetch_selected_stocks 内仅约定抛 WatchlistLoadError，但取数源
+        # 实现（HTTP/SQLite）可能逸出其它异常（连接、解码、属性等），若不兜底会冒出 load() 拖垮常驻进程。
+        # 这里把任何非约定异常也收敛为降级"只守仓"（与契约失败同口径），绝不让异常逸出。
         try:
             rows = self._fetch_selected_stocks(today)
         except WatchlistLoadError as exc:
@@ -99,6 +102,18 @@ class WatchlistLoader:
                 trade_date=str(today),
                 reason=reason,
             )
+            return WatchlistContext(
+                trade_date=today,
+                is_open=True,
+                open_new_position_allowed=False,
+                tradable={},
+                watch_only=[],
+                degraded=True,
+                degraded_reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 非约定异常也降级，绝不逸出 load() 拖垮常驻进程（评审二轮 P3#79）
+            reason = f"watchlist 取数未预期异常: {exc!r}"
+            self._logger.error("watchlist_degraded_fetch_unexpected", trade_date=str(today), reason=reason)
             return WatchlistContext(
                 trade_date=today,
                 is_open=True,

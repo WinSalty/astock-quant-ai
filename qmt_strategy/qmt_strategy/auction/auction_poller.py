@@ -121,6 +121,11 @@ class AuctionPoller:
                 pass
 
         # —— 逐 code 计算因子并推下游 ——
+        # 历史累积延后到整轮成功后统一提交（评审复审 P2#46）：原实现在循环内逐 code append 历史、紧接着调
+        # _router_sink（可能抛错）。若某 code 处抛错被上层(run)吞掉，已 append 的前序 code 历史会残留，下轮
+        # 重跑同一轮 tick 时再次 append → _history 重复累积、污染后续帧 Δvol/重心增量。改为本地缓冲，循环
+        # 全部跑完(无异常)才统一并入 _history；半轮失败则整轮历史不提交，下轮干净重跑。
+        pending_history: List[tuple] = []
         for code in codes:
             plan = plans[code]
             tick = ticks.get(code)  # 可能为 None（该 code 本轮无 tick，或整体降级）
@@ -132,13 +137,15 @@ class AuctionPoller:
                 plan=plan,
                 now_utc=now_utc,
             )
-            # 仅把成功取到的完整 tick 累积进历史（供后续帧算重心增量）；
-            # 降级帧（tick 缺失）不入历史，避免污染 Δvol 计算。
+            # 仅把成功取到的完整 tick 缓冲（供整轮成功后入历史）；降级帧（tick 缺失）不入历史，避免污染 Δvol。
             if tick is not None:
-                self._history.setdefault(code, []).append(tick)
-            # push 给下游 entry_router 观测，本模块不在此下单。
+                pending_history.append((code, tick))
+            # push 给下游 entry_router 观测，本模块不在此下单（若抛错，pending_history 整轮丢弃）。
             self._router_sink(snap)
             snapshots.append(snap)
+        # 整轮无异常 → 统一提交历史（半轮失败上面会在抛出前丢弃 pending_history）。
+        for code, tick in pending_history:
+            self._history.setdefault(code, []).append(tick)
 
         if degraded:
             # 留痕本轮降级帧数，便于复盘确认「竞价不可得 → 退化为开盘后确认」。
@@ -197,7 +204,13 @@ class AuctionPoller:
                 pass
             else:
                 # CANCELABLE / LOCKED / SETTLED：正常采集一轮。
-                self.poll_once(now_utc)
+                # 单轮异常隔离（评审二轮 P2#46）：调度层 RUN_AUCTION 先标 fired 再跑本循环（防重入阻塞），若
+                # poll_once 某轮抛错(因子计算/router_sink/脏 tick)逸出，整段竞价窗口会被放弃且当日永不重试。
+                # 这里把单轮异常就地吞掉(已留痕)、继续下一轮，保证竞价窗口不因一轮抖动整体崩。
+                try:
+                    self.poll_once(now_utc)
+                except Exception as exc:  # noqa: BLE001 单轮异常不放弃整段竞价
+                    self._logger.error("auction_poll_once_failed", phase=str(phase), error=repr(exc))
 
             # 一轮工作完成后 sleep（间隔临近 9:20/9:25 自动加密），再计数判退出。
             # 口径：max_loops 计「完整迭代次数」，每轮含一次 sleep，便于测试用有限轮次驱动。

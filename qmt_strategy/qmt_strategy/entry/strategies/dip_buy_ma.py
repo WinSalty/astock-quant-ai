@@ -12,7 +12,7 @@ from __future__ import annotations
 from ...config.settings import Settings
 from ...contracts.enums import EntryAction, OrderPhase
 from ...contracts.models import AuctionSnapshot, PlanRow
-from .base import EntryStrategy, StrategyOutcome, register, resolve_thresholds
+from .base import EntryStrategy, StrategyOutcome, prior_gate_reason, register, resolve_thresholds
 
 
 @register(EntryAction.DIP_BUY_MA)
@@ -20,6 +20,12 @@ class DipBuyMaStrategy(EntryStrategy):
     """均线低吸：open_pct 落低吸档 → 限价低吸；高开超 / 跌破支撑 → 弃。"""
 
     def decide(self, plan: PlanRow, snap: AuctionSnapshot, settings: Settings) -> StrategyOutcome:
+        # —— 先验闸门（评审二轮 P3#75）：低吸（含高位连板低吸）原完全不读龙头强度/续板先验、无强度把关即挂单。
+        # 这里与追买类同口径消费先验：leader_strength_score/continuation_prob【有值且低于阈值】→ 收手，
+        # 不去低吸一个强度已塌/续板预期弱的票（接下跌）。缺先验时不误杀，由下方盘口档位条件把关。
+        gate = prior_gate_reason(plan, settings)
+        if gate is not None:
+            return StrategyOutcome(action=EntryAction.SKIP, reason=f"DIP_BUY_MA弃:{gate}")
         thr = resolve_thresholds(plan, snap, settings)
         op = snap.open_pct
 
