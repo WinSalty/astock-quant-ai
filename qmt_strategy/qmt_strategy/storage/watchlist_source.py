@@ -122,6 +122,10 @@ class SqliteSelectedStockSource:
         params_list = [sqlite_sql.params_for("watchlist", mappers.selected_to_row(r)) for r in rows]
 
         conn = sqlite3.connect(self._db_path)
+        # 设置等锁超时（评审三轮 EXEC-storage-07）：本直连同步写未设 busy_timeout（默认 0），与异步写线程并发时
+        # DELETE/executemany 会瞬间 database is locked 致当日名单整批写不进 → loader 降级只守仓、错过全部开仓信号。
+        # 与 set_flag/read_conn 同口径等锁 5s（直连写与单写线程是两个写连接，WAL 只允许一个写者，须等锁）。
+        conn.execute("PRAGMA busy_timeout=5000")
         try:
             # latest-wins 第 1 步：删掉本批涉及日期下的全部旧名单（按 IN 列表，占位防注入）。
             if target_dates:

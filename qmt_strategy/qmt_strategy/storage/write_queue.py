@@ -32,12 +32,24 @@ class AsyncWriteQueue:
         name: str = "qmt-writer",
         depth_warn: int = 1000,
         on_failure: Optional[Callable[[str], None]] = None,
+        fail_after: int = 5,
+        max_queue: int = 0,
     ):
         # conn_factory：返回写线程独占的 DB-API 连接（如 sqlite3.connect(...)）。
         self._conn_factory = conn_factory
         self._logger = logger
         self._name = name
         self._depth_warn = depth_warn
+        # 持续 I/O 故障熔断（评审三轮 EXEC-storage-03）：磁盘满时 commit 持续抛 OSError 被吞、写线程不死、
+        # _failed 不 set、is_healthy 误报健康、on_failure 不触发 → 持续静默丢数据。这里对「连续 commit 失败」
+        # 计数超阈值即 _failed.set()+on_failure(区分瞬时锁等待与持续 I/O 故障)。
+        self._fail_after = fail_after
+        self._consecutive_fail = 0       # 仅写线程读写
+        # 队列长度硬上限（>0 启用）：写线程阻塞挂起(如 fsync 永久卡死)时防无界堆积内存熔断，超限触发 on_failure。
+        self._max_queue = max_queue
+        # 最近一次写是否成功（仅写线程写、健康检查线程读；CPython bool 读写原子，不引锁以免污染热路径）。
+        # 让 is_healthy 纳入「最近写成功」而非只看线程存活，否则磁盘满下写线程存活但持续丢数据仍误报健康。
+        self._last_write_ok = True
         # on_failure：存储不可用时的告警钩子（写线程已死/建连失败）。供上层触发停盘/运维告警,不抛错(不影响交易)。
         self._on_failure = on_failure
         self._q: "queue.Queue[WriteTask]" = queue.Queue()
@@ -90,11 +102,13 @@ class AsyncWriteQueue:
             raise RuntimeError("AsyncWriteQueue 未 start()")
         if self._failed.is_set() or (self._thread is not None and not self._thread.is_alive()):
             self._logger.error("write_queue_dead_drop", name=self._name)
-            if self._on_failure is not None:
-                try:
-                    self._on_failure("write_queue_dead")
-                except Exception:
-                    pass
+            self._invoke_on_failure("write_queue_dead")
+            return
+        # 队列上限熔断（评审三轮 EXEC-storage-03）：写线程阻塞挂起(如 fsync 永久卡死)时无界堆积会内存爆掉；
+        # max_queue>0 且积压超限时显式丢弃本任务 + 强告警 + on_failure，绝不静默无界堆积。
+        if self._max_queue > 0 and self._q.qsize() >= self._max_queue:
+            self._logger.error("write_queue_overflow", depth=self._q.qsize(), name=self._name)
+            self._invoke_on_failure("write_queue_overflow")
             return
         self._q.put_nowait(task)
         depth = self._q.qsize()
@@ -103,9 +117,28 @@ class AsyncWriteQueue:
             self._logger.warn("write_queue_backlog", depth=depth, name=self._name)
             self._warn_level = ((depth // self._depth_warn) + 1) * self._depth_warn
 
+    def _invoke_on_failure(self, reason: str) -> None:
+        """触发存储故障告警钩子（评审三轮 EXEC-storage-03）；全程吞异常，绝不影响交易线程/写线程。"""
+        if self._on_failure is None:
+            return
+        try:
+            self._on_failure(reason)
+        except Exception:  # noqa: BLE001 告警钩子异常不传播
+            pass
+
     def is_healthy(self) -> bool:
-        """写线程健康性（供 local_stack / Engine 周期性健康检查）。"""
-        return self._started and not self._failed.is_set() and self._thread is not None and self._thread.is_alive()
+        """写线程健康性（供 local_stack / Engine 周期性健康检查）。
+
+        纳入「最近一次写是否成功」（评审三轮 EXEC-storage-03）：否则磁盘满下写线程存活但持续 commit 失败丢数据，
+        旧实现只看线程存活仍误报健康、fail-closed 永不触发。
+        """
+        return (
+            self._started
+            and not self._failed.is_set()
+            and self._thread is not None
+            and self._thread.is_alive()
+            and self._last_write_ok
+        )
 
     def set_on_failure(self, on_failure: Optional[Callable[[str], None]]) -> None:
         """装配后补设存储故障告警钩子（评审二轮 P0#2）。
@@ -137,6 +170,9 @@ class AsyncWriteQueue:
             try:
                 task(self._conn)
                 self._conn.commit()
+                # 写成功：清零连续失败计数 + 置最近写成功（评审三轮 EXEC-storage-03）。
+                self._consecutive_fail = 0
+                self._last_write_ok = True
             except Exception as e:
                 # 关键不变量 2：写失败只记日志 + 回滚，绝不冒泡到交易线程。
                 try:
@@ -146,6 +182,17 @@ class AsyncWriteQueue:
                 # 标记本批存在 commit 失败（评审二轮 P0#1）：供 flush_confirm 的屏障任务据此判失败。
                 self._batch_ok = False
                 self._logger.error("async_write_failed", error=repr(e), name=self._name)
+                # 持续 I/O 故障熔断（评审三轮 EXEC-storage-03）：连续 commit 失败计数；置最近写失败；达阈值
+                # 即 _failed.set()+on_failure，让 is_healthy 转 False、上层 fail-closed（区分瞬时锁等待与持续故障）。
+                self._consecutive_fail += 1
+                self._last_write_ok = False
+                if self._consecutive_fail >= self._fail_after and not self._failed.is_set():
+                    self._failed.set()
+                    self._logger.error(
+                        "write_queue_persist_failed",
+                        consecutive_fail=self._consecutive_fail, name=self._name,
+                    )
+                    self._invoke_on_failure("write_persist_failed")
             finally:
                 self._q.task_done()
         try:

@@ -137,3 +137,68 @@ def test_watchlist_fetch_decode_error_raises_load_error(tmp_path):
     # 解码异常被 fetch 的 try 捕获并收敛为 WatchlistLoadError(不逸出),loader 据此降级。
     with pytest.raises(WatchlistLoadError):
         src.fetch(date(2026, 6, 12))
+
+
+# ===========================================================================
+# 评审三轮 EXEC-storage-03：磁盘满 fail-closed 可观测 + 队列上限熔断
+# ===========================================================================
+def test_write_queue_persistent_commit_failure_marks_unhealthy():
+    """连续 commit 失败达阈值 → _failed.set()+on_failure，is_healthy 转 False（不再静默丢数据）。"""
+    from qmt_strategy.common.logger import RecordingLogger
+    from qmt_strategy.storage.write_queue import AsyncWriteQueue
+
+    class _DiskFullConn:
+        def commit(self):
+            raise OSError("disk full")
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    failures: list[str] = []
+    q = AsyncWriteQueue(
+        lambda: _DiskFullConn(), RecordingLogger(), name="t",
+        on_failure=failures.append, fail_after=3,
+    )
+    q.start()
+    try:
+        for _ in range(4):
+            q.submit(lambda conn: None)
+        q.flush(1.0)
+        assert "write_persist_failed" in failures   # 连续失败达阈值触发 fail-closed
+        assert q.is_healthy() is False               # 健康检查纳入"最近写成功"，转不健康
+    finally:
+        q.stop()
+
+
+def test_write_queue_overflow_triggers_on_failure():
+    """max_queue 积压超限（写线程阻塞挂起）→ on_failure + 丢弃 + 告警，绝不无界堆积内存爆掉。"""
+    import threading
+
+    from qmt_strategy.common.logger import RecordingLogger
+    from qmt_strategy.storage.write_queue import AsyncWriteQueue
+
+    block = threading.Event()
+
+    class _OkConn:
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    failures: list[str] = []
+    q = AsyncWriteQueue(
+        lambda: _OkConn(), RecordingLogger(), name="t",
+        on_failure=failures.append, max_queue=5,
+    )
+    q.start()
+    try:
+        q.submit(lambda conn: block.wait(2.0))   # 卡住写线程
+        for _ in range(12):                       # 后续任务积压超 max_queue
+            q.submit(lambda conn: None)
+        assert "write_queue_overflow" in failures
+    finally:
+        block.set()
+        q.stop()

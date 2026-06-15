@@ -139,26 +139,45 @@ class SqliteQmtRepository:
     # 系统标志位 kv（评审二轮 P1#9）：对账未通过阻断次日开仓等跨进程/跨日运行态
     # ------------------------------------------------------------------
     def set_flag(self, flag_key: str, flag_value: Optional[str]) -> None:
-        """设置系统标志位（非热路径，直连同步写，立即持久）。flag_value=None 视为清除该标志。"""
-        import sqlite3 as _sqlite3
+        """设置系统标志位（非热路径，直连同步写，立即持久）。flag_value=None 视为清除该标志。
 
-        conn = _sqlite3.connect(self._db_path)
-        # 等锁 5s（评审复审 P2-2）：直连写与异步写线程存在写-写互斥，默认 busy_timeout=0 会瞬间 database is locked
-        # 致阻断标志写丢失（次日本应禁开却恢复开仓）。设 5s 等锁，与 schema.apply_pragmas 同口径。
-        conn.execute("PRAGMA busy_timeout=5000")
-        try:
-            if flag_value is None:
-                conn.execute("DELETE FROM system_flags WHERE flag_key=?", (flag_key,))
-            else:
-                # updated_at 用调用方可不传的简化口径：这里不引时钟，仅记值；时间留痕由日志承载。
-                conn.execute(
-                    "INSERT INTO system_flags (flag_key, flag_value, updated_at) VALUES (?,?,NULL) "
-                    "ON CONFLICT(flag_key) DO UPDATE SET flag_value=excluded.flag_value",
-                    (flag_key, flag_value),
-                )
-            conn.commit()
-        finally:
-            conn.close()
+        带退避重试 + 失败显式抛出（评审三轮 EXEC-storage-04）：set_flag 写安全关键标志（对账未通过的次日禁开仓
+        阻断），与异步写线程争 WAL 写锁时 5s 等锁仍可能 database is locked。这里对瞬时 locked 带退避重试 3 次
+        （0.1/0.2s）；耗尽仍失败则【显式抛出】（绝不静默丢标志），由调用方 _set_reconcile_block fail-closed+强告警，
+        杜绝"标志没写进、隔日重启误恢复开仓"的静默路径。重试在非热路径，阻塞可接受。
+        """
+        import sqlite3 as _sqlite3
+        import time as _time
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            conn = _sqlite3.connect(self._db_path)
+            # 等锁 5s（评审复审 P2-2，与 schema.apply_pragmas 同口径）。
+            conn.execute("PRAGMA busy_timeout=5000")
+            try:
+                if flag_value is None:
+                    conn.execute("DELETE FROM system_flags WHERE flag_key=?", (flag_key,))
+                else:
+                    # updated_at 用调用方可不传的简化口径：这里不引时钟，仅记值；时间留痕由日志承载。
+                    conn.execute(
+                        "INSERT INTO system_flags (flag_key, flag_value, updated_at) VALUES (?,?,NULL) "
+                        "ON CONFLICT(flag_key) DO UPDATE SET flag_value=excluded.flag_value",
+                        (flag_key, flag_value),
+                    )
+                conn.commit()
+                return
+            except _sqlite3.OperationalError as exc:  # 瞬时 database is locked：退避重试
+                last_exc = exc
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                conn.close()
+            if attempt < 2:
+                _time.sleep(0.1 * (2 ** attempt))
+        # 重试耗尽仍失败：显式抛出（绝不静默），由调用方 fail-closed。
+        raise last_exc if last_exc is not None else RuntimeError("set_flag 写入失败")
 
     def get_flag(self, flag_key: str) -> Optional[str]:
         """读系统标志位（短读连接）；无该标志返回 None。"""
