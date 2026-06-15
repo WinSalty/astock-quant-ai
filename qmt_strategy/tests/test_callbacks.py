@@ -483,3 +483,25 @@ def test_on_disconnected_custom_hook_invoked():
     cb.on_disconnected()
     assert calls["n"] == 2
     assert logger.events().count("disconnected") == 2
+
+
+def test_set_on_disconnected_hook_routes_to_guard():
+    """评审三轮 EXEC-sched-01：运行期回填断线钩子（解决 Engine 先于 guard 装配的循环依赖）。
+
+    默认未回填时为 no-op；回填后 on_disconnected 恰触发该钩子一次（生产回填为 guard.on_disconnected）。
+    """
+    # 默认构造（不传 on_disconnected_hook）→ 断线钩子为 no-op，不应抛错。
+    repo = InMemoryQmtRepository()
+    logger = RecordingLogger()
+    cb = ExecCallback(
+        DataWriterImpl(repo, logger), InMemoryLocalLedger(), logger,
+        account_id=ACCOUNT, trade_date_provider=lambda: T_BUY,
+    )
+    cb.on_disconnected()  # no-op 不抛
+    assert "disconnected" in logger.events()
+
+    # 运行期回填（模拟 run.py 回填 guard.on_disconnected）→ 断线触发该钩子。
+    routed = {"n": 0}
+    cb.set_on_disconnected_hook(lambda: routed.__setitem__("n", routed["n"] + 1))
+    cb.on_disconnected()
+    assert routed["n"] == 1

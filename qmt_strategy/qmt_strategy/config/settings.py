@@ -140,6 +140,12 @@ class Settings:
     # —— 下单/台账参数 ——
     order_ttl_seconds: int = 60               # 单最长存活时限（开盘单），竞价单到 9:25 定盘
     repository_unique_with_trade_date: bool = True  # §6.5 加固：明细唯一键是否纳入 trade_date
+    # 下单通道主动探活连续失败阈值（评审三轮 EXEC-risk-05）：盘中心跳 query_stock_asset 连续失败达该
+    # 次数才置 _trade_conn_ok=False（FREEZE），避免单次抖动误冻；单次成功即清零。
+    trade_conn_heartbeat_fail_threshold: int = 3  # QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD
+    # 撤单回执丢失的 CANCELLING 单宽限期秒数（评审三轮 EXEC-order-08）：超过宽限仍 CANCELLING 即幂等
+    # 重发 cancel/续二次截止，防撤单回执断线丢失导致单永久卡 CANCELLING 占名额占预算。
+    cancel_grace_seconds: int = 30            # QMT_CANCEL_GRACE_SECONDS
 
     # —— 本地化数据栈（doc/05 单进程+SQLite）——
     local_db_path: str = "qmt_local.db"       # QMT_LOCAL_DB_PATH：本机 SQLite 库路径（回流/台账/名单）
@@ -232,6 +238,10 @@ class Settings:
             auction_timing_enabled=_as_bool(g("QMT_AUCTION_TIMING_ENABLED") or "false"),
             kill_switch=_as_bool(g("QMT_KILL_SWITCH") or "false"),
             order_ttl_seconds=_as_int(g("QMT_ORDER_TTL_SECONDS")) or 60,
+            trade_conn_heartbeat_fail_threshold=(
+                _as_int(g("QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD")) or 3
+            ),
+            cancel_grace_seconds=_as_int(g("QMT_CANCEL_GRACE_SECONDS")) or 30,
             repository_unique_with_trade_date=_as_bool(
                 g("QMT_UNIQUE_WITH_TRADE_DATE") or "true"
             ),

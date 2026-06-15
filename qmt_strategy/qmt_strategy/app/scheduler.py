@@ -126,6 +126,36 @@ class DailyScheduler:
     def _mark(self, today: date, action: Action) -> None:
         self._fired.setdefault(today, set()).add(action)
 
+    def _run_sell_with_feed_health(self, today: date, *, session: str, manage_feed: bool) -> None:
+        """取实时盘口跑卖出，并（盘中）以取盘口成败作行情健康源（评审三轮 EXEC-risk-04 / EXEC-sched-05）。
+
+        业务意图：盘中连续交易段 _market_feed_ok 原无更新来源（竞价后 AuctionPoller 退出），行情断流
+        FREEZE 安全默认在盘中形同虚设。这里把「盘中卖出取盘口的成败」作为行情健康置位源。
+        manage_feed 口径：
+        - True（盘中 INTRADAY）：sell_books_provider 未接线/取盘口异常 → report_market_feed(False)
+          保守不卖（不残留 prewarm 重置的 True）；取到盘口（即便空）→ report_market_feed(True) 再卖。
+        - False（竞价段 RUN_AUCTION）：行情健康由买入侧 AuctionPoller 自管，本路径**不触碰** _market_feed_ok，
+          只在有盘口源时跑一次竞价卖出评估（提供 decide_auction 的调度入口，避免其成死代码）。
+        边界：engine 缺 report_market_feed（部分离线/单测 fake）时用 getattr 守卫跳过健康置位。
+        """
+        report = getattr(self._engine, "report_market_feed", None) if manage_feed else None
+        if self._sell_books_provider is None:
+            if callable(report):
+                report(False)  # 盘中无盘口源 → 保守置行情不健康（FREEZE），竞价段(report=None)不动
+            return
+        try:
+            books = self._sell_books_provider(today)
+        except Exception as exc:  # noqa: BLE001 取盘口失败 = 行情不可信：置 feed 不健康 + 强告警，不卖
+            self._logger.error(
+                "scheduler_sell_books_failed", trade_date=str(today), session=session, error=repr(exc)
+            )
+            if callable(report):
+                report(False)
+            return
+        if callable(report):
+            report(True)  # 成功取到盘口源（即便空）= 行情通道可用
+        self._engine.run_sell_pass(today, books, session=session)
+
     # ------------------------------------------------------------------
     # 动作分发
     # ------------------------------------------------------------------
@@ -134,10 +164,19 @@ class DailyScheduler:
         if action == Action.IDLE:
             return
         if action == Action.PREWARM:
+            # 连接就绪为盘前重建前置（评审三轮 EXEC-sched-10）：检查 connect_and_subscribe 返回值，
+            # 连接失败时窗口内不把 PREWARM 标 final fired（允许下轮重连重做），并强告警。
+            connected = True
             if self._guard is not None:
-                self._guard.connect_and_subscribe()
+                connected = bool(self._guard.connect_and_subscribe())
+                if not connected:
+                    self._logger.warn(
+                        "scheduler_prewarm_conn_not_ready_will_retry", trade_date=str(today),
+                        note="连接未就绪：基于未就绪 trader 的 query_* 重建/抓基线可能失败，窗口内不定稿，下轮重连重做",
+                    )
             # 先盘前拉取当日 watchlist 落本机 SQLite（失败不抛、降级无名单，详见 WatchlistPrefetcher），
             # 再让 engine.prewarm 从本机库装载——保证 prewarm 读到的是当日最新名单。
+            # engine.prewarm 幂等（日初基线复用 + 持仓以 QMT 为权威重建），连接失败时重建可能不可靠但重跑安全。
             saved = 0
             if self._watchlist_prefetch is not None:
                 try:
@@ -148,28 +187,33 @@ class DailyScheduler:
                         "scheduler_watchlist_prefetch_error", trade_date=str(today), error=repr(exc)
                     )
             self._engine.prewarm(today)
-            # PREWARM 重试（评审二轮 P2#48）：原实现 prefetch 失败/空也一次性标 fired→整日只守仓不再补拉。
-            # 这里：配了 prefetch 且本次拉到 0 行，且仍在开窗前(< 竞价 9:15)→【不标 fired】，下轮重试再拉
-            # （engine.prewarm 因日初基线复用/持仓重建幂等，重跑安全）；拉到 ≥1 行或已到 9:15 才标 fired 定稿。
+            # PREWARM 重试（评审二轮 P2#48 + 三轮 EXEC-sched-10）：原实现 prefetch 失败/空也一次性标 fired。
+            # 这里重试条件取「watchlist 拉到 0 行」或「连接未就绪」，且仍在开窗前(< 竞价 9:15)→【不标 fired】，
+            # 下轮重试再拉/再连；拉到 ≥1 行且连接就绪、或已到 9:15（避免无限重试错过窗口）才标 fired 定稿。
             # clock 缺失（部分离线/单测注入 None）→ 不做时间窗判断，直接标 fired（向后兼容，不重试）。
             now_t = east8_time_of(self._clock.now_utc()) if self._clock is not None else None
-            should_retry = (
-                self._watchlist_prefetch is not None
-                and saved == 0
-                and now_t is not None
-                and now_t < _AUCTION_START
+            before_auction = now_t is not None and now_t < _AUCTION_START
+            should_retry = before_auction and (
+                (self._watchlist_prefetch is not None and saved == 0) or (not connected)
             )
             if not should_retry:
                 self._mark(today, Action.PREWARM)
-                self._logger.info("scheduler_prewarmed", trade_date=str(today), saved=saved)
+                self._logger.info(
+                    "scheduler_prewarmed", trade_date=str(today), saved=saved, connected=connected
+                )
             else:
                 self._logger.warn(
-                    "scheduler_prewarm_empty_will_retry", trade_date=str(today),
-                    note="watchlist 拉到 0 行且未到 9:15，下轮重试补拉",
+                    "scheduler_prewarm_will_retry", trade_date=str(today), saved=saved, connected=connected,
+                    note="watchlist 拉到 0 行 或 连接未就绪，且未到 9:15，下轮重试",
                 )
         elif action == Action.RUN_AUCTION:
             self._mark(today, Action.RUN_AUCTION)  # 先登记再跑（run_auction 阻塞至 09:30，避免重入）
             self._logger.info("scheduler_run_auction", trade_date=str(today))
+            # 竞价段卖出评估入口（评审三轮 EXEC-sched-05）：可卖日 9:15–9:25 集合竞价定夺卖出，原调度从无
+            # session='auction' 调 run_sell_pass 的入口、decide_auction 整条卖出分支是死代码。这里在买入侧
+            # run_auction（阻塞至 9:30）之前先跑一次竞价卖出评估（需实时盘口源 sell_books_provider，缺省跳过）。
+            # 注：竞价段行情健康由买入侧 AuctionPoller 自管，故此处不改 _market_feed_ok（conservative=False）。
+            self._run_sell_with_feed_health(today, session="auction", manage_feed=False)
             self._engine.run_auction()
         elif action == Action.INTRADAY:
             # 存储健康周期体检（评审二轮 P0#2）：写线程静默死亡且当轮无 submit 触发 on_failure 时的兜底发现，
@@ -177,11 +221,15 @@ class DailyScheduler:
             health_tick = getattr(self._engine, "storage_health_tick", None)
             if callable(health_tick):
                 health_tick()
+            # 下单通道主动探活（评审三轮 EXEC-risk-05）：盘中周期心跳 query_stock_asset，连续失败达阈值即
+            # report_trade_conn(False) → risk.gate FREEZE，覆盖「通道静默变坏但未触发断线回调」的盲区。
+            heartbeat = getattr(self._engine, "trade_conn_heartbeat", None)
+            if callable(heartbeat):
+                heartbeat()
             self._engine.sweep_ttl()  # 超时撤单巡检（无需盘口）
-            if self._sell_books_provider is not None:
-                # 盘中卖出决策（需实时盘口源；缺省不注入则跳过，属 TODO(实测)）。
-                books = self._sell_books_provider(today)
-                self._engine.run_sell_pass(today, books, session="intraday")
+            # 盘中卖出决策（评审三轮 EXEC-risk-04）：以取盘口成败作行情健康源；无盘口源时保守置 feed=False
+            # （盘中不卖，不残留 prewarm 重置的 True），避免「行情断流 FREEZE 安全默认」在盘中形同虚设。
+            self._run_sell_with_feed_health(today, session="intraday", manage_feed=True)
         elif action == Action.CLOSE_BATCH:
             self._engine.close_batch(today)
             self._mark(today, Action.CLOSE_BATCH)

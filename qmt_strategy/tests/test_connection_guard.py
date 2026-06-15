@@ -299,3 +299,105 @@ def test_default_backfill_is_noop():
     guard.on_disconnected()
     assert guard.ready is True
     assert guard.current_session_id == 9010
+
+
+# ---------------------------------------------------------------------------
+# 6) 评审三轮 EXEC-sched-03：snapshot 一致快照 + 连接序入口先置未就绪
+# ---------------------------------------------------------------------------
+def test_snapshot_returns_consistent_pair():
+    """snapshot() 返回 (ready, current_trader) 一致快照（供主循环跨线程取一致对）。"""
+    t0 = RecordingFakeTrader(connect_rc=0, subscribe_rc=0)
+    guard, _logger, _account, _callback = _make_guard([t0], [1])
+    # 未连接：未就绪、trader 为 None。
+    assert guard.snapshot() == (False, None)
+    assert guard.connect_and_subscribe() is True
+    assert guard.snapshot() == (True, t0)
+
+
+def test_ready_false_at_entry_of_connect():
+    """重连/初连序一进入即 ready=False（不残留旧 True，避免对半就绪句柄 run_forever）。"""
+    box = {}
+
+    class _AssertingTrader(RecordingFakeTrader):
+        def connect(self):
+            # connect 被调用时（已切到本新实例），就绪标记必须已先置 False。
+            box["ready_during_connect"] = box["guard"].ready
+            return super().connect()
+
+    t = _AssertingTrader(connect_rc=0, subscribe_rc=0)
+    guard, _logger, _account, _callback = _make_guard([t], [42])
+    box["guard"] = guard
+    assert guard.connect_and_subscribe() is True
+    assert box["ready_during_connect"] is False
+    assert guard.ready is True
+
+
+# ---------------------------------------------------------------------------
+# 7) 评审三轮 EXEC-sched-02：on_connection_state 通知解冻/冻结
+# ---------------------------------------------------------------------------
+def test_connection_state_notified_on_ready_and_disconnect():
+    """连接就绪→on_connection_state(True)、断线→(False)、重连就绪→(True)。"""
+    states = []
+    t0 = RecordingFakeTrader(connect_rc=0, subscribe_rc=0)
+    t1 = RecordingFakeTrader(connect_rc=0, subscribe_rc=0)
+    logger = RecordingLogger()
+    account = FakeStockAccount("acc1", account_type=2)
+
+    sids = iter([111, 222])
+    traders = iter([t0, t1])
+    guard = ConnectionGuard(
+        trader_factory=lambda s: next(traders),
+        account=account, callback=object(), clock=_clock(), logger=logger,
+        session_id_provider=lambda: next(sids),
+        on_connection_state=states.append,
+    )
+    assert guard.connect_and_subscribe() is True
+    assert states[-1] is True
+    guard.on_disconnected()
+    # 断线先通知 False，重连就绪再通知 True。
+    assert False in states
+    assert states[-1] is True
+
+
+def test_connect_failure_notifies_connection_state_false():
+    """connect 失败 → on_connection_state(False)（冻结下单闸）。"""
+    states = []
+    t = RecordingFakeTrader(connect_rc=-1, subscribe_rc=0)
+    logger = RecordingLogger()
+    guard = ConnectionGuard(
+        trader_factory=lambda s: t, account=FakeStockAccount("acc1"), callback=object(),
+        clock=_clock(), logger=logger, session_id_provider=lambda: 9,
+        on_connection_state=states.append,
+    )
+    assert guard.connect_and_subscribe() is False
+    assert states == [False]
+
+
+# ---------------------------------------------------------------------------
+# 8) 评审三轮 EXEC-sched-08：session 复用 fail-closed
+# ---------------------------------------------------------------------------
+def test_reconnect_session_reuse_fails_closed():
+    """provider 持续吐相同 session → 退避重取至上限仍复用 → 拒绝重连、未就绪、不补采。"""
+    logger = RecordingLogger()
+    backfill_calls = {"n": 0}
+
+    # provider 恒返回同一 session 5（模拟误配复用）；trader_factory 每次造新成功 trader。
+    def session_provider():
+        return 5
+
+    def trader_factory(_sid):
+        return RecordingFakeTrader(connect_rc=0, subscribe_rc=0)
+
+    guard = ConnectionGuard(
+        trader_factory=trader_factory, account=FakeStockAccount("acc1"), callback=object(),
+        clock=_clock(), logger=logger, session_id_provider=session_provider,
+        on_reconnect_backfill=lambda: backfill_calls.__setitem__("n", backfill_calls["n"] + 1),
+        max_session_retry=3,
+    )
+    # 初连成功（session=5）。
+    assert guard.connect_and_subscribe() is True
+    # 断线 → reconnect：新 session 仍是 5（复用）→ 退避重取 3 次仍复用 → 拒绝重连。
+    guard.on_disconnected()
+    assert guard.ready is False
+    assert backfill_calls["n"] == 0                       # 复用 session 绝不补采
+    assert "reconnect_aborted_session_reuse" in logger.events()

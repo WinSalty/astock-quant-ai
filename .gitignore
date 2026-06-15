@@ -8,3 +8,7 @@ __pycache__/
 .DS_Store
 
 .idea/
+
+# 第三轮评审修复设计阶段临时工作文件（不入库）
+doc/.r3_design_workflow.js
+doc/.r3_design_specs.md

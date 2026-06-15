@@ -122,3 +122,104 @@ def test_run_skips_non_trading_day():
         clock.advance(600)
     s.run(sleep_fn=fast_sleep, max_iters=45)
     assert eng.calls == [] and guard.connects == 0 and stack.synced == []
+
+
+# ===========================================================================
+# 评审三轮 EXEC-sched-10：PREWARM 以连接就绪为前置
+# ===========================================================================
+class _FlakyGuard:
+    """connect_and_subscribe 可注入返回值（模拟连接失败）。"""
+    def __init__(self, results):
+        self._results = list(results)
+        self.connects = 0
+    def connect_and_subscribe(self):
+        self.connects += 1
+        return self._results[min(self.connects - 1, len(self._results) - 1)]
+
+
+def test_prewarm_not_fired_when_connect_fails_before_auction():
+    # 9:00（< 9:15）连接失败 → 不标 fired（下轮 decide 仍返回 PREWARM 重做），并强告警。
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 0))
+    eng = _FakeEngine(); guard = _FlakyGuard([False, True]); stack = _FakeStack()
+    s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal())
+    s.dispatch(Action.PREWARM, TRADING_DAY)
+    assert s.decide(clock.now_utc()) == Action.PREWARM       # 未定稿，仍需 PREWARM
+    # 第二轮连接成功 → 定稿 fired。
+    s.dispatch(Action.PREWARM, TRADING_DAY)
+    assert s.decide(clock.now_utc()) != Action.PREWARM       # 已定稿
+    assert "scheduler_prewarm_conn_not_ready_will_retry" in s._logger.events()
+
+
+def test_prewarm_fired_after_9_15_even_if_conn_fails():
+    # 9:20（>= 9:15）连接失败 → 仍定稿 fired（避免无限重试错过窗口），仅告警。
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 20))
+    eng = _FakeEngine(); guard = _FlakyGuard([False]); stack = _FakeStack()
+    s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal())
+    s.dispatch(Action.PREWARM, TRADING_DAY)
+    # 9:20 已过竞价起点 → PREWARM 定稿（decide 在已 prewarm 后此刻进竞价/盘中，不再 PREWARM）。
+    assert Action.PREWARM in s._fired.get(TRADING_DAY, set())
+
+
+# ===========================================================================
+# 评审三轮 EXEC-risk-04 / EXEC-risk-05 / EXEC-sched-05：盘中/竞价卖出 + 探活
+# ===========================================================================
+class _RichEngine(_FakeEngine):
+    """带行情健康/通道探活记录的 fake engine。"""
+    def __init__(self):
+        super().__init__()
+        self.feed_reports = []
+        self.heartbeats = 0
+    def report_market_feed(self, ok): self.feed_reports.append(ok)
+    def trade_conn_heartbeat(self): self.heartbeats += 1
+
+
+def _rich_sched(clock, **kw):
+    eng = _RichEngine(); guard = _FakeGuard(); stack = _FakeStack()
+    s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal(), **kw)
+    return s, eng, guard, stack
+
+
+def test_intraday_calls_heartbeat():
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 35))
+    s, eng, _g, _st = _rich_sched(clock)
+    s.dispatch(Action.INTRADAY, TRADING_DAY)
+    assert eng.heartbeats == 1                # 盘中主动探活下单通道
+
+
+def test_intraday_no_books_provider_reports_feed_false():
+    # 无盘口源 → 盘中保守置行情不健康（FREEZE），不跑 run_sell_pass。
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 35))
+    s, eng, _g, _st = _rich_sched(clock, sell_books_provider=None)
+    s.dispatch(Action.INTRADAY, TRADING_DAY)
+    assert eng.feed_reports == [False]
+    assert _count(eng, "sell") == 0
+
+
+def test_intraday_books_failure_reports_feed_false():
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 35))
+    def boom(_today):
+        raise RuntimeError("xtdata down")
+    s, eng, _g, _st = _rich_sched(clock, sell_books_provider=boom)
+    s.dispatch(Action.INTRADAY, TRADING_DAY)
+    assert eng.feed_reports == [False]
+    assert "scheduler_sell_books_failed" in s._logger.events()
+    assert _count(eng, "sell") == 0
+
+
+def test_intraday_books_ok_reports_feed_true_and_sells():
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 35))
+    s, eng, _g, _st = _rich_sched(clock, sell_books_provider=lambda today: {"600036.SH": object()})
+    s.dispatch(Action.INTRADAY, TRADING_DAY)
+    assert eng.feed_reports == [True]
+    assert ("sell", "intraday") in eng.calls
+
+
+def test_auction_sell_entry_runs_with_provider():
+    # 评审三轮 EXEC-sched-05：竞价段有 session='auction' 的卖出调度入口（decide_auction 非死代码）。
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 16))
+    s, eng, _g, _st = _rich_sched(clock, sell_books_provider=lambda today: {"600036.SH": object()})
+    s.dispatch(Action.RUN_AUCTION, TRADING_DAY)
+    assert ("sell", "auction") in eng.calls   # 竞价段卖出评估入口存在
+    assert _count(eng, "run_auction") == 1    # 买入侧轮询照常
+    # 竞价段不改 _market_feed_ok（由买入侧 AuctionPoller 自管）。
+    assert eng.feed_reports == []

@@ -343,22 +343,79 @@ def test_open_blocked_when_drawdown_unknown():
     assert eng._open_blocked_by_risk("600000.SH") is True
 
 
-def test_reconnect_backfill_stays_frozen_on_failure():
-    """#14：补采失败 → _trade_conn_ok 保持 False（fail-closed），不再无条件解冻。"""
+def test_reconnect_backfill_does_not_freeze_on_failure():
+    """评审三轮 EXEC-sched-02：on_reconnect_backfill 不再独占管理 _trade_conn_ok。
+
+    解冻/冻结权威源已迁到「连接就绪事件」(report_trade_conn)；补采失败仅强告警、不再据此把
+    _trade_conn_ok 翻成 False 永久冻结卖出（连接已由 guard 就绪解冻，持仓由下次 prewarm/收盘快照校准）。
+    """
     eng, _ = _engine(_CfgTrader())
     eng.prewarm(T_BUY)
+    eng._trade_conn_ok = True  # 连接已就绪（guard 已 report_trade_conn(True)）
     eng._snapshot.run_backfill = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("conn down"))
     eng.on_reconnect_backfill()
+    assert eng._trade_conn_ok is True  # 补采失败不再据此冻结
+    assert "engine_reconnect_backfill_failed" in eng._logger.events()
+
+
+def test_reconnect_backfill_does_not_self_unfreeze():
+    """评审三轮 EXEC-sched-02：补采成功也不擅自解冻——解冻是 report_trade_conn(True) 的职责。"""
+    eng, _ = _engine(_CfgTrader())
+    eng.prewarm(T_BUY)
+    eng._trade_conn_ok = False  # 模拟断线冻结态
+    eng.on_reconnect_backfill()  # 补采成功，但不触碰 _trade_conn_ok
     assert eng._trade_conn_ok is False
 
 
-def test_reconnect_backfill_unfreezes_on_success():
-    """#14：补采成功 → 解除通道冻结。"""
+def test_report_trade_conn_toggles_flag():
+    """评审三轮 EXEC-sched-02：report_trade_conn 真正切换 _trade_conn_ok 并清零探活失败计数。"""
     eng, _ = _engine(_CfgTrader())
-    eng.prewarm(T_BUY)
-    eng._trade_conn_ok = False
-    eng.on_reconnect_backfill()
+    eng._trade_conn_fail_streak = 2
+    eng.report_trade_conn(False)
+    assert eng._trade_conn_ok is False
+    eng.report_trade_conn(True)
     assert eng._trade_conn_ok is True
+    assert eng._trade_conn_fail_streak == 0  # 解冻同时清零失败计数
+
+
+def test_trade_conn_heartbeat_marks_down_after_n_failures():
+    """评审三轮 EXEC-risk-05：盘中主动探活连续失败达阈值才 FREEZE，单次成功清零、不自动解冻。"""
+    class _DeadAssetTrader(_CfgTrader):
+        def query_stock_asset(self, account):
+            raise RuntimeError("rpc timeout")
+
+    eng, _ = _engine(_DeadAssetTrader(), env={"QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD": "3"})
+    eng.trade_conn_heartbeat()
+    assert eng._trade_conn_ok is True   # 1 次失败未达阈值
+    eng.trade_conn_heartbeat()
+    assert eng._trade_conn_ok is True   # 2 次仍未达
+    eng.trade_conn_heartbeat()
+    assert eng._trade_conn_ok is False  # 第 3 次达阈值 → FREEZE
+
+    # 心跳恢复成功：清零失败计数，但不擅自解冻（解冻是 report_trade_conn(True) 的职责）。
+    eng_ok, _ = _engine(_CfgTrader())
+    eng_ok._trade_conn_fail_streak = 1
+    eng_ok.trade_conn_heartbeat()  # query_stock_asset 成功
+    assert eng_ok._trade_conn_fail_streak == 0
+    assert eng_ok._trade_conn_ok is True
+
+
+def test_trade_conn_heartbeat_requests_reconnect_once_on_freeze():
+    """评审三轮 P1-1：心跳跨阈值冻结时请求一次重连（把静默死亡当断线，让连接就绪事件接管解冻）。"""
+    class _DeadAssetTrader(_CfgTrader):
+        def query_stock_asset(self, account):
+            raise RuntimeError("rpc timeout")
+
+    eng, _ = _engine(_DeadAssetTrader(), env={"QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD": "2"})
+    reconnects = {"n": 0}
+    eng.set_reconnect_requester(lambda: reconnects.__setitem__("n", reconnects["n"] + 1))
+    eng.trade_conn_heartbeat()            # 1 次失败
+    assert reconnects["n"] == 0
+    eng.trade_conn_heartbeat()            # 2 次达阈值 → 首次冻结 → 请求 1 次重连
+    assert eng._trade_conn_ok is False
+    assert reconnects["n"] == 1
+    eng.trade_conn_heartbeat()            # 已冻结，后续失败不再重复请求（避免重连风暴，由主循环退避重连）
+    assert reconnects["n"] == 1
 
 
 def test_report_market_feed_toggles_flag():

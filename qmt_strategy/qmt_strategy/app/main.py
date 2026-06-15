@@ -160,7 +160,10 @@ class Engine:
             self._data_writer, self._ledger, deps.logger,
             account_id=deps.account_id,
             trade_date_provider=self._today_provider,
-            on_disconnected_hook=self.on_reconnect_backfill,
+            # 断线钩子默认 no-op（评审三轮 EXEC-sched-01）：原实现直接接 on_reconnect_backfill，绕过
+            # ConnectionGuard，导致真实掉线后永不换 session 重连、guard.ready 恒 True。改为由 run.py 在
+            # guard 构造后回填 callback.set_on_disconnected_hook(lambda: guard.on_disconnected())——断线先经
+            # guard 换新 session 重连，成功后再由 guard 触发 engine.on_reconnect_backfill 补采。
             position_sink=self._apply_trade_to_position,
             # 卖单终态失败复位钩子（评审二轮 P1#31）：拒单/全撤零成交 → 持仓从 SELLING 复位回 HOLDING 重挂。
             sell_revert_sink=self._revert_sell_unit,
@@ -190,6 +193,14 @@ class Engine:
         # 行情 / 下单通道健康标志（断线时置 False，恢复后置 True；供 risk.gate 安全默认）。
         self._market_feed_ok = True
         self._trade_conn_ok = True
+        # 下单通道主动探活连续失败计数（评审三轮 EXEC-risk-05）：盘中心跳 query_stock_asset 连续失败累计，
+        # 达阈值才置 _trade_conn_ok=False（避免单次抖动误冻）；任一次成功即清零。
+        self._trade_conn_fail_streak = 0
+        # 重连请求钩子（评审三轮 EXEC-risk-05 / 评审复核 P1-1）：心跳探到「静默死亡」（通道卡死但未触发
+        # 断线回调）首次跨阈值冻结时，把它当断线处理触发 guard 换 session 重连重订阅，让「连接就绪事件」
+        # 接管解冻——否则心跳冻结后 guard.ready 仍 True、_supervise_once 不会重连、_trade_conn_ok 永无解冻
+        # 路径 = 永久冻结整日。默认 no-op；run.py 在 guard 构造后回填 guard.on_disconnected。
+        self._reconnect_requester: Callable[[], None] = lambda: None
         # 日初总资产基线（评审 P0-B2）：prewarm 抓取，供 risk.gate 算账户日内回撤击穿。
         # None 表示未取到基线（查询失败/未装载）→ 回撤口径返回 None，不凭空冻结（其它闸门仍生效）。
         self._day_open_equity: Optional[Decimal] = None
@@ -270,6 +281,58 @@ class Engine:
         if self._market_feed_ok != ok:
             self._logger.warn("engine_market_feed_changed", market_feed_ok=ok)
         self._market_feed_ok = ok
+
+    def report_trade_conn(self, ok: bool) -> None:
+        """下单通道健康上报（评审三轮 EXEC-sched-02）：作为 risk.gate FREEZE 的权威源之一。
+
+        口径迁移：原来 _trade_conn_ok 只由 on_reconnect_backfill 一次注定失败的补采管理（fail-open 风险），
+        现改由「连接就绪事件」驱动——ConnectionGuard 经 on_connection_state 在重连真正就绪时 report(True)、
+        断线/连接失败时 report(False)；另由主动心跳（trade_conn_heartbeat）与下单同步失败回馈补充。
+        仅状态翻转时留痕，避免刷日志。置 True 时清零探活失败计数。
+        """
+        if ok:
+            self._trade_conn_fail_streak = 0
+        if self._trade_conn_ok != ok:
+            self._logger.warn("engine_trade_conn_changed", trade_conn_ok=ok)
+        self._trade_conn_ok = ok
+
+    def set_reconnect_requester(self, requester: Callable[[], None]) -> None:
+        """注入「请求重连」钩子（评审三轮 P1-1）。由 run.py 在 guard 构造后回填 guard.on_disconnected。"""
+        self._reconnect_requester = requester
+
+    def trade_conn_heartbeat(self) -> None:
+        """盘中主动探活下单通道（评审三轮 EXEC-risk-05）：由调度 INTRADAY 周期调用。
+
+        业务意图：_trade_conn_ok 原仅靠 on_disconnected 翻转，下单通道「静默变坏」（卡单/RPC 超时但
+        未触发断线回调）时风控不冻结、仍向不可用通道发单。这里用轻量 query_stock_asset 做心跳：
+        连续失败达阈值（settings.trade_conn_heartbeat_fail_threshold）才 report_trade_conn(False)，
+        单次成功即清零；避免单次抖动误冻。查询本身异常被吞（探活失败即记一次失败，不外抛）。
+        解冻路径（P1-1 修复）：首次跨阈值冻结时把「静默死亡」当断线，触发 guard 换 session 重连重订阅，
+        由「连接就绪事件」接管解冻；否则心跳冻结后 guard.ready 仍 True、主循环不重连 = 永久冻结。
+        """
+        threshold = getattr(self._settings, "trade_conn_heartbeat_fail_threshold", 3)
+        try:
+            self._deps.trader.query_stock_asset(self._deps.account)
+        except Exception as exc:  # noqa: BLE001 探活失败计一次，连续达阈值才冻结
+            self._trade_conn_fail_streak += 1
+            self._logger.warn(
+                "engine_trade_conn_heartbeat_failed",
+                streak=self._trade_conn_fail_streak,
+                threshold=threshold,
+                error=str(exc),
+            )
+            if self._trade_conn_fail_streak >= threshold:
+                was_ok = self._trade_conn_ok
+                self.report_trade_conn(False)
+                if was_ok:
+                    # 仅在「首次从健康跨入冻结」时请求一次重连：把静默死亡当断线，guard 换 session 重连
+                    # 重订阅成功后经 on_connection_state(True) 解冻；若重连失败 ready=False，主循环 _supervise_once
+                    # 会继续退避重连（无需在此每个 tick 重复请求，避免重连风暴）。
+                    self._reconnect_requester()
+            return
+        # 心跳成功：清零失败计数。注意不在此擅自 report(True) 解冻——解冻权威源是「连接就绪事件」
+        # （guard.on_connection_state），心跳只负责「探测到死即冻结 + 请求重连」，避免静默通道被心跳成功误解冻。
+        self._trade_conn_fail_streak = 0
 
     # ------------------------------------------------------------------
     # 盘前：装载当日 watchlist + 推进持仓状态
@@ -921,24 +984,24 @@ class Engine:
     # 收盘 / 断线补采 / 对账
     # ------------------------------------------------------------------
     def on_reconnect_backfill(self) -> None:
-        """断线重连后补采当日缺口（§6.2.3）：由连接守护 / 回调 on_disconnected 钩子触发。
+        """断线重连【就绪后】补采当日缺口（§6.2.3）：由 ConnectionGuard.reconnect 成功后触发。
 
-        通道健康标志口径修正（评审二轮 P1#14）：原实现先置 _trade_conn_ok=False 再在 finally 无条件置回
-        True——即便补采失败（连接其实仍不可用）也"乐观解冻"，FREEZE 安全默认形同虚设（fail-open）。
-        修复：补采+持仓重建【全部成功】才解冻（连接确实可用）；任一异常则保持 False（fail-closed），让
-        行情/下单中断 FREEZE 在重连真正确认前持续生效，并强告警。
+        通道健康标志口径再修正（评审三轮 EXEC-sched-01/02）：
+        - 原二轮实现用本方法独占管理 _trade_conn_ok（进入置 False、补采全成才置 True）。但因断线钩子
+          被错接成本方法、从不经 guard 换 session 重连（EXEC-sched-01），且本方法用已断 trader 补采必败，
+          导致 _trade_conn_ok 永久 False → 全天 FREEZE 连止损都冻结（EXEC-sched-02）。
+        - 现在解冻/冻结权威源迁到「连接就绪事件」：ConnectionGuard 在 connect_and_subscribe 成功时已通过
+          on_connection_state→report_trade_conn(True) 解冻；断线/连接失败时 report(False) 冻结。故本方法
+          **不再触碰 _trade_conn_ok**，只负责「重连就绪后补采 + 持仓重建」；补采失败仅强告警、不再令通道
+          永久冻结（连接已就绪、卖出能力须保留，持仓由下次 prewarm/收盘快照重新校准）。
         """
-        self._trade_conn_ok = False
         try:
             self._snapshot.run_backfill()
             # 补采后用 QMT 权威持仓重建持仓状态机（评审二轮 P1#30）：断线期间发生的买入成交只被 query_*
             # 补采落库、不回写持仓状态机 → 会漏卖；这里据 QMT 当前持仓重建/校准单元，使其进入卖出决策。
             self._rebuild_positions_from_broker(self._today_provider())
-        except Exception as exc:  # noqa: BLE001 补采失败 = 连接仍不可信：保持冻结(fail-closed)，不解冻
+        except Exception as exc:  # noqa: BLE001 补采失败仅告警：连接已就绪，不再据此永久冻结卖出
             self._logger.error("engine_reconnect_backfill_failed", error=str(exc))
-            return
-        # 补采 + 持仓重建均成功 → 连接确实可用，解除通道冻结。
-        self._trade_conn_ok = True
 
     def close_batch(self, trade_date: Optional[date] = None) -> None:
         """收盘批次（§6.2.2）：全量明细兜底 + CLOSE 资产/持仓快照，随后触发对账（§6.7）。"""

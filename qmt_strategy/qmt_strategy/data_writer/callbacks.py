@@ -95,6 +95,16 @@ class ExecCallback:
         # HOLDING（供下一轮重挂），否则止损/破位清仓永久失效。由 Engine 注入 (ts_code)->None；缺省不复位。
         self._sell_revert_sink = sell_revert_sink
 
+    def set_on_disconnected_hook(self, hook: Callable[[], None]) -> None:
+        """运行期回填断线钩子（评审三轮 EXEC-sched-01）。
+
+        业务意图：解决构造期循环依赖——Engine（含本回调）先于 ConnectionGuard 装配，故构造时拿不到 guard
+        引用。run.py 在 guard 构造完后回填 `lambda: guard.on_disconnected()`，使真实断线先经 guard 换新
+        session 重连（成功后再由 guard 触发 engine.on_reconnect_backfill 补采），而非绕过 guard 直连补采。
+        边界：hook 异常仍由 on_disconnected 的既有 try 口径处理；重跑幂等覆盖（同一 hook 多次回填无副作用）。
+        """
+        self._on_disconnected_hook = hook
+
     def _maybe_revert_sell_unit(self, order_id: Optional[int]) -> None:
         """卖单终态失败 → 复位持仓 SELLING 态（评审二轮 P1#31）。
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import random
 import time
 from datetime import date, time as dtime
 from typing import Optional, Tuple
@@ -119,10 +120,27 @@ def _build_remote_repo(settings: Settings, logger):
     return None
 
 
-def _make_session_id_provider():
-    """每次重连返回单调递增的新 session_id（旧 session 不复用，§2.2）。"""
-    seq = itertools.count(int(time.time()))
-    return lambda: next(seq)
+def _make_session_id_provider(settings: Optional[Settings] = None):
+    """每次重连返回单调递增的新 session_id（旧 session 不复用，§2.2 / 评审三轮 EXEC-sched-07）。
+
+    业务意图：起点不能用秒级 int(time.time())——同秒重启/多进程会与历史 session 区间重叠，违反
+    「每次重连必须用全新且不与历史重叠的 session」（复用已断 session 可能订阅静默失效却无回报）。
+    口径：基底取「毫秒低位（同秒重启高度可分）+ 随机位」并收口到正 int32（< 2^31），再 itertools 单调
+    自增。**必须收口到正 int32**：xtquant 的 session_id 是 C 层整型量级，若用 ms<<高位 的大整数会被
+    静默截断、丢掉高位单调性反而更易碰撞（评审三轮 P0-1）。
+    - 毫秒低 15 位：同秒重启（毫秒差 <1000ms < 32768）必然可分；
+    - 15 位随机：同一毫秒窗内的并发/重启再加一层离散，两次启动区间重叠概率 ~N/2^15（N=单进程重连数，极小）；
+    - QMT_SESSION_ID：显式配置时作偏置叠加（接入原死配置，便于人工指定基底排查）。
+    边界（TODO 实测）：xtquant 实际接受的位宽以目标机为准，必要时调整掩码（当前取正 int32 0x7FFFFFFF 保守安全）。
+    """
+    ms = int(time.time() * 1000)
+    base = ((ms & 0x7FFF) << 15) | random.getrandbits(15)  # 30 位：毫秒低位 + 随机位
+    if settings is not None and settings.session_id:
+        base += int(settings.session_id)
+    base &= 0x7FFFFFFF  # 收口到正 int32，杜绝高位溢出被 C 层截断
+    seq = itertools.count(base)
+    # 自增也夹到正 int32（长周期重连防越界回绕；单日重连量级远不及，仅兜底）。
+    return lambda: next(seq) & 0x7FFFFFFF
 
 
 def _load_trade_calendar_days(path: str) -> list:
@@ -227,10 +245,54 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     trader_factory = xt_real.make_trader_factory(settings.mini_path or "", holder)
     guard = ConnectionGuard(
         trader_factory=trader_factory, account=account, callback=callback,
-        clock=clock, logger=logger, session_id_provider=_make_session_id_provider(),
-        on_reconnect_backfill=engine.on_reconnect_backfill,     # 重连后触发当日 query_* 补采
+        clock=clock, logger=logger, session_id_provider=_make_session_id_provider(settings),
+        on_reconnect_backfill=engine.on_reconnect_backfill,     # 重连就绪后触发当日 query_* 补采
+        # 解冻/冻结下单闸的权威源（评审三轮 EXEC-sched-02）：连接就绪→report_trade_conn(True)、
+        # 断线/连接失败→report_trade_conn(False)，不再由一次注定失败的补采独占管理。
+        on_connection_state=engine.report_trade_conn,
     )
+    # 断线钩子延迟回填（评审三轮 EXEC-sched-01）：Engine（含 ExecCallback）先于 guard 装配，构造期拿不到
+    # guard 引用；此处 guard 已就位，回填 callback 的断线钩子为「先经 guard 换新 session 重连」——
+    # 真实断线链路 xt_real._RealCallback.on_disconnected → ExecCallback.on_disconnected → guard.on_disconnected
+    # → guard.reconnect（换新 session、connect/subscribe 成功）→ guard 触发 engine.on_reconnect_backfill 补采。
+    engine.callback.set_on_disconnected_hook(guard.on_disconnected)
+    # 心跳探到「静默死亡」首次冻结时请求重连（评审三轮 P1-1）：把它当断线交 guard 换 session 重连重订阅，
+    # 让连接就绪事件接管解冻，避免心跳冻结后无解冻路径而整日永久冻结。
+    engine.set_reconnect_requester(guard.on_disconnected)
     return engine, stack, guard, clock, calendar
+
+
+# 主循环退避/告警常量（评审三轮 EXEC-sched-09）。
+_RECONNECT_BACKOFF_BASE = 5.0    # 未就绪首次重连后的退避基数秒
+_RECONNECT_BACKOFF_MAX = 60.0    # 退避上限秒（指数退避封顶，避免 busy-loop 也避免过久不重试）
+_NOT_READY_ALERT_THRESHOLD = 6   # 连续未就绪达该次数即强告警「连接长期未就绪」
+
+
+def _supervise_once(guard, logger, state: dict) -> Tuple[bool, object, dict]:
+    """主循环一轮连接监督（评审三轮 EXEC-sched-03/09）：纯逻辑、可单测（不真正 run_forever）。
+
+    业务意图：原主循环未就绪时仅 sleep(5) 空转，从不主动重连/告警，盘前一次性建连失败即整日无连接。
+    这里取 guard 的一致快照 (ready, trader)：
+    - 就绪 → 返回 (True, trader, 清零计数)，由调用方对该 trader run_forever（本函数不阻塞）；
+    - 未就绪 → 主动退避重连 guard.reconnect()、未就绪计数 +1、达阈值强告警，返回 (False, None, 新计数)。
+    把「连接未就绪」与「watchlist 未装载」分开：后者属 scheduler.prewarm 的 fired 语义，不在此混判。
+    """
+    ready, trader = guard.snapshot()
+    if ready and trader is not None:
+        return True, trader, {"not_ready_streak": 0}
+    streak = state.get("not_ready_streak", 0) + 1
+    try:
+        # 主动退避重连（guard 内部重走全序、幂等；与 scheduler PREWARM 的建连叠加亦安全，TODO 实测口径）。
+        guard.reconnect()
+    except Exception as e:  # noqa: BLE001 重连异常不终止主循环
+        logger.error("run_supervise_reconnect_error", error=repr(e))
+    if streak >= _NOT_READY_ALERT_THRESHOLD:
+        logger.error(
+            "run_loop_persistently_disconnected",
+            not_ready_streak=streak,
+            note="连接长期未就绪：已退避主动重连仍未成功，请人工排查 miniQMT 链路/账号",
+        )
+    return False, None, {"not_ready_streak": streak}
 
 
 def main() -> None:
@@ -264,16 +326,23 @@ def main() -> None:
     scheduler.start_thread()
     logger.info("scheduler_started")
 
-    # —— 主线程常驻：等连接就绪（调度器 PREWARM 阶段会建连）后 run_forever 接收回调；进程退出即丢推送（§2.2）——
+    # —— 主线程常驻：取连接一致快照，就绪则 run_forever 接收回调，未就绪则主动退避重连+告警（§2.2）——
     # 注：run_forever / 断线重连(on_disconnected→guard.reconnect 换 trader) 的交互依 QMT 运行期行为，
-    #     具体阻塞/返回语义须目标机实测，这里给出常驻骨架（TODO(实测)）。
+    #     具体阻塞/返回语义须目标机实测，这里给出常驻骨架（TODO(实测)）；监督逻辑抽到 _supervise_once 可单测。
+    supervise_state: dict = {"not_ready_streak": 0}
     while True:
-        if guard.ready and guard.current_trader is not None:
+        ready, trader, supervise_state = _supervise_once(guard, logger, supervise_state)
+        if ready and trader is not None:
             try:
-                guard.current_trader.run_forever()  # 阻塞接收回调；返回（断线）后回到循环等待重连
+                trader.run_forever()  # 阻塞接收回调；返回（断线）后回到循环，由 _supervise_once 退避重连
             except Exception as e:  # noqa: BLE001 run_forever 异常不应直接终止进程
                 logger.error("run_forever_error", error=repr(e))
-        time.sleep(5)
+            time.sleep(1)  # run_forever 返回后短暂让步再监督（断线由钩子触发重连，这里兜底再探）
+        else:
+            # 未就绪：按连续未就绪次数指数退避（带上限），避免 busy-loop 又避免长久不重试。
+            streak = supervise_state.get("not_ready_streak", 1)
+            backoff = min(_RECONNECT_BACKOFF_BASE * (2 ** (streak - 1)), _RECONNECT_BACKOFF_MAX)
+            time.sleep(backoff)
 
 
 if __name__ == "__main__":
