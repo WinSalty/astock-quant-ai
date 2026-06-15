@@ -81,8 +81,14 @@ class Settings:
 
     # —— 信号侧 HTTP 内网接口（doc/07：盘前 GET watchlist + 盘后 POST 回流，两接口同源同 token）——
     signal_base_url: Optional[str] = None     # QMT_SIGNAL_BASE_URL：信号侧服务根，如 http://1.2.3.4:8000
-    signal_internal_token: Optional[str] = None      # QMT_SIGNAL_INTERNAL_TOKEN：X-Internal-Token 值
+    signal_internal_token: Optional[str] = None      # QMT_SIGNAL_INTERNAL_TOKEN：X-Internal-Token 值（统一回落）
     signal_internal_token_file: Optional[str] = None  # QMT_SIGNAL_INTERNAL_TOKEN_FILE：token 落盘文件（优先）
+    # 按接口独立 token（评审三轮 XCUT-01）：信号侧支持 watchlist 导出与 qmt 回流写两套独立 token；执行侧据此
+    # 也支持分接口配置——缺省回落统一 signal_internal_token，需隔离权限时分别配置。绝不让一个接口的 401 拖垮另一个。
+    signal_watchlist_token: Optional[str] = None       # QMT_SIGNAL_WATCHLIST_TOKEN：GET /internal/watchlist 专用
+    signal_watchlist_token_file: Optional[str] = None  # QMT_SIGNAL_WATCHLIST_TOKEN_FILE
+    signal_ingest_token: Optional[str] = None          # QMT_SIGNAL_INGEST_TOKEN：POST /internal/qmt/ingest 专用
+    signal_ingest_token_file: Optional[str] = None     # QMT_SIGNAL_INGEST_TOKEN_FILE
     http_timeout_seconds: float = 10.0        # QMT_HTTP_TIMEOUT_SECONDS：单次接口超时秒数
 
     # —— 7.1.3 竞价轮询与采集节奏 ——
@@ -194,6 +200,10 @@ class Settings:
             signal_base_url=g("QMT_SIGNAL_BASE_URL") or None,
             signal_internal_token=g("QMT_SIGNAL_INTERNAL_TOKEN") or None,
             signal_internal_token_file=g("QMT_SIGNAL_INTERNAL_TOKEN_FILE") or None,
+            signal_watchlist_token=g("QMT_SIGNAL_WATCHLIST_TOKEN") or None,
+            signal_watchlist_token_file=g("QMT_SIGNAL_WATCHLIST_TOKEN_FILE") or None,
+            signal_ingest_token=g("QMT_SIGNAL_INGEST_TOKEN") or None,
+            signal_ingest_token_file=g("QMT_SIGNAL_INGEST_TOKEN_FILE") or None,
             http_timeout_seconds=_as_float(g("QMT_HTTP_TIMEOUT_SECONDS")) or 10.0,
             auction_poll_interval_sec=_as_float(g("QMT_AUCTION_POLL_INTERVAL_SEC")) or 3.0,
             auction_window=g("QMT_AUCTION_WINDOW") or "09:15-09:25",
@@ -267,6 +277,35 @@ class Settings:
         if self.signal_internal_token:
             return self.signal_internal_token.strip()
         return None
+
+    @staticmethod
+    def _read_token(token_file: Optional[str], token_value: Optional[str]) -> Optional[str]:
+        """按「文件优先、环境变量兜底」读取 token（文件不可读不抛、回落 env）。"""
+        if token_file:
+            try:
+                with open(token_file, encoding="utf-8") as fh:
+                    token = fh.read().strip()
+                if token:
+                    return token
+            except OSError:
+                pass
+        if token_value:
+            return token_value.strip()
+        return None
+
+    def resolve_watchlist_token(self) -> Optional[str]:
+        """GET /internal/watchlist 专用 token（评审三轮 XCUT-01）：专用文件/env→回落统一 signal token。"""
+        return (
+            self._read_token(self.signal_watchlist_token_file, self.signal_watchlist_token)
+            or self.resolve_signal_token()
+        )
+
+    def resolve_ingest_token(self) -> Optional[str]:
+        """POST /internal/qmt/ingest 专用 token（评审三轮 XCUT-01）：专用文件/env→回落统一 signal token。"""
+        return (
+            self._read_token(self.signal_ingest_token_file, self.signal_ingest_token)
+            or self.resolve_signal_token()
+        )
 
     def assert_safe_to_trade(self) -> None:
         """下单前安全校验（§7.1.6）：竞价择时开关只有在显式置真时才允许，

@@ -31,21 +31,29 @@ from .main import Engine, EngineDeps, build_engine
 from .scheduler import DailyScheduler, parse_hhmm
 
 
-def _build_signal_client(settings: Settings, logger):
-    """构造信号侧 HTTP 客户端（base_url + token + 超时），供盘后回流与盘前 watchlist 拉取共用。
+def _build_signal_client(settings: Settings, logger, *, purpose: str = "unified"):
+    """构造信号侧 HTTP 客户端（base_url + token + 超时）。
 
-    缺 base_url → 返回 None（不走 HTTP 通道）。token 经 resolve_signal_token（文件优先）解析；
-    未配 token 时记告警但仍返回 client（信号侧会以 401 兜底，便于本机连通性排查）。
+    按接口选 token（评审三轮 XCUT-01）：信号侧支持 watchlist 导出与 qmt 回流写两套独立 token，执行侧据此分接口
+    取 token——purpose='watchlist'→resolve_watchlist_token、'ingest'→resolve_ingest_token、其余→统一 signal token；
+    三者缺省都回落统一 signal_internal_token，故默认配置仍自洽、运维隔离权限时各端用各自 token 不互相 401。
+    缺 base_url → 返回 None。未配 token 时记告警但仍返回 client（信号侧以 401 兜底，便于连通性排查）。
     """
     if not settings.signal_base_url:
         return None
     from ..common.http_client import SignalHttpClient
 
-    token = settings.resolve_signal_token()
+    if purpose == "watchlist":
+        token = settings.resolve_watchlist_token()
+    elif purpose == "ingest":
+        token = settings.resolve_ingest_token()
+    else:
+        token = settings.resolve_signal_token()
     if not token:
         logger.warn(
             "signal_client_no_token",
-            note="QMT_SIGNAL_INTERNAL_TOKEN(_FILE) 未配置，HTTP 调用将被信号侧 401",
+            purpose=purpose,
+            note="对应接口 token 未配置（QMT_SIGNAL_*_TOKEN(_FILE) / QMT_SIGNAL_INTERNAL_TOKEN(_FILE)），将被信号侧 401",
         )
     return SignalHttpClient(settings.signal_base_url, token, settings.http_timeout_seconds, logger)
 
@@ -60,7 +68,8 @@ def _build_decision_emitter(settings: Settings, logger, account_id: str, clock):
     from ..decision.decision_emitter import DECISION_TABLE, DecisionEmitter
     from ..storage.http_ingest_repository import INGEST_PATH
 
-    client = _build_signal_client(settings, logger)
+    # 决策日志走回流 ingest 端点 → 用 ingest token（评审三轮 XCUT-01）。
+    client = _build_signal_client(settings, logger, purpose="ingest")
 
     def _sink(rows):
         # 逐行 POST 决策记录；首个失败上抛 → 采集器 _flush 捕获并 warn 后丢弃该批（数据可丢失）。
@@ -94,8 +103,8 @@ def _build_remote_repo(settings: Settings, logger):
     2) 回落 **直连 MySQL**（旧方案 A）：仅配了 QMT_MYSQL_DSN（未配 signal_base_url）时启用。
     3) 都没配 → None（只本地、暂不同步，sync_to_remote 跳过并告警）。
     """
-    # 1) HTTP 回流优先。
-    client = _build_signal_client(settings, logger)
+    # 1) HTTP 回流优先（POST /internal/qmt/ingest → 用 ingest token，评审三轮 XCUT-01）。
+    client = _build_signal_client(settings, logger, purpose="ingest")
     if client is not None:
         from ..storage.http_ingest_repository import HttpIngestQmtRepository
 
@@ -306,7 +315,8 @@ def main() -> None:
     # —— 盘前 watchlist 拉取钩子（doc/07）：配了 signal_base_url 才启用——
     # PREWARM 时先从信号侧 GET /internal/watchlist 拉当日名单落本机 SQLite，再让 engine.prewarm 装载。
     watchlist_prefetch = None
-    signal_client = _build_signal_client(settings, logger)
+    # GET /internal/watchlist → 用 watchlist token（评审三轮 XCUT-01）。
+    signal_client = _build_signal_client(settings, logger, purpose="watchlist")
     if signal_client is not None:
         from ..watchlist.remote_watchlist import WatchlistPrefetcher
 

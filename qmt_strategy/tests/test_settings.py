@@ -81,3 +81,20 @@ def test_build_calendar_static_from_file(tmp_path):
     cal = _build_calendar(s, RecordingLogger())
     assert isinstance(cal, StaticTradeCalendar)
     assert cal.is_open(date(2026, 6, 12)) and not cal.is_open(date(2026, 6, 13))
+
+
+def test_per_interface_token_fallback_and_override():
+    """评审三轮 XCUT-01：watchlist/ingest 分接口 token 缺省回落统一 signal token，配置后各取各自。"""
+    from qmt_strategy.config.settings import Settings
+
+    s = Settings(signal_internal_token="unified")
+    assert s.resolve_watchlist_token() == "unified"   # 回落统一
+    assert s.resolve_ingest_token() == "unified"
+    s2 = Settings(
+        signal_internal_token="unified",
+        signal_watchlist_token="wl",
+        signal_ingest_token="ing",
+    )
+    assert s2.resolve_watchlist_token() == "wl"        # 各取各自，运维隔离权限不互相 401
+    assert s2.resolve_ingest_token() == "ing"
+    assert s2.resolve_signal_token() == "unified"
