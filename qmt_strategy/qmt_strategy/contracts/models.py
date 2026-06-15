@@ -72,6 +72,10 @@ class SelectedStockRow:
     setup: Optional[str] = None                    # 技术形态/位置
     # 证券名称（评审二轮 P1#18/#63）：信号侧契约已含，执行侧据此识别 ST/退市（主板 ST 涨停 5%）并做 live 过滤。
     name: Optional[str] = None
+    # 显式 ST 标志（评审三轮 F3）：主板 ST 涨停 5% 原完全依赖 name(name 缺失即按 10% 算出超法定涨停价废单/
+    # 漏判 5% 顶板)。信号侧契约补此显式布尔后，board_rules/loader 优先采用 is_st，不再单点押在 name 上。
+    # None=信号侧未下发(回退 name 判定)；True/False=显式 ST 与否。
+    is_st: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------

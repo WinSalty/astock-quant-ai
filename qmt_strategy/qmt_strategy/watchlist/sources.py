@@ -6,7 +6,9 @@
 - 路径 A（DB 直读）：执行侧用**只读账号**直连 MySQL，
   ``SELECT * FROM limit_up_selected_stock WHERE target_trade_date = :today``，延迟最低；
 - 路径 B（HTTP 只读接口）：当执行侧不便直连 MySQL 时，调信号侧 FastAPI 只读端点
-  （如 ``GET /api/selected-stocks?target_trade_date=today``）。
+  （真实端点 ``GET /api/internal/watchlist?date=T``，T=prev_open(today)；评审三轮 XCUT-02 修正，
+  原 ``/api/selected-stocks?target_trade_date=today`` 为不存在端点+错误日期语义，见 HttpSelectedStockSource）。
+  当前 path B 为死代码，生产走 prefetch+本机 SQLite。
 
 两路返回**同一契约**（一行一股的 ``SelectedStockRow``），故上层只需面向协议、不感知来源。
 真实落地点（SQL 执行 / HTTP 调用 / JSON→SelectedStockRow 反序列化）由注入的 callable 承载，
@@ -94,13 +96,17 @@ class DbSelectedStockSource(CallableSelectedStockSource):
 class HttpSelectedStockSource(CallableSelectedStockSource):
     """路径 B：调信号侧 FastAPI 只读端点（§2.3 第 2 步）。
 
-    真实落地点：``GET /api/selected-stocks?target_trade_date=today``，
-    校验 HTTP 200、把 JSON 数组反序列化为 ``SelectedStockRow`` 列表
-    （非 200 / 超时 / JSON 解析失败由 fetch_fn 抛异常，本层转 WatchlistLoadError）。
-
-    用于执行侧不便直连 MySQL 时；与 A 路返回同一契约，对上层等价，可互为主备（§2.6）。
+    契约修正（评审三轮 XCUT-02）：原 docstring/落地点写的 ``GET /api/selected-stocks?target_trade_date=today``
+    是【不存在的端点 + 错误日期语义】——信号侧真实只读端点是 ``GET /api/internal/watchlist?date=T``，查询键是
+    【信号日 T = prev_open(today)】(不是买入日 today)，返回的每条 target_trade_date=T+1=today。fetch_fn 闭包须：
+      1) 按 date=prev_open(today)(信号日 T) 调 ``GET /api/internal/watchlist``，校验 HTTP 200；
+      2) 把 JSON items 反序列化为 ``SelectedStockRow``，并把每条 target_trade_date 对齐为 today（与
+         remote_watchlist.WatchlistPrefetcher 完全一致），非 200/超时/解析失败抛异常由本层转 WatchlistLoadError。
+    **注意**：path B 当前为死代码（仅测试引用；生产走 prefetch+本机 SQLite 的 SqliteSelectedStockSource）。如启用，
+    务必按上述端点/日期口径实现闭包，绝不可沿用旧 docstring 的 /api/selected-stocks 与 target_trade_date=today
+    语义（会打 404 端点 或 传错日期整日拿不到数据 → 主备双失败降级只守仓）。建议优先废弃 path B、统一走 prefetch。
     """
 
     def __init__(self, fetch_fn: FetchFn):
-        # fetch_fn：注入「调只读端点并反序列化为 list[SelectedStockRow]」的闭包。
+        # fetch_fn：注入「按 date=信号日T 调 /api/internal/watchlist 并反序列化、对齐 target_trade_date=today」的闭包。
         super().__init__(fetch_fn, source_name="http")

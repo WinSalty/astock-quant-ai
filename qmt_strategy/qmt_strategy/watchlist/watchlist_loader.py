@@ -266,10 +266,12 @@ class WatchlistLoader:
             watch_only.append(self._to_entry(row, norm_code=norm, price=price, today=today))
             return
 
-        # 2.1) ST / 退市整理 live 过滤（评审二轮 P1#10/#18）：信号侧透传的证券名称含 ST/退 → 转观察名单
-        #      （不下单）。原实现 universe_filter.is_tradable_universe(ST/停牌/退市) 全链路无调用、只剩前缀白名单，
-        #      ST 票（仍是 600/000 前缀）会照常进入下单路径。打板战法对 ST 高风险标的取保守"只观察不下单"。
-        if universe_filter.is_st_name(row.name):
+        # 2.1) ST / 退市整理 live 过滤（评审二轮 P1#10/#18 + 三轮 F3）：优先采用信号侧显式 is_st 布尔，缺则回退
+        #      证券名称含 ST/退 判定 → 转观察名单（不下单）。ST 票（仍是 600/000 前缀）若不拦截会照常进下单路径，
+        #      打板战法对 ST 高风险标的取保守"只观察不下单"。is_st 显式标志补齐后不再单点押在 name 上。
+        _is_st_explicit = getattr(row, "is_st", None)
+        _is_st = bool(_is_st_explicit) if _is_st_explicit is not None else universe_filter.is_st_name(row.name)
+        if _is_st:
             self._logger.info(
                 "watchlist_st_reject", norm_code=norm, name=row.name, trade_date=str(today)
             )

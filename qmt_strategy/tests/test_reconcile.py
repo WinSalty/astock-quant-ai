@@ -206,10 +206,11 @@ def test_resolved_ts_code_normalizes_dirty_codes():
 
 
 def test_resolved_ts_code_bj_suffix():
-    """600000.BJ 等显式 BJ 后缀按归一规则返回 600000.BJ（显式后缀优先）。"""
+    """评审三轮 F1：合法 BJ 代码(830xxx.BJ)归一保留；矛盾脏串(600000.BJ：600 沪市 vs .BJ)判脏返 None。"""
     from qmt_strategy.reconcile.reconcile import _resolve
 
-    assert _resolve("600000.BJ") == "600000.BJ"
+    assert _resolve("830799.BJ") == "830799.BJ"   # 前缀后缀自洽
+    assert _resolve("600000.BJ") is None          # 矛盾脏串(锚点化后不再让显式后缀盖过前缀真值)
     assert _resolve("SH600000") == "600000.SH"
     assert _resolve("600000") == "600000.SH"
     assert _resolve("300750") == "300750.SZ"

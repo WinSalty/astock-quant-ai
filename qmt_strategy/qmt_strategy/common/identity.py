@@ -20,6 +20,8 @@ _SZ = "SZ"
 _BJ = "BJ"
 
 _DIGITS6 = re.compile(r"(\d{6})")
+# 锚点化后缀正则（评审三轮 F1）：只认末尾 .SH/.SZ/.BJ，绝不用裸子串匹配任意位置的字面量。
+_SUFFIX_RE = re.compile(r"\.(SH|SZ|BJ)$")
 
 
 def _suffix_by_prefix(code6: str) -> Optional[str]:
@@ -36,8 +38,12 @@ def _suffix_by_prefix(code6: str) -> Optional[str]:
 def resolve_code(raw: Optional[str]) -> Optional[str]:
     """把任意脏代码归一为标准 ts_code（带交易所后缀，大写）。
 
-    支持形态：600036.SH / 600036.sh / SH600036 / sh.600036 / 600036 / 600036.BJ。
-    边界：取不到 6 位数字或无法判定交易所则返回 None（交由上游降级，不臆造）。
+    支持形态：600036.SH / 600036.sh / SH600036 / sh.600036 / 600036 / 830799.BJ。
+    锚点化口径（评审三轮 F1）：显式交易所后缀只认【规范位置】——末尾 .SH/.SZ/.BJ 或开头 SH/SZ/BJ；
+    绝不用裸子串 `ex in s`（任意位置出现 SH/SZ/BJ 字面量都被当后缀，脏串如 'SH000001' 会被判到错误交易所
+    → 下错单 / norm_code join 错配）。当显式后缀与按数字前缀推断的交易所【矛盾】时判脏数据返回 None（交上游
+    降级，绝不让任意位置字面量盖过前缀真值）。
+    边界：取不到 6 位数字或无法判定交易所则返回 None。
     """
     if not raw:
         return None
@@ -46,13 +52,21 @@ def resolve_code(raw: Optional[str]) -> Optional[str]:
     if not m:
         return None
     code6 = m.group(1)
-    # 优先采用原串里已显式给出的合法交易所后缀（前缀或后缀形态都兼容）
+    # 只认锚点位置的显式后缀：末尾 .SH/.SZ/.BJ 或开头 SH/SZ/BJ（如 SH600036 / SH.600036）。
     explicit = None
-    for ex in (_SH, _SZ, _BJ):
-        if ex in s:
-            explicit = ex
-            break
-    suffix = explicit or _suffix_by_prefix(code6)
+    m_suffix = _SUFFIX_RE.search(s)
+    if m_suffix:
+        explicit = m_suffix.group(1)
+    else:
+        for ex in (_SH, _SZ, _BJ):
+            if s.startswith(ex):
+                explicit = ex
+                break
+    by_prefix = _suffix_by_prefix(code6)
+    # 显式后缀与数字前缀推断矛盾 → 脏数据返回 None（如 'SH000001'：00 前缀属深市，与显式 SH 冲突）。
+    if explicit is not None and by_prefix is not None and explicit != by_prefix:
+        return None
+    suffix = explicit or by_prefix
     if suffix is None:
         return None
     return f"{code6}.{suffix}"

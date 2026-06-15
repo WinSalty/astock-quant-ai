@@ -140,3 +140,35 @@ def test_is_tradable_universe():
     assert is_tradable_universe("688981.SH", "中芯国际") is False
     assert is_tradable_universe("600036.SH", "招商银行", is_halted=True) is False
     assert is_tradable_universe("600036.SH", "招商银行", is_delisted=True) is False
+
+
+# ===========================================================================
+# 评审三轮 F1：锚点化后缀，矛盾脏串返 None（不判到错误交易所）
+# ===========================================================================
+@pytest.mark.parametrize("dirty", ["SH000001", "000001.SH", "SZ600036", "600036.BJ"])
+def test_resolve_code_contradictory_dirty_returns_none(dirty):
+    # 显式后缀与数字前缀矛盾 → 脏数据返 None（绝不下错单/join 错配）。
+    assert resolve_code(dirty) is None
+
+
+def test_resolve_code_embedded_literal_not_hijacked():
+    # 名称/板块标记里嵌入 SH/SZ 字面量但与前缀一致 → 仍按前缀正确归一（不被任意位置字面量劫持）。
+    assert resolve_code("AI算力SZ300750") == "300750.SZ"
+    assert resolve_code("人工智能300750") == "300750.SZ"
+
+
+# ===========================================================================
+# 评审三轮 F3：board_rules 优先采用显式 is_st（不再单点押在 name）
+# ===========================================================================
+def test_budget_prices_prefers_explicit_is_st():
+    from qmt_strategy.common.board_rules import budget_prices
+    # 主板票、name 不含 ST，但显式 is_st=True → 按 5% 现算（10.00→10.50），不再被 name 误判为非 ST。
+    row = make_selected_row(ts_code="600036.SH", signal_close=Decimal("10.00"))
+    row.name = "招商银行"
+    row.is_st = True
+    assert budget_prices(row).limit_up_price == Decimal("10.50")  # ST 5%
+    # 反之显式 is_st=False 即便 name 含 ST 字样也按 10%。
+    row2 = make_selected_row(ts_code="600036.SH", signal_close=Decimal("10.00"))
+    row2.name = "ST华微"
+    row2.is_st = False
+    assert budget_prices(row2).limit_up_price == Decimal("11.00")  # 非 ST 10%
