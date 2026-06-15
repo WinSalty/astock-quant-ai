@@ -98,6 +98,10 @@ class EntryRouter:
         self._position_sizer = position_sizer
         # 已产出有效 BUY 的 ts_code 集合（幂等：同票不再重复路由，§4.2 末）。
         self._decided: Set[str] = set()
+        # 上次留痕的 action（按 ts_code）：竞价段每秒一帧、且 SKIP/竞价择时关-release 的票每帧重路由，
+        # 若每帧都 _record 会让 decision_log 对同一票同一决策重复写数百行、污染闭环归因（复审 P2-2）。
+        # 仅当某票的决策 action 相对上一帧【发生变化】时才留痕，去抖重复帧。
+        self._last_recorded_action: Dict[str, EntryAction] = {}
 
     # ------------------------------------------------------------------
     # 对外入口
@@ -122,6 +126,16 @@ class EntryRouter:
         if decision.action != EntryAction.SKIP:
             self._decided.add(plan.ts_code)
         return decision
+
+    def release(self, ts_code: str) -> None:
+        """解除某票的幂等锁（评审二轮 P1#16）。
+
+        背景：竞价择时默认关时，竞价段(AUCTION)产出的 BUY 决策被编排层「只采集不下单」整类丢弃，但此票已被
+        on_auction_snapshot 锁进 _decided → 后续帧（尤其定盘段 SETTLED）不再路由 → 最强龙头(秒封一字/竞价强开)
+        在默认生产配置下永远买不进。编排层在「丢弃竞价决策」后调用本方法解锁，使后续帧能重新评估为 OPENING
+        决策（定盘/开盘后追）真正成交。
+        """
+        self._decided.discard(ts_code)
 
     def route(self, plan: PlanRow, snap: AuctionSnapshot) -> Optional[EntryDecision]:
         """路由主逻辑（§4.8）：先闸门 _should_skip，否则按 (family, setup) 选策略得决策。
@@ -242,7 +256,10 @@ class EntryRouter:
         # —— 打板 / 半路族：竞价定方向（首板 / 竞价）走竞价强开追，连板接力 / 半路走打板跟买。——
         # 受控词表（不含裸「板」）：打板 / 连板 / 半路。
         if ("打板" in hay) or ("连板" in hay) or ("半路" in hay):
-            if "竞价" in setup or "首板" in setup:
+            # 竞价强开追(挂竞价单)仅适用【打板/连板族】的竞价定方向(首板/竞价)；半路族(BANLU)的「首板半路」
+            # 不应被误路由到竞价强开追挂竞价单(评审二轮 P2#43：超出半路战法语义)，半路一律走盘中打板跟买。
+            is_daban = ("打板" in family) or ("打板" in setup) or ("连板" in hay)
+            if is_daban and ("竞价" in setup or "首板" in setup):
                 return EntryAction.CHASE_AUCTION_STRONG
             # 连板接力 / 半路 / 其余打板形态 → 打板跟买。
             return EntryAction.CHASE_LIMIT_UP
@@ -314,7 +331,12 @@ class EntryRouter:
 
         decision_log 提供则 append（供闭环归因「为何买 / 弃」事实源）；
         无论是否有 decision_log，都写一条结构化日志（不写敏感信息）。
+        去抖（复审 P2-2）：同一票相对上一帧 action 未变（如竞价段连续多帧同为 SKIP / 同一 BUY 被反复
+        release 重路由）→ 不重复留痕，避免 decision_log 对同一决策写入数百行污染归因；action 变化才记。
         """
+        if self._last_recorded_action.get(decision.ts_code) == decision.action:
+            return
+        self._last_recorded_action[decision.ts_code] = decision.action
         if self._decision_log is not None:
             self._decision_log.append(decision)
         # 日志事件：BUY 与 SKIP 分流，便于检索「未下单 N−M」口径。

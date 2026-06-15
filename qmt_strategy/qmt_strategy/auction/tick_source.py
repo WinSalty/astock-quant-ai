@@ -22,6 +22,27 @@ class XtdataTickSource:
     def __init__(self, xtdata: XtDataLike):
         # 注入 xtdata 接口（真实 xtquant 模块对象或其包装），本类不直接 import xtquant。
         self._xtdata = xtdata
+        # 已订阅 code 集合（评审二轮 P2#44）：get_full_tick 前须先 subscribe_quote，否则可能取不到 / 取到陈旧
+        # tick；按 code 首次取数前订阅一次（幂等），避免重复订阅。
+        self._subscribed: set = set()
+
+    def _ensure_subscribed(self, codes: List[str]) -> None:
+        """对未订阅的 code 调用 xtdata.subscribe_quote 订阅行情（评审二轮 P2#44）。
+
+        订阅失败不阻断取数（仅跳过该 code 的订阅记录，下次再试）：真实取数失败会由 get_full_tick 归一为
+        TickSourceError 走降级。xtdata 无 subscribe_quote（旧版本 / fake）→ 整体跳过，不影响既有行为。
+        """
+        sub = getattr(self._xtdata, "subscribe_quote", None)
+        if not callable(sub):
+            return
+        for code in codes:
+            if code in self._subscribed:
+                continue
+            try:
+                sub(code, "tick")
+                self._subscribed.add(code)
+            except Exception:  # noqa: BLE001 订阅失败不阻断，取数失败再走降级
+                pass
 
     def get_full_tick(self, codes: List[str]) -> Dict[str, dict]:
         """批量取全推 tick；任何底层异常转 TickSourceError 抛出（§3.8）。
@@ -29,6 +50,8 @@ class XtdataTickSource:
         业务意图：竞价段需对失败统一降级，故在此把 xtdata 可能抛的各类异常
         （网络 / 行情未就绪 / KeyError 等）归一为 TickSourceError，由 poller 主循环捕获走降级 B。
         """
+        # 取数前确保已订阅（评审二轮 P2#44）：xtdata.get_full_tick 依赖先 subscribe_quote。
+        self._ensure_subscribed(codes)
         try:
             result = self._xtdata.get_full_tick(codes)
         except Exception as exc:  # noqa: BLE001 - 故意宽捕获后归一为领域异常

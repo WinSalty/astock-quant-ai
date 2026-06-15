@@ -20,6 +20,7 @@ from .base import (
     EntryStrategy,
     StrategyOutcome,
     is_auction_degraded,
+    order_phase_for,
     prior_gate_reason,
     register,
     resolve_thresholds,
@@ -141,5 +142,7 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
                 f"CHASE_AUCTION_STRONG买:强开越竞越强 open_pct={op}≥overheat={thr.overheat_pct} "
                 f"vol_ratio={ratio} centroid_trend=UP 竞价价={limit}"
             ),
-            order_phase=OrderPhase.AUCTION,
+            # 下单时段按 phase 判定（评审二轮 P1#17）：定盘前→AUCTION 竞价单；定盘段(9:25–9:30)→OPENING 开盘后单，
+            # 避免在定盘段挂出 TTL 立即过期的竞价废单。
+            order_phase=order_phase_for(snap),
         )

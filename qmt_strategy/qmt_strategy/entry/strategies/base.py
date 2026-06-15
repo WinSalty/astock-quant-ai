@@ -22,8 +22,25 @@ from decimal import Decimal
 from typing import Callable, Dict, Optional, Type
 
 from ...config.settings import Settings
-from ...contracts.enums import CentroidTrend, EntryAction, OrderPhase
+from ...contracts.enums import AuctionPhase, CentroidTrend, EntryAction, OrderPhase
 from ...contracts.models import AuctionSnapshot, PlanRow
+
+# 竞价单时段（定盘前可挂竞价单）：< 9:25。定盘/盘中(>=9:25)一律走 OPENING 开盘后单。
+_AUCTION_ORDER_PHASES = (
+    AuctionPhase.PRE_AUCTION,
+    AuctionPhase.AUCTION_CANCELABLE,
+    AuctionPhase.AUCTION_LOCKED,
+)
+
+
+def order_phase_for(snap: AuctionSnapshot) -> OrderPhase:
+    """按快照所处时段判定下单时段（评审二轮 P1#17）。
+
+    定盘前(<9:25, PRE/CANCELABLE/LOCKED)→AUCTION 竞价单；定盘及以后(>=9:25, SETTLED/CLOSED)→OPENING 开盘后单。
+    原 chase_auction_strong 买分支硬编码 order_phase=AUCTION：在定盘段(9:25–9:30)仍按竞价单提交，
+    其 TTL 立即过期(竞价单 TTL 截止=9:25)→下单即被撤的废单 + 白占配额；改用本函数按时段动态判定。
+    """
+    return OrderPhase.AUCTION if snap.phase in _AUCTION_ORDER_PHASES else OrderPhase.OPENING
 
 # 竞价整体不可得（降级 B）的 data_quality 标记码。
 # 口径与 auction.auction_factors.DQ_NO_TICK 一致（值 "NO_TICK"）：整帧 tick 缺失即降级 B。

@@ -262,13 +262,15 @@ def test_sync_order_failure_marks_error_not_missing():
 def test_sweep_expired_drives_ttl_cancel():
     trader = _FakeTrader(order_id=100)
     ledger = InMemoryLocalLedger()
-    clock = FakeClock(utc_at_east8(T_BUY, 9, 16))   # 可撤段
+    # 开盘后下 OPENING 单（评审二轮 P1#16/#17：开盘前下的 OPENING 单 TTL 从 9:30 起算、不会盘前过期，
+    # 故用开盘后 9:35 验证常规 TTL 撤单链路）。
+    clock = FakeClock(utc_at_east8(T_BUY, 9, 35))
     ex = _executor(trader, clock, ledger=ledger)
     biz = ex.place(_decision(order_phase=OrderPhase.OPENING, plan_volume=1000))
     led = ledger.get(biz)
     ledger.sync_status(led.order_id, OrderState.REPORTED)   # 已报、未成
-    # 推进到 TTL 截止之后（默认 order_ttl_seconds=60），仍在可撤段（9:17）。
-    clock.set(utc_at_east8(T_BUY, 9, 17, 30))
+    # 推进到 TTL 截止之后（默认 order_ttl_seconds=60）：9:36:30 > 9:35+60s。
+    clock.set(utc_at_east8(T_BUY, 9, 36, 30))
     handled = ex.sweep_expired()
     assert biz in handled
     assert trader.cancel_calls == [led.order_id]    # TTL 到期被撤

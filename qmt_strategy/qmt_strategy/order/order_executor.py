@@ -432,7 +432,10 @@ class OrderExecutor:
         self._sync_persist_before_order()
 
         # —— TTL 截止：竞价单到 9:25 定盘；开盘单 now + order_ttl_seconds（§4.4(3)）——
-        self._ttl_deadline[biz_no] = self._compute_ttl_deadline(now, decision.order_phase)
+        # 买入开盘单 extend_to_open=True（评审复审 P2-3）：开盘前下的买单 TTL 顺延至开盘起算；卖单不顺延。
+        self._ttl_deadline[biz_no] = self._compute_ttl_deadline(
+            now, decision.order_phase, extend_to_open=True
+        )
         # 保留原决策句柄：供 on_ttl_expired 判定 miss_reason 与转次优（§4.4(7)）。
         self._decision_by_biz[biz_no] = decision
 
@@ -640,19 +643,31 @@ class OrderExecutor:
         lots = int(raw_shares) // _BOARD_LOT
         return lots * _BOARD_LOT
 
-    def _compute_ttl_deadline(self, now: datetime, order_phase: OrderPhase) -> datetime:
+    def _compute_ttl_deadline(
+        self, now: datetime, order_phase: OrderPhase, *, extend_to_open: bool = False
+    ) -> datetime:
         """计算 TTL 截止时刻（UTC naive）。
 
         竞价单（AUCTION）：存活到 9:25 定盘（东八区），不用相对秒数。
         开盘单（OPENING）：now + settings.order_ttl_seconds。
         实现：竞价单先在东八区把当日 9:25 拼好，再回到「相对 now 的偏移」以保持 UTC naive 口径。
+
+        extend_to_open（仅【买入】开盘单，评审二轮 P1#16/#17 + 复审 P2-3）：开盘前(<9:30)下的买入 OPENING 单
+        TTL 从 9:30 开盘起算，保证存活到开盘成交而非开盘前(连续竞价未开)就过期被撤成废单。卖单不传此参数
+        （extend_to_open=False）——卖单需独立 TTL 以便挂不到价尽快撤改重挂(#12)，绝不可顺延到开盘后才撤。
         """
         if order_phase == OrderPhase.AUCTION:
             east8_now = east8_now_from_utc(now)
             east8_925 = east8_now.replace(hour=9, minute=25, second=0, microsecond=0)
             # 截止偏移 = 东八区(9:25 - now)，加到 UTC naive 的 now 上（不手工 ±8h，仅取差值）。
             return now + (east8_925 - east8_now)
-        return now + timedelta(seconds=self._settings.order_ttl_seconds)
+        base = now
+        if extend_to_open:
+            east8_now = east8_now_from_utc(now)
+            east8_open = east8_now.replace(hour=9, minute=30, second=0, microsecond=0)
+            if east8_now < east8_open:
+                base = now + (east8_open - east8_now)  # 推到开盘时刻再加 TTL（仅买单）
+        return base + timedelta(seconds=self._settings.order_ttl_seconds)
 
     # ------------------------------------------------------------------
     # TTL 到期处理（§4.5 ttl 到期 / §4.4(7)）

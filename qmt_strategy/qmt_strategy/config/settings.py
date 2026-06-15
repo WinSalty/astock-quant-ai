@@ -97,6 +97,12 @@ class Settings:
     auction_lowbuy_pct_high: Optional[Decimal] = None  # QMT_AUCTION_LOWBUY_PCT_HIGH
     auction_overheat_pct: Optional[Decimal] = None   # QMT_AUCTION_OVERHEAT_PCT：超该幅度警惕
     leader_strength_min: Optional[Decimal] = None    # QMT_LEADER_STRENGTH_MIN：龙头强度分下限
+    # 打板跟买的封流比下限（评审二轮 P2#41 + 复审 P2-1）：封流比(封单额/流通市值)有值且低于此值视为封单不稳→弃。
+    # 原硬编码 0.0 使该护栏恒不触发(对任何顶板无条件跟买)，现改为【可配置】。
+    # 默认 0（关闭）：执行侧 seal_to_float_ratio 依赖 bidVol 的"手/股"量纲(auction_factors.virtual_seal)，
+    # 在目标机实测确认 bidVol 量纲(是否需 ×100)并据此标定阈值前，不默认激活——避免量纲偏差把真实强板误杀在
+    # 真金买入路径上。实测确认后用 QMT_SEAL_RATIO_MIN 配一个正阈值(如 0.005)启用本护栏。
+    seal_ratio_min: Decimal = Decimal("0")            # QMT_SEAL_RATIO_MIN
     strategy_enabled: dict = field(default_factory=dict)  # QMT_STRATEGY_<NAME>_ENABLED 汇总
 
     # —— 7.1.5 风控阈值（执行侧硬约束，下单前生效）——
@@ -192,6 +198,10 @@ class Settings:
             auction_lowbuy_pct_high=_as_decimal(g("QMT_AUCTION_LOWBUY_PCT_HIGH")),
             auction_overheat_pct=_as_decimal(g("QMT_AUCTION_OVERHEAT_PCT")),
             leader_strength_min=_as_decimal(g("QMT_LEADER_STRENGTH_MIN")),
+            # 用 is-not-None 守卫（复审 P1-1）：配 0 是"显式关闭"，不能被 `or 默认` 当假值覆盖（安全阀须能关）。
+            seal_ratio_min=(
+                _v if (_v := _as_decimal(g("QMT_SEAL_RATIO_MIN"))) is not None else Decimal("0")
+            ),
             strategy_enabled=strat,
             max_position_per_stock=_as_decimal(g("QMT_MAX_POSITION_PER_STOCK")),
             max_total_exposure=_as_decimal(g("QMT_MAX_TOTAL_EXPOSURE")),

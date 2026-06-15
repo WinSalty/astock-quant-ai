@@ -164,6 +164,14 @@ class WatchlistPrefetcher:
             )
             return 0
 
+        # 供数降级感知（评审二轮 P2#58）：信号侧导出若有坏行被跳过(skipped_count>0)，可能漏掉可交易标的，
+        # 这里强告警，使盘前装载不在"无声漏标的"下进行（运维可据此排查脏数据）。
+        skipped = (resp or {}).get("skipped_count") or 0
+        if skipped:
+            self._logger.warn(
+                "watchlist_prefetch_rows_skipped",
+                today=str(today), signal_date=str(signal_t), skipped=skipped,
+            )
         items = (resp or {}).get("items") or []
         rows: List[SelectedStockRow] = []
         for it in items:

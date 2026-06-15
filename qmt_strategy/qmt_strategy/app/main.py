@@ -203,6 +203,8 @@ class Engine:
         self._day_open_equity_date: Optional[date] = None
         # 对账未通过阻断开仓标志（评审二轮 P1#9）：prewarm 从持久标志读入；True 则今日只守仓不开新仓。
         self._reconcile_blocked = False
+        # 竞价择时关时"仅采集"留痕去抖集合（复审 P2-2）：同一票每帧重复采集会洪泛日志，每票每日只留痕一次。
+        self._auction_collect_logged: set = set()
 
     # ------------------------------------------------------------------
     # 对外暴露（供 main / 连接守护注册回调 / 调度）
@@ -277,6 +279,7 @@ class Engine:
         # 每个交易日开盘前重置行情通道健康为 True（评审二轮 P1#15）：新一天默认行情可用，盘中由竞价轮询/
         # 盘口源在断流时置 False；避免前一日末轮的 False 状态跨日残留，导致开盘即全程冻结。
         self._market_feed_ok = True
+        self._auction_collect_logged.clear()  # 新交易日重置竞价采集去抖集合（复审 P2-2）
         # 对账阻断标记（评审二轮 P1#9）：上一交易日对账未通过且未人工清除 → 今日只守仓不开新仓。
         self._reconcile_blocked = self._read_reconcile_block()
         if self._reconcile_blocked:
@@ -671,18 +674,24 @@ class Engine:
             return
         # 竞价择时闸门：竞价单仅在实测开关打开时下单，否则只采集留痕（§7.1.6）。
         if decision.order_phase == OrderPhase.AUCTION and not self._settings.auction_timing_enabled:
-            self._logger.info(
-                "engine_auction_timing_disabled_collect_only",
-                ts_code=decision.ts_code,
-                reason="QMT_AUCTION_TIMING_ENABLED=false",
-            )
-            self._emit_decision(
-                decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
-                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
-                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
-                order_phase=decision.order_phase, reason="竞价择时未开,仅采集", reason_code="auction_timing_disabled",
-                factors=decision.factors_snapshot,
-            )
+            # 去抖（复审 P2-2）：同一票每帧重复采集会洪泛日志/decision_log，每票每日只留痕一次。
+            if decision.ts_code not in self._auction_collect_logged:
+                self._auction_collect_logged.add(decision.ts_code)
+                self._logger.info(
+                    "engine_auction_timing_disabled_collect_only",
+                    ts_code=decision.ts_code,
+                    reason="QMT_AUCTION_TIMING_ENABLED=false",
+                )
+                self._emit_decision(
+                    decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
+                    ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                    trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                    order_phase=decision.order_phase, reason="竞价择时未开,仅采集", reason_code="auction_timing_disabled",
+                    factors=decision.factors_snapshot,
+                )
+            # 解除幂等锁（评审二轮 P1#16）：竞价段决策被丢弃后允许后续帧（定盘段）重评为 OPENING 真正成交，
+            # 否则最强龙头(秒封一字/竞价强开)在默认配置下被永久锁死买不进。
+            self._entry.release(decision.ts_code)
             return
         # 限价合法性 / 偏离防护（评审二轮 P2#67）：下单前校验限价非正/超法定涨停价/偏离盘口过大则拒发，
         # 防价位口径错误（如 ST 误算成 10%、参考价兜底错位）直发废单或追高失控。
