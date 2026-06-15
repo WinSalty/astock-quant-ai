@@ -373,3 +373,159 @@ FIRST_BOARD(题材发酵·JSON)
 本文与信号侧 `resources/doc/limit-up-*` 设计/改造文档不重复：那些记录的是**已落地**的多阶段改造、KPL 口径、情绪周期、F3 竞价分母等；本文聚焦**尚未做的**资金维补强、提示词正向化、分位/闸门/缓存/契约的增量优化。`llm-tushare-on-demand-stock-data-plan.md` 已证明「按需补数编排器 + `a_moneyflow` 表」基建成熟——故资金主线是「接线/扩消费面」而非从零搭建。
 
 > 本文为处理中的分析/方案文档，落地推进后按本仓库文档分类规则整体移入归档目录。
+
+---
+
+## 11 · 落地取舍结论（可以做 / 没必要）—— 基于真实代码复核
+
+### 11.0 方法说明
+
+本结论基于通读真实代码（`limit_up_push_service.py` / `limit_up_leader_scoring_service.py` / `limit_up_backtest_service.py` / `db/models/notification.py` / `schemas/limit_up_watchlist.py` / `core/config.py` 等，含近期阶段 C/D/E 修复）+ 对抗式 triage 复核，回答「哪些可做、哪些没必要」。关键阶段背景须先记牢：① **实盘执行侧（miniQMT）未对接，无 `qmt_*` 回流闭环、无隔日真实标签**，凡需「真实频率校准 / 单调约束权重回归」的事都做不了，只能落结构占位；② **执行侧单日只按 `leader_strength_score` 取 top-5**（`QMT_MAX_POSITIONS_PER_DAY` 默认 5），当前三层精选合计 35 只里绝大多数被 top-5 截断后是陪跑/噪声——因此**「改的是确定性打分排序（直接改变 top-5 构成）」的项才有真价值，「只喂 LLM 散文叙事」的项普遍被 top-5 截断稀释、价值打折**。③ 全程恪守信号侧硬约束：**只下发只读因子，不出仓位、不出买卖价、不出止损**；凡涉及越界的判定在下文明确点出（见 §5.6）。
+
+---
+
+### 11.1 ✅ 建议做（高 ROI / 零成本 / 修明确 bug）
+
+- **§4.5（=§3.1.5，复核改判合并）** PARSE_FALLBACK 写缓存补 `failed=True` —— 现 PARSE_FALLBACK 兜底以 `READY` 写缓存（`:2557` 未传 `failed=True`），与 error 分支 / `_run_text_stage` 不对称，导致一次 LLM 解析抖动产生的「极低先验」被同 `input_hash` 重跑长期复用、污染 watchlist。本文件一处改即修，零依赖。**（复核改判：§3.1.5 与 §4.5 实为同一行修复，合并为单条 P0，避免重复排期）。** 前置/依赖：无。
+- **§6.2** 补「高辨识度」命中分支 + 否定前缀短路 + 契约漂移单测 —— HIGH_BOARD selection prompt 下发 `leader_role∈{空间板/题材龙头/高辨识度}`，但打分消费侧关键词集仅 `{龙头,空间板,前排,跟风,卡位,助攻,补涨}`，**「高辨识度」是孤儿 token，静默退中性 0.5/STRAGGLER**——最该给高分的高连板标的反被压成中性。直接改 recognition 子分与角色判定 → 改强度排序 → 改 top-5 构成，**不被 top-5 截断稀释**。未被阶段 C/D/E 触碰。前置/依赖：无。
+- **§5.6** 清除合成/建议 prompt 越界诱导 —— 本批最强真问题（合规红线）：`_investment_advice_prompt` 正文确含「整体仓位态度」「合理低吸区间、过高开警惕点」「失败/止损条件」，**直接违反信号侧不出仓位/买卖价/止损硬约束**。改 prompt 文案：仓位态度→进攻/防守倾向（不含比例）、低吸区间质性化、止损→失效条件（用竞价相对强弱、不落绝对价格）、加禁越界纪律句、FINAL 表列固定为 `_stocks_for_final_prompt` 实有字段（禁加不在输入里的龙虎榜净买）。零数据依赖。前置/依赖：无。
+- **§4.2** 空仓闸门 `resolve_gate` 前移至 LLM 之前 + 注入 `market_state`/`gate_reasons` 进 context/prompt + 落表复用同一 gate 对象 —— 现 `resolve_gate` 仅在落表期（`:571`）调一次、在 LLM 全 pipeline（`:401`）之后，LLM 全程拿不到 `market_state`，致**报告正文叙事 ↔ watchlist 行级动作两套口径冲突**。前移不引入前视（`market_emotion` 在 `_assemble_context` 已算好，T 日盘后量）。市场级闸门，不被 top-5 截断。前置/依赖：无（本条是 §5.5 的前置上游）。
+- **§3.2（龙虎榜三列）** `dragon_tiger_flag` / `lhb_net_amount` / `lhb_net_rate` 零成本只读列入 watchlist —— `top_list` 已每日单批抓、`top_by_code` 索引已建，纯落表 join 加列。零新增抓取、零前视、零越权。前置/依赖：新列可空 + bump `WATCHLIST_SCHEMA_VERSION→1.1.0`，命名须与 §3.1 `main_net_amount`（分单结构净额）严格区分（lhb 是龙虎榜成交净买元口径），`dragon_tiger_flag` 缺测按「缺测≠资金弱」不置 0。`main_net_inflow/elg_net_ratio` 来自 moneyflow，不在本条，随 §3.1 同批落。
+- **§4.7** 三层精选上限砍半（chain 20→10、high 10→5、合计 35→约 17-18）—— 纯 env 配置、零代码零迁移；当前 35 只里绝大多数被 top-5 截断后是陪跑/噪声，收紧主战场直接见效并顺带降逐股 `cyq` 调用量。与 §4.1 全池分位无冲突。前置/依赖：建议灰度 N 期对照 watchlist 命中率/回测 `leader_strength_ic` 再固化，强势日配合 `leader_strength_score` 阈值而非纯数量截断（避免误删强龙头）。
+- **§5.1** 把「可引用字段白名单」正向写进 prompt（按阶段分写）—— 纯文案、零数据依赖，降「封板较强、资金活跃」类无锚空泛结论。**铁律：白名单按阶段分写，资金字段（net_amount/net_rate）只进 chain/high selection prompt，绝不放进共享 FOCUS 契约和首板 prompt**，否则点名输入里不存在的字段反致编造。前置/依赖：落地前对每阶段 `stage_input` 实际 key 集合加断言，防重构后失配。
+- **§5.4（prompt 文案版）** 可成交性/一字板提示 —— `_tradable_flag` 在打分层已确定性判一字/秒封产 WATCH，但全部 FOCUS/建议 prompt 零引用，叙事可能把一字板当强势重点推荐，与 watchlist `tradable_flag=WATCH` 自相矛盾，读者看不到「买不进」关键风险。叙事护栏，与 top-5 不冲突。**铁律：仅当 `open_times==0` 且 `first_limit_time` 在开盘 30 秒内才标一字；`open_times/first_limit_time` 缺失（None）不臆断、按普通强封处理。** 前置/依赖：无（P2 的把 `tradable_flag` 注入 FINAL/ADVICE 叙事的时序版依赖 §4.2 打分前移，归暂缓）。
+- **§5.2** 把打分层已固化经验阈值搬运进选股 prompt —— 纯文案对齐，只搬代码确有常量（5%-25% 健康换手、`upper_chip_pressure` ≤25/25-45/>45）。**铁律：首封时间/开板次数保留定性表述，严禁伪造「30 秒」「≥3 次判弱」这类代码里不存在的精确分桶；全段标注「经验参照非硬规则」。** 前置/依赖：无。
+- **§3.6（红线文档治理）** 把五条不接入红线 + 「单一资金口径」硬约束写入数据接入口径文档 —— 零代码、纯文档治理，防后续迭代重复提接入、防误把多口径资金并行入分位分布。前置/依赖：无。
+
+> 优先级速记（本组内）：**P0** = §4.5、§6.2、§5.6、§4.2；**P1** = §3.2、§4.7、§5.1、§5.4(文案版)；**P2** = §5.2、§3.6(文档)。
+
+---
+
+### 11.2 🟡 有条件做（需先满足前置闸门）
+
+- **§3.1** moneyflow 全市场接入 + 改 `_money_subscore` 消费真实主力净额（资金维进分直接改 top-5 构成，**不被截断稀释**，有真价值；改的是盘前排序分位与 LLM 上下文，不依赖实盘回流）。**前置闸门：① 一次性脚本验证 moneyflow 在当前积分档支持 `trade_date-only` 全市场放行（daily_basic 与 5 个 OPTIONAL_APIS 已证同档可行，属高确定性但非零——不同接口积分门槛可不同，需单独确认）；② 涨停/入选池 moneyflow 覆盖率抽样达标；③ 单位口径固化（见下条，强制内嵌前置）；④ 归一化（净额/流通市值或截面分位）+ 缺测中性（imputed 不当 0）；⑤ 改 `_money_subscore` 须 bump `scoring_version` 并与回测同批迁移。**
+- **单位口径**（§3.1 的强制内嵌前置纪律，非独立任务）moneyflow 万元 / `daily.amount` 千元 / `circ_mv` 万元，跨单位算净占比须统一换算到「元」+ 加 `|净占比|>1` 上界置缺保护。**现成范式可直接套用**：封流比 `free_float` 缺失时回退 `circ_mv_wan×Decimal('10000')` + `seal_ratio>100%` 置缺告警（`:1984-1995`）。当前无单位 bug（`daily.amount` 仅用于比值，单位自抵消）。依赖：§3.1（本条是其落地约束，不单独立项）。
+- **§4.3** `_capital_signals` 改 left-join 增强 + 注入 moneyflow 主力净额 + 首板补 `capital_signals` 键（现 `if not top: continue` 纯 inner-join 丢弃全部非 LHB 涨停股；只改喂 LLM 上下文、不进六维分，被 top-5 截断稀释）。**前置：硬依赖 §3.1 全市场 moneyflow 批量管线先打通**（否则 left-join 也无主力净额可填），`lhb_net_amount` 与 `main_net_amount` 命名严格区分，缺测按「资金不明中性」。
+- **§5.3** 资金信号档加字段措辞 + 「缺测≠资金弱」纪律 —— 可拆两半：**①** chain/high prompt 引用 `capital_signals.net_amount/net_rate` + 缺测中性纪律 = 零数据依赖当下可做（但因 `_capital_signals` 仍 LHB inner-join，短期多为「无数据可引用」，收益受龙虎榜稀疏性拖累）；**②** 首板也收资金 / 改 moneyflow 为主 = 硬依赖 §3.1+§4.3。属 LLM 散文护栏、不进 top-5 打分。
+- **§5.5** 周期约束写成可执行降级规则（复用已 resolve 的 gate 结论注入 prompt，不另立阈值）—— 文案本身 easy 且 high value。**硬前置：必须先做 §4.2 把 `resolve_gate` 前移、resolve 一次并把 `market_state/sentiment_cycle` 缓存进 `context['market_context']`**，否则 prompt 无权威闸门结论可引用、直接写阈值会与 `sentiment_gate` 分叉。
+- **§3.3** `hm_detail/hm_list` 游资席位接入 —— 一期注入 SELECTION/FOCUS 辨识度上下文喂 LLM 可做，二期进 `_recognition_subscore`（权重仅 0.10 且子分为占位）须回测确认 lift、当前无标签做不了。剔 `top_inst` 正确、无动作。**前置：① 一次性脚本验证 `hm_detail` 当前积分档全市场放行（与 moneyflow 同属未验证宽接口）；② 人工席位字典播种并标 imputed/季度复核（长期维护成本是主要 ROI 拖累）。**
+- **§3.4** `moneyflow_ind_dc` 板块资金 + KPL 题材↔东财板块名映射 —— 只喂 FIRST_BOARD 题材发酵叙事、不进打分。**前置硬闸门：先离线统计 KPL theme 与东财板块名精确+别名映射命中率（go/no-go），达标才上提示词；未命中题材严格标 `sector_flow_unmatched` 不赋值/不惩罚（绝不把未匹配当净流出）；只接东财 `_dc` 单口径，禁并行 `_ths/_cnt`。** 映射表长期维护成本是主要 ROI 拖累。
+- **§6.1** 概率档位映射 tier 分层骨架 + `calibration_version` + 列注释澄清「离散代表值≠连续校准概率」+ 首板系统性下调一档 —— 现 `_PROB_BAND_TO_DECIMAL` 单套硬映射、4 个离散值塞进 `DECIMAL(5,4)` 列。**骨架部分纯结构、零数据依赖、当前即改善首板高估，按 §6.4① 口径属可立即落（复核：骨架子项优先级对齐到「即落」）；真实频率回填须等隔日标签 + 闭环归因物化表，暂缓。** 有条件指必须同批 bump 元数据、不留裸值。依赖：真实校准依赖 §6.4 子分落库 + 实盘 `qmt_*` 回流。
+- **§6.3** `data_confidence` 只读列 + 聚合层缺测剔除归一 —— 拆两半：**①** `data_confidence`（非 imputed 权重占比）纯描述性只读列、不越权、零依赖、立即可落；**②** `_aggregate_linear` 缺测维从分子分母同时剔除 + 按有效维等比放大 + 最低有效维阈值，须 bump `scoring_version` 与回测同批迁移，且**先用 `data_confidence` 分桶在回测验证「剔除归一 vs 0.5 兜底」真实增益**（不显著则只留列不动聚合）。依赖：聚合改造依赖 §6.4① 子分落库。
+- **§6.4** 子分随回测落库（**子项 P0**）+ `WEIGHTS_REGISTRY` 护栏 + height/position 解耦（可先做结构）+ 真实 `WEIGHTS_V2` 回归（暂缓）—— `WEIGHTS_V1` 自承占位 TBD；`_height_subscore` 正权与 `_position_safety_subscore` 负向用同一 `height_ratio`，**同一高度既奖励又惩罚（重复建模），回归前会互相抵消**；回测 base dict 只取综合分、不读 `strength_dim_json`，**单维归因不可行**。子分落库纯数据搬运、零实盘依赖，是后续一切单维归因/校准的前置闸门。真实 `WEIGHTS_V2` 带单调约束的数值回归依赖次日续板/隔日溢价标签 + 实盘回流闭环，当前样本不足、只能落 `calibrated=false` 占位 → 暂缓。
+
+---
+
+### 11.3 ⏸️ 暂缓 / 待闭环（现在做没必要）
+
+- **§3.5** `moneyflow_mkt_dc` 大盘资金 / `moneyflow_hsgt` 北向 —— 纯 LLM 情绪叙事佐证、无确定性消费链、增益未经回测，当前 ROI 低。须近 5 日窗口单独请求（不能塞进单日 OPTIONAL_APIS 循环）。结构可先在 `_emotion_cycle_metrics` 返回体留 `market_net_amount` 占位。**等什么：观察期 N 期人工对照评估真实增益。**
+- **§4.4** `_theme_summary` 题材排序加资金维 —— P1 免费档（透传 top_list 求和 `theme_lhb_net_amount`）被龙虎榜稀疏性拖累（§4.3 inner-join 后常空，join 覆盖率低），且题材已有 `cpt` 衍生维（days/cons_nums/rank/top_stock）兜底，边际价值低；题材是上下文维度、不进六维打分、被 top-5 截断。**等什么：§3.4 `moneyflow_ind_dc` 管线就绪后连同 `theme_main_net_amount` 一起评估，不单独先做 lhb 代理。**
+- **§4.6** `_board_level` 正则失败用 `limit_list_d.limit_times` 结构化兜底 + unrecognized 占比告警 —— 缺口真实（纯正则 `return 0`、`limit_times` 已取未用），但 `limit_times` 未按 `ts_code` merge 进 kpl/compact 行，兜底**非「读 row 现有字段」即可、需先建跨表 join**（非零代码）；只救 KPL status 文案漂移的边缘股、主路径多数可解析。**等什么：挂在 §4.3/§4.4 把 `limit_list_d` 已 merge 之后顺带做，不单独先建 join。**
+- **§5.4（时序注入版）** 把已算 `tradable_flag` 注入 FINAL/ADVICE 输入根除两轨不一致 —— 须调 `score_stocks` 时序（当前落表期 `:571` 才算），成本更高。**等什么：§4.2 打分/闸门前移。**
+- **§3.3 二期 / §6.1 真实校准 / §6.3 聚合改造 / §6.4③ WEIGHTS_V2** 凡需真实隔日标签的子项 —— **等什么：实盘 `qmt_*` 回流闭环样本 + 回测正收益标签管线（执行侧 miniQMT 未到位）。**
+
+---
+
+### 11.4 ❌ 没必要 / 不做（缺口不存在 / 已修复 / ROI 太低 / 越界 / 被 top-5 截断）
+
+- **§4.1** 分位池用全涨停池构建 —— **已被阶段 C/D/E 修复落地**：`score_stocks` 已加 `context_rows` 参数（两参数解耦，全池构建分位、入选票打分），`push_service:603` `full_pool=context.get('limit_up_stocks') or [...]`、`:607 context_rows=full_pool`，且 `:601-602` 已把「读 `pipeline.get(limit_up_stocks)` 恒 None 静默回退入选子集」改为读顶层 context。**报告把它列 P0#2 的乐观假设已被现状推翻，无需再开发，只做回归确认**（断言 `context['limit_up_stocks']` 生产路径非空，避免 `or` 兜底退化）。
+- **§3.6 `stk_auction` 集合竞价接入** —— 竞价择时是执行侧领域，接入即**前视（T+1 当天数据）+ 越权（违反信号侧只下只读因子）**，现状已合规（watchlist 只下 `float_mktcap`+`first_board_vol` 两个分母，比值计算留执行侧），零动作。
+- **§3.6 `dc_hot` / `ths_hot` 散户人气榜** —— 散户人气是噪声逆向指标，与龙头强度负相关/无关，硬加只稀释区分度，列为红线、保持不接入。
+- **§3.6 `top_inst` 机构席位** —— 打板主战场是游资接力，机构席位身份在该语境逆向/噪声，`recognition` 权重仅 0.10 且子分占位，过拟合风险高，不接入（与 §3.3 剔 `top_inst` 一致）。
+- **§3.6 `moneyflow_dc` / `moneyflow_ths` 并行接入** —— 与原生 moneyflow 三套 `net` 口径不可互换，并行入同一截面分位分布会污染 money 子分，**硬约束「任一时刻只允许单一资金口径」**；§3.1 只走原生单口径，并行=负收益。
+- **§3.6 `kpl_concept` 接入** —— 与已用 `limit_cpt_list`（rank/cons_nums/up_nums/top_stock 衍生维）信息高度重叠、无新增确定性消费者，长期维护成本换边际重复信息，不做。
+- **§7 三套档位正交分列（角色 ROLE_* / 战法族 _STRATEGY_CN / 操作档 ACTION_*）** —— 三套枚举已正交分列、各落独立列（role_tags/strategy_family/action）、语义不混用，属现状确认型、**无缺口可改**（角色英文 enum 化是另一条 §6.2 P1，须 bump version、价值边际，归暂缓）。
+
+---
+
+### 11.5 总表（覆盖全部条目）
+
+| 章节 | 建议 | 判定 | 优先级 | 一句话理由 | 前置/依赖 |
+|---|---|---|---|---|---|
+| §4.5（=§3.1.5） | PARSE_FALLBACK 补 `failed=True` | ✅ 做 | P0 | 防极低先验被 READY 缓存固化污染 watchlist；一行修复（复核合并去重） | 无 |
+| §6.2 | 补「高辨识度」命中+否定短路+契约单测 | ✅ 做 | P0 | 孤儿 token 致高连板被压中性；直接改 top-5 构成、不被截断 | 无 |
+| §5.6 | 清除越界诱导（仓位/低吸/止损） | ✅ 做 | P0 | 合规红线，prompt 主动诱导越界硬违约；纯文案 | 无 |
+| §4.2 | `resolve_gate` 前移 + 注入 market_state | ✅ 做 | P0 | 消除报告↔watchlist 两套口径冲突；§5.5 上游 | 无 |
+| §3.2 | 龙虎榜三只读列入 watchlist | ✅ 做 | P1 | 零新增抓取/前视/越权纯加列 | bump schema→1.1.0；命名与 main_net 区分；缺测不置 0 |
+| §4.7 | 三层精选上限砍半 | ✅ 做 | P1 | 纯 env 配置；收紧被 top-5 截断的陪跑噪声 | 建议灰度，配合强度阈值非纯数量截断 |
+| §5.1 | 阶段化字段白名单写进 prompt | ✅ 做 | P1 | 降空泛编造；资金字段只进 chain/high selection | 每阶段 stage_input key 加断言 |
+| §5.4（文案版） | 一字板/可成交性提示 | ✅ 做 | P1 | 补读者看不到的「买不进」风险护栏 | 触发严限 open_times==0 且首封 30 秒内，None 不判 |
+| §5.2 | 搬运已固化经验阈值进 prompt | ✅ 做 | P2 | 纯口径对齐，只搬代码确有常量 | 严禁伪造不存在的精确分桶 |
+| §3.6（文档） | 红线/单口径硬约束写入口径文档 | ✅ 做 | P2 | 防后续重复提接入/多口径污染 | 无 |
+| §3.1 | moneyflow 全市场接入 + 改 money 子分 | 🟡 有条件 | P1 | 资金维进分直接改 top-5、不被稀释 | 积分放行脚本 + 覆盖率 + 单位口径 + bump scoring_version |
+| 单位口径 | 跨单位统一换算到元 + 上界置缺 | 🟡 有条件 | P1 | §3.1 强制内嵌前置；现成 circ_mv×10000 范式可套 | §3.1（不单独立项） |
+| §4.3 | `_capital_signals` left-join + 注入主力净额 | 🟡 有条件 | P2 | 只改 LLM 上下文、被 top-5 稀释 | 强依赖 §3.1 管线；lhb/main_net 命名区分 |
+| §5.3 | 资金档措辞+缺测纪律 / 首板收资金 | 🟡 有条件 | P2 | ①措辞当下可做但受 LHB 稀疏拖累；②收资金依赖管线 | §4.3、§3.1（②子项） |
+| §5.5 | 周期降级规则注入 prompt | 🟡 有条件 | P1 | 复用权威 gate 结论、不另立阈值 | 强依赖 §4.2 闸门前移 |
+| §3.3 | 游资席位 hm_detail/hm_list | 🟡 有条件 | P2 | 一期喂 LLM 辨识度；二期进分需回测 | 积分放行脚本 + 人工席位字典；二期依赖实盘标签 |
+| §3.4 | 板块资金 moneyflow_ind_dc + 题材映射 | 🟡 有条件 | P2 | 只喂题材发酵叙事、不进打分 | 映射命中率 go/no-go 闸门；单口径 _dc |
+| §6.1 | 概率档 tier 骨架 + calibration_version | 🟡 有条件 | P1（骨架即落） | 骨架零依赖改善首板高估；真实回填待闭环 | 真实校准依赖 §6.4①+实盘回流 |
+| §6.3 | data_confidence 列 / 聚合剔除归一 | 🟡 有条件 | P1（列即落） | ①只读列零依赖；②聚合改造需回测验证增益 | 聚合改造依赖 §6.4① + 回测分桶 |
+| §6.4 | 子分落库 / REGISTRY 护栏 / 解耦 / V2 回归 | 🟡 有条件 | P0（子分落库） | 子分落库是单维归因前置闸门；V2 待标签 | 真实 V2 依赖实盘 qmt_* 闭环 |
+| §3.5 | 大盘/北向资金 moneyflow_mkt/hsgt | ⏸️ 暂缓 | P2 | 纯情绪叙事、无确定性消费、未回测 | 观察期 N 期人工评估 |
+| §4.4 | 题材排序加资金维 | ⏸️ 暂缓 | P2 | P1 受 LHB 稀疏拖累、已有 cpt 维兜底 | 待 §3.4 管线就绪一起评估 |
+| §4.6 | `_board_level` limit_times 结构化兜底 | ⏸️ 暂缓 | P2 | 需跨表 join、只救边缘股、ROI 低 | 复用 §4.3/§4.4 已 merge 的 limit_list_d |
+| §5.4（时序版） | tradable_flag 注入 FINAL/ADVICE | ⏸️ 暂缓 | P2 | 须调打分时序、成本高 | §4.2 打分前移 |
+| §4.1 | 全涨停池分位 | ❌ 不做 | - | 已被阶段 C/D/E 修复，只需回归确认 | 断言 limit_up_stocks 非空 |
+| §3.6 | stk_auction 集合竞价 | ❌ 不做 | - | 接入即前视+越权，现状合规 | 无 |
+| §3.6 | dc_hot / ths_hot 散户人气 | ❌ 不做 | - | 噪声逆向、稀释区分度（红线） | 无 |
+| §3.6 | top_inst 机构席位 | ❌ 不做 | - | 打板语境逆向噪声、权重仅 0.10 占位 | 无 |
+| §3.6 | moneyflow_dc / moneyflow_ths 并行 | ❌ 不做 | - | 多口径并行污染 money 子分位分布 | 无 |
+| §3.6 | kpl_concept | ❌ 不做 | - | 与 limit_cpt_list 信息重叠、无增量 | 无 |
+| §7 | 三套档位正交分列 | ❌ 不做 | - | 已正交分列、无缺口可改 | 无 |
+
+---
+
+### 11.6 最小落地子集
+
+若只动手做最少的几项（全部纯逻辑/纯配置/纯文案、零实盘回流依赖、当前阶段即正收益，取自对抗复核 `overall_notes`），按顺序为：
+
+1. **§4.5（=§3.1.5）** PARSE_FALLBACK 补 `failed=True` —— 一行修复，防极低先验固化污染 watchlist（P0，缓存纪律）。
+2. **§6.2** 补「高辨识度」命中分支 + 否定前缀短路 + 契约漂移单测 —— 直接改 recognition 子分/角色判定→改强度排序→改 top-5 构成，少数不被截断稀释的确定性打分硬 bug（P0）。
+3. **§5.6** 清除 advice prompt 越界诱导（仓位/低吸区间/止损）—— 合规红线，纯文案（P0）。
+4. **§4.2** `resolve_gate` 前移 + `market_state` 注入 context —— 消除报告↔watchlist 两套口径冲突，且是 §5.5 前置上游（P0）。
+5. **§4.7** 三层精选上限砍半 —— 纯 env 配置零代码，收紧被 top-5 截断的陪跑噪声（P1，建议灰度）。
+6. **§3.2** 三个龙虎榜只读列 —— 零新增抓取、与 §3.1 解耦，价值取决于复盘看板是否消费，可与前述同批落但优先级低于前五条。
+
+这六条在不依赖任何实盘回流/回测标签的前提下，覆盖**一处合规红线 + 一处确定性打分 bug + 一处口径冲突 + 一处缓存纪律 + 一处主战场收窄**，是当前阶段投入产出比最高的子集。§3.1/§4.3/§5.5/§6.4③ 等依赖 moneyflow 管线或实盘标签的条目排在这六条之后；§3.4/§3.5/§4.4/§4.6 等映射闸门/稀疏龙虎榜代理/边缘股兜底类 ROI 低，不进最小子集。
+
+---
+
+### 11.7 ⚠️ 报告写但代码已实现/已修复，无需再做（避免重复劳动）
+
+- **§4.1（报告列 P0#2）分位池全涨停池解耦** —— 已被阶段 C/D/E 修复完整落地：`context_rows` 参数、`full_pool` 全池分位、读顶层 context 修掉「恒 None 静默回退入选子集」。**报告的乐观假设已被现状推翻，不要再当开发任务排期，只做回归确认。**
+- **§3.6 `stk_auction` 现状已合规** —— watchlist 只下 `float_mktcap`+`first_board_vol` 两个分母，竞价比值留执行侧，无需任何代码动作（接入反而引入前视+越权）。
+- **§3.1.5 与 §4.5 是同一行（`:2557`）修复** —— 复核已确认重复计数且优先级 P1/P0 分叉，**已合并为单条 P0，不要按两条不同优先级重复排期同一改动**。
+- **§5.1/§5.3 自纠正确** —— 不要在 `_focus_json_contract` 登记输入字段名（该方法是输出契约非输入白名单）；资金字段不要写进共享 FOCUS 契约和首板 prompt。
+- **§4.5 附注否决子项** —— `upstream_degraded` 进 hash、新增 `prior_degraded` 列经核验确属冗余（FOCUS 降级 `stock_priors=[]`→落表经 `_prob_band_to_decimal`→NULL，回测可据 NULL+stage_quality 剔除），不做。
+
+---
+
+### 11.8 ✅ 落地实现状态（本轮已实现，信号侧 `stock-ah-premium-ai`）
+
+> 本轮按 §11 取舍，把「✅ 建议做」全部 + 「🟡 有条件做」中无外部前置、当前阶段即可见效的子项落地实现；经两轮多智能体对抗式代码评审 + 修复，信号侧测试 **466 passed**（无回归）、改动文件零新增 ruff 违规。详细实现设计见信号侧 `resources/doc/limit-up-doc10-landing-implementation-plan.md`。
+
+**本轮已实现：**
+
+| 章节 | 实现要点 | 类型 |
+|---|---|---|
+| §4.5 | `_run_json_stage` 的 PARSE_FALLBACK 兜底改 `failed=True` 写缓存，不再以 READY 复用「极低先验」污染 watchlist | 逻辑修复 |
+| §6.2 | 角色关键词桶集中化 + 补「高辨识度」命中分支 + 否定前缀（非/不/未/无/没）守卫 + contract-drift 单测 | 逻辑修复 |
+| §6.1 | `_PROB_BAND_TO_DECIMAL` 改按 tier(FIRST/CHAIN/HIGH) 键控（首板下调一档量级）+ `prob_calibration_version` 落 `strength_dim_json` + 列注释澄清「离散档值非连续概率」（**骨架**；真实频率回填待闭环） | 逻辑/契约内容 |
+| §6.3① | `data_confidence`（非缺测子项权重占比）写入 `strength_dim_json`，纯只读不参与打分（**无迁移**） | 描述性增列 |
+| §4.2 | `resolve_gate` 前移至 `_assemble_context`，权威 `market_state` 注入 `market_context`（含三个 SELECTION board_context 的精简闸门视图）；落表段对同一不可变 `market_emotion` 确定性 re-resolve、逐字节一致、不缓存对象 | 流程结构 |
+| §5.6 | `_investment_advice_prompt`/`_final_report_prompt`/`_limit_up_system_prompt`/`_focus_json_contract` 清除诱导越界措辞（仓位态度→进攻/防守倾向、低吸区间质性化、止损→失效条件）+ 禁空泛套话纪律句 | 提示词文案 |
+| §5.1 | FOCUS 通用「可引用字段白名单」（仅 FOCUS 实有字段、绝不含 capital_signals）+ chain/high 选股 prompt 资金字段白名单 + 系统提示「字段以输入实际存在者为准」 | 提示词文案 |
+| §5.3① | chain/high 选股 prompt 资金信号措辞 + 「缺测≠资金弱」中性纪律 | 提示词文案 |
+| §5.4 | FOCUS 契约一字板/可成交性提示（仅 `open_times==0` 且首封 30 秒内才标，缺测不臆断）+ advice 分层不高于谨慎观察 | 提示词文案 |
+| §5.2 | 选股 prompt 换手经验参照（5%-25%）+ FOCUS 契约上方筹码压力参照（≤25/25-45/>45），均标「经验参照非硬规则」、只搬代码确有常量 | 提示词文案 |
+| §5.5 | 系统提示复用权威 `market_state` 写可执行周期降级规则（不另立阈值，依赖 §4.2） | 提示词文案 |
+| §4.7 | 三层精选上限默认值砍半：chain 20→10、high 10→5、first 5→3（合计 35→约 18），纯配置 | 配置 |
+| §3.2 | watchlist 新增龙虎榜三只读列 `dragon_tiger_flag`/`lhb_net_amount`/`lhb_net_rate`（Alembic 0056、可空、`WATCHLIST_SCHEMA_VERSION`→1.1.0）；落表按 `top_list` 索引填充，**抓取失败(FAILED)→None 未知、不臆断「不在榜」**，缺测不置 0 | 契约/迁移 |
+| §3.6 | 五条数据不接入红线 + 「money 子分单一资金口径」硬约束写入数据接入口径文档（`resources/doc/limit-up-data-access-redlines.md`） | 文档治理 |
+
+**本轮暂未做（有外部硬前置 / 待闭环样本，记录承接）：**
+
+- **§3.1 moneyflow 资金主线**（及其依赖链 §4.3 资金为主、§5.3② 首板收资金）：前置=一次性脚本验证当前积分档支持 `moneyflow` 的 `trade_date`-only 全市场放行 + 涨停/入选池覆盖率抽样 + 单位换算固化 + bump `scoring_version` 与回测同批迁移。需联网核验积分档，未在本轮。
+- **§3.3 游资 / §3.4 板块资金 / §3.5 大盘资金 / §4.4 题材资金维 / §4.6 board_level 跨表兜底**：映射命中率闸门 / 长期人工字典 / 跨表 join，ROI 低或前置重。
+- **§6.1 真实频率回填 / §6.3② 聚合层剔除归一 / §6.4 子分落库+WEIGHTS_V2**：依赖实盘 `qmt_*` 回流闭环样本与回测正收益标签（执行侧 miniQMT 未到位）。本轮只落结构/只读列骨架。
