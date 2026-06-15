@@ -527,3 +527,39 @@ def test_run_stop_flag_breaks_loop():
     poller.stop()
     poller.run(sleep_fn=lambda s: None, max_loops=10)
     assert sink.snaps == []  # 已 stop，不进循环体
+
+
+def test_poll_once_push_failure_isolated_and_history_committed():
+    """EXEC-auction-06：单票 push 失败就地隔离——不阻断其它票、不回滚已提交历史、留痕。"""
+    plans = {
+        "600000.SH": make_plan_row("600000.SH", first_board_vol=100000),
+        "000001.SZ": make_plan_row("000001.SZ", first_board_vol=200000),
+    }
+    ticks = {
+        "600000.SH": {"lastPrice": 11.0, "lastClose": 10.0, "volume": 50000},
+        "000001.SZ": {"lastPrice": 10.5, "lastClose": 10.0, "volume": 80000},
+    }
+    tsrc = FakeTickSource(fixed=ticks)
+    poller, _sink, logger = _make_poller(tsrc, plans, utc_at_east8(D, 9, 16, 0))
+
+    # 首票 push 抛错的 sink 变体：第 1 个 snap 抛异常，其余正常收集。
+    received: List[AuctionSnapshot] = []
+
+    def failing_sink(snap: AuctionSnapshot) -> None:
+        if snap.ts_code == "600000.SH":
+            raise RuntimeError("downstream boom")
+        received.append(snap)
+
+    poller._router_sink = failing_sink
+
+    snaps = poller.poll_once(utc_at_east8(D, 9, 16, 0))
+
+    # (a) poll_once 不抛、仍返回两帧
+    assert len(snaps) == 2
+    # (b) 第 2 票仍被 push（首票失败不阻断其它票）
+    assert [s.ts_code for s in received] == ["000001.SZ"]
+    # (c) 两个 code 的 tick 均已进历史（push 失败不回滚历史、失败票历史也已提交）
+    assert len(poller._history["600000.SH"]) == 1
+    assert len(poller._history["000001.SZ"]) == 1
+    # (d) 单票 push 失败留痕
+    assert "auction_router_push_failed" in logger.events()

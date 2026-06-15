@@ -124,6 +124,11 @@ class Settings:
     # 强度加权资金分配（按 leader_strength_score 分预算，强的分得多）：可分配总预算上限 = 日初权益×本比例。
     # 默认 1.0=用全部日初权益作上限（强度权重在候选间归一分配）；可调小以留现金（如 0.8 只用八成仓）。
     target_position_ratio: Decimal = Decimal("1.0")   # QMT_TARGET_POSITION_RATIO
+    # 允许 plan_volume 缺失时回退 _plan_volume 现算（评审三轮 EXEC-entry-02）：默认 False=对真实 BUY 主链
+    # fail-closed。真实 BUY 的仓位必须由 EntryRouter 的强度加权 position_sizer 给出 plan_volume，缺失视为
+    # 装配/限价异常，拒单留痕而非用【不含强度份额】的 _plan_volume 退化口径绕过强度与名额约束。仅离线/无
+    # sizer 的兼容场景显式置 True 才启用回退（QMT_ALLOW_PLAN_VOLUME_FALLBACK）。
+    allow_plan_volume_fallback: bool = False          # QMT_ALLOW_PLAN_VOLUME_FALLBACK
     price_deviation_guard_pct: Optional[Decimal] = None  # QMT_PRICE_DEVIATION_GUARD_PCT
     # QMT_MARKET_STATE_BLOCK：禁开仓集合（评审 2.5 口径修正）。
     # 信号侧 watchlist 的 market_state 只有三档：空仓 / 谨慎参与 / 参与（六档情绪周期已在信号侧
@@ -237,6 +242,7 @@ class Settings:
                 if (g("QMT_TARGET_POSITION_RATIO") or "").strip() != ""
                 else Decimal("1.0")
             ),
+            allow_plan_volume_fallback=_as_bool(g("QMT_ALLOW_PLAN_VOLUME_FALLBACK") or "false"),
             price_deviation_guard_pct=_as_decimal(g("QMT_PRICE_DEVIATION_GUARD_PCT")),
             market_state_block=split_csv(g("QMT_MARKET_STATE_BLOCK"), ["空仓", "谨慎参与", "退潮", "冰点"]),
             account_drawdown_limit=_as_decimal(g("QMT_ACCOUNT_DRAWDOWN_LIMIT")),

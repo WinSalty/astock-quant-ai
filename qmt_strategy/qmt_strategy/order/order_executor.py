@@ -377,9 +377,30 @@ class OrderExecutor:
 
         limit_price = decision.limit_price
 
-        # —— 计划股数：优先用决策给定，否则按账户可用资金现算 ——
+        # —— 计划股数：优先用决策给定 ——
+        # fail-closed（评审三轮 EXEC-entry-02）：真实 BUY 的仓位必须由 EntryRouter 的强度加权 position_sizer
+        # 预填 plan_volume。plan_volume 缺失说明装配/限价异常（如 chase 降级 B 限价为 None 致 entry_router 跳过
+        # sizer），此时【拒单留痕】而非静默回退到【不含强度份额、绕过 top-N 名额约束】的 _plan_volume——后者会
+        # 悄悄丢掉强度份额、构成隐性失效路径。仅当显式开启 allow_plan_volume_fallback（离线/无 sizer 兼容场景）
+        # 才走 _plan_volume 现算。
         plan_volume = decision.plan_volume
         if plan_volume is None:
+            if not self._settings.allow_plan_volume_fallback:
+                self._logger.error(
+                    "order_missing_plan_volume_fail_closed",
+                    ts_code=decision.ts_code,
+                    account_id=self._account_id,
+                )
+                self._emit_decision(
+                    decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                    ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                    trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                    order_phase=decision.order_phase,
+                    reason="BUY 计划股数缺失（sizer 未预填，疑装配/限价异常），fail-closed 拒单",
+                    reason_code="missing_plan_volume", limit_price=limit_price,
+                    factors=decision.factors_snapshot,
+                )
+                return None
             plan_volume = self._plan_volume(decision, limit_price)
         if not plan_volume or plan_volume <= 0:
             # 资金不足 / 算出 0 股：不下单并留痕，等价于该计划放弃（§4.4(6) 资金口径）。
@@ -748,6 +769,11 @@ class OrderExecutor:
     # ------------------------------------------------------------------
     def _plan_volume(self, decision: EntryDecision, limit_price: Optional[Decimal]) -> int:
         """按账户可用资金 + 仓位上限算计划股数，向下取整到 100 股整手。
+
+        ⚠️ 不含强度份额（评审三轮 EXEC-entry-02）：本现算口径只按 cash/总敞口/单票单笔上限算，
+        【不】乘 EntryRouter 强度加权 position_sizer 的 w，也不参与 top-N 名额优选。故【不得用于强度加权
+        BUY 主链】——主链 plan_volume 缺失应 fail-closed 拒单（见 place）。本方法仅供离线/无 sizer 的兼容
+        场景，且需 settings.allow_plan_volume_fallback=True 显式开启才会被 place 调用。
 
         业务意图：资金读 trader.query_stock_asset(account).cash（当日可用现金，§4.4(6)）；
         单票投入上限取 settings.per_order_max_amount / max_position_per_stock 的较小值（若配置）。

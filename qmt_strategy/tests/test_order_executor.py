@@ -576,11 +576,15 @@ def test_max_orders_per_day_idempotent_hit_not_counted(clock_0916):
 # 计划股数现算 + 资金不足
 # ---------------------------------------------------------------------------
 def test_plan_volume_computed_from_cash(clock_0916):
-    """decision.plan_volume=None → 按可用资金现算，向下取整到 100 股。"""
+    """decision.plan_volume=None → 按可用资金现算，向下取整到 100 股。
+
+    评审三轮 EXEC-entry-02：现算回退默认 fail-closed，本用例显式开启 allow_plan_volume_fallback 验证回退口径。
+    """
     # cash=23560，限价 11.00 → 23560/11=2141.8 → 向下取整到 2100 股。
     trader = FakeTrader(cash="23560")
     ledger = InMemoryLocalLedger()
-    ex = _executor(trader, clock_0916, ledger=ledger)
+    ex = _executor(trader, clock_0916, ledger=ledger,
+                   settings=Settings(allow_plan_volume_fallback=True))
     biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
     assert ledger.get(biz).plan_volume == 2100
     assert trader.order_calls[0]["order_volume"] == 2100
@@ -590,7 +594,8 @@ def test_insufficient_cash_no_order(clock_0916):
     """可用资金不足一手 → 算出 0 股 → 不下单 + 返回 None。"""
     trader = FakeTrader(cash="500")              # 500/11 < 100 股
     logger = RecordingLogger()
-    ex = _executor(trader, clock_0916, logger=logger)
+    ex = _executor(trader, clock_0916, logger=logger,
+                   settings=Settings(allow_plan_volume_fallback=True))
     assert ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00"))) is None
     assert len(trader.order_calls) == 0
     assert "order_zero_volume_skip" in logger.events()
@@ -600,7 +605,7 @@ def test_per_order_max_amount_caps_volume(clock_0916):
     """per_order_max_amount 收紧单笔预算 → 限制计划股数。"""
     trader = FakeTrader(cash="1000000")
     ledger = InMemoryLocalLedger()
-    settings = Settings(per_order_max_amount=Decimal("11000"))   # 11000/11=1000 股
+    settings = Settings(per_order_max_amount=Decimal("11000"), allow_plan_volume_fallback=True)   # 11000/11=1000 股
     ex = _executor(trader, clock_0916, ledger=ledger, settings=settings)
     biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
     assert ledger.get(biz).plan_volume == 1000
@@ -812,7 +817,9 @@ def test_plan_volume_zero_when_held_at_cap(clock_0916):
                          can_use_volume=10000, open_price=Decimal("11.0"),
                          market_value=Decimal("110000"))
     trader = _RcTrader(rc=1001, positions=[pos])
-    ex = _executor(trader, clock_0916, settings=Settings(max_position_per_stock=Decimal("100000")))
+    ex = _executor(trader, clock_0916,
+                   settings=Settings(max_position_per_stock=Decimal("100000"),
+                                     allow_plan_volume_fallback=True))
     biz = ex.place(_decision(plan_volume=None))       # 触发 _plan_volume 现算
     assert biz is None
     assert trader.order_calls == []
@@ -825,7 +832,8 @@ def test_plan_volume_subtracts_held_position(clock_0916):
                          market_value=Decimal("55000"))
     trader = _RcTrader(rc=1001, positions=[pos], cash="1000000")
     ex = _executor(trader, clock_0916,
-                   settings=Settings(max_position_per_stock=Decimal("100000")))
+                   settings=Settings(max_position_per_stock=Decimal("100000"),
+                                     allow_plan_volume_fallback=True))
     biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
     assert biz is not None
     call = trader.order_calls[0]
@@ -856,3 +864,15 @@ def test_cancelling_real_chain_recancel_after_grace():
     ex.sweep_expired(clock.now_utc())
     assert trader.cancel_calls == [oid, oid]            # 超 grace 幂等重发
     assert biz in ex._ttl_deadline                      # 仍续二次截止待回执/再撤
+
+
+# —— EXEC-entry-02：真实 BUY plan_volume 缺失 → fail-closed 拒单（默认不回退 _plan_volume）——
+def test_buy_missing_plan_volume_fail_closed(clock_0916):
+    """plan_volume=None 且未开启回退 → 不下单、返回 None、留痕 reason_code=missing_plan_volume。"""
+    trader = FakeTrader(cash="1000000")
+    logger = RecordingLogger()
+    ex = _executor(trader, clock_0916, logger=logger)
+    biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
+    assert biz is None                      # fail-closed 拒单
+    assert trader.order_calls == []         # 未真正下单
+    assert "order_missing_plan_volume_fail_closed" in logger.events()

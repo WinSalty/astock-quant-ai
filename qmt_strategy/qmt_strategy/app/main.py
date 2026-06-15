@@ -75,6 +75,11 @@ XT_PRICE_TYPE_FIX = 11
 # 对账未通过阻断开仓的持久标志键（评审二轮 P1#9）：置位后次日 prewarm 读到即只守仓不开新仓，人工清除前持续。
 _RECONCILE_BLOCK_FLAG = "reconcile_blocked"
 
+# 缺强度/beyond-N 票的保守份额系数（评审三轮 EXEC-entry-05/01）：缺强度或超出 top-N 名额的票，其预算份额基数
+# 按「最弱真实票 × 本系数」给一个远低于任一 top-N 真实份额的小额，既不挤占强票满额、也不在名额/余额富余时闲置。
+# 0.1 为占位值，回测标定前任何数值都是经验占位；落地后可移入 settings 标定。
+_MISSING_STRENGTH_FACTOR = Decimal("0.1")
+
 
 @dataclass
 class EngineDeps:
@@ -593,11 +598,20 @@ class Engine:
     # 强度加权资金分配（评审"按强度/优先级排序分"）
     # ------------------------------------------------------------------
     def _compute_strength_weights(self) -> None:
-        """按当日可交易候选的 leader_strength_score 归一为预算权重（强的占比大）。
+        """按当日可交易候选的 leader_strength_score 归一为预算【份额】权重（强的占比大）。
 
-        口径：w_i = strength_i / Σ strength；缺强度的票用候选最小强度兜底（避免拿不到额度）；全部缺强度
-        时退化为等权(1/N)。权重在 prewarm 一次性算定、不随触发顺序变化——故弱票即使先触发也只吃自己的
-        小份额，强票份额被保留（实现"强的分得多、不被弱的抢光"，且与触发时序无关）。
+        口径（评审三轮 EXEC-entry-01/05 修订 + 复审防优先级反转）：
+        - top-N 优先制（保护龙头名额）：按强度降序取前 N（cap=max_positions_per_day），仅 top-N 进 weights、
+          在 N 只内归一（Σw=1），beyond-N 票【不进 weights】→ sizer 据 w is None 返 0，把名额留给更强的 top-N。
+          这样【不会】被竞价触发先后劫持——若放开 beyond-N 让其拿小额度，弱票先触发就会先占 committed 名额，
+          把后触发的强龙头挤出名额（优先级反转，背离打板"只打最强"的核心）。单日只数仍由 order_executor.place
+          的 committed 计数闸动态收口（终态零成交释放名额）。注：强票全判弃→名额空置是【正确】的——策略既然
+          对这些票收手，就不应强行补买更弱的替代票。
+        - top-N 满额部署：强票份额不被 beyond-N 摊薄，也不把额度摊到买不到的弱票上闲置现金。
+        - 缺强度票（leader_strength_score is None）：排序键置极低（-1，不挤占 top-N 名额优选）；若仍落入 top-N
+          （真实强度票不足 N 只时），份额基数用 floor×_MISSING_STRENGTH_FACTOR（远低于最弱真实票，不等权稀释
+          强票）；全部缺强度时退化等权(1/N)。
+        权重在 prewarm 一次性算定、不随触发顺序变化——弱票即使先触发也只吃自己的小份额。
         """
         plans = list(self._plan_map.values())
         if not plans:
@@ -606,24 +620,33 @@ class Engine:
         present = [p.leader_strength_score for p in plans if p.leader_strength_score is not None]
         floor_score = min(present) if present else Decimal("0")
 
-        def _score(p: PlanRow) -> Decimal:
-            """缺强度的票用候选最小强度兜底参与排序/归一（避免拿不到额度）。"""
-            return p.leader_strength_score if p.leader_strength_score is not None else floor_score
+        def _rank_key(p: PlanRow) -> Decimal:
+            """排序键：真实强度用本身；缺强度置极低（-1，低于所有真实强度）→ 不挤占 top-N 名额优选。"""
+            return p.leader_strength_score if p.leader_strength_score is not None else Decimal("-1")
 
-        # 建仓名额优选：按强度降序；若设了单日建仓只数上限 N，仅取强度最高的前 N 只进入买入 universe，
-        # 权重在这 N 只内归一（Σw=1 → 满额部署），其余不进 weights（sizer 据此返 0 不开仓）。
-        # 这样「≤N 只被买入」与「资金按强度满额分配」口径一致——不会把额度摊到买不到的弱票上而闲置现金。
-        ranked = sorted(plans, key=_score, reverse=True)
+        def _share_basis(p: PlanRow) -> Decimal:
+            """份额基数：真实强度用本身；缺强度用 floor×保守系数（远低于最弱真实票，不等权稀释强票）。"""
+            if p.leader_strength_score is not None:
+                return p.leader_strength_score
+            return floor_score * _MISSING_STRENGTH_FACTOR
+
+        ranked = sorted(plans, key=_rank_key, reverse=True)
         cap = self._settings.max_positions_per_day
-        if cap is not None and cap > 0:
-            ranked = ranked[:cap]
-        scores: Dict[str, Decimal] = {p.ts_code: _score(p) for p in ranked}
-        total = sum(scores.values(), Decimal("0"))
+        top = ranked[:cap] if (cap is not None and cap > 0) else ranked
+        basis: Dict[str, Decimal] = {p.ts_code: _share_basis(p) for p in top}
+        total = sum(basis.values(), Decimal("0"))
+        weights: Dict[str, Decimal] = {}
         if total > 0:
-            self._strength_weights = {code: (s / total) for code, s in scores.items()}
+            for code, s in basis.items():
+                weights[code] = s / total
         else:
-            eq = Decimal("1") / Decimal(len(scores))
-            self._strength_weights = {code: eq for code in scores}
+            # 全部缺强度且 floor=0 → 退化等权 1/N（与既有口径一致）。
+            eq = Decimal("1") / Decimal(len(basis))
+            for code in basis:
+                weights[code] = eq
+        # 注意（复审 EXEC-entry-01）：beyond-N 票【刻意不进 weights】——见上方 top-N 优先制说明，避免弱票按触发
+        # 先后抢占强龙头名额造成优先级反转。名额收口仍在 order_executor.place 的 committed 计数闸（动态）。
+        self._strength_weights = weights
         self._logger.info(
             "engine_strength_weights", count=len(self._strength_weights), position_cap=cap
         )
@@ -662,10 +685,11 @@ class Engine:
         # 总敞口闸 + 在途扣减：可分配上限 − 当日已承诺(在途+已成)买入。
         committed = self._order.committed_amount(self._today_provider())
         budget = min(cash, ceiling - committed)
-        # 强度份额：仅买入 universe（强度优选 top-N）内的票分配额度，并按 ceiling×w 约束（强的分得多）。
+        # 强度份额（评审三轮 EXEC-entry-01）：仅 top-N 强票进 _strength_weights（按强度归一分资金，强的分得多）；
+        # beyond-N 弱票/非候选不在表内 → w is None → 返 0，把名额留给更强的 top-N（防弱票按触发先后抢占强龙头
+        # 名额的优先级反转）。单日建仓【只数】仍由 order_executor.place 的 committed 计数闸动态收口。
         w = self._strength_weights.get(plan.ts_code)
         if w is None:
-            # 不在当日建仓名额内（名额已被更强的票占用）→ 返 0 不开新仓（与单日建仓只数上限口径一致）。
             return 0
         budget = min(budget, ceiling * w)
         # 单笔 / 单票金额上限收紧。

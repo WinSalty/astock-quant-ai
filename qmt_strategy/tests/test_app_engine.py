@@ -203,14 +203,19 @@ def _three_candidate_deps(env=None):
 
 
 def test_position_cap_restricts_budget_to_top_n_strength():
-    """单日建仓只数上限 N=2：仅强度 top-2 分配额度（权重在 2 只内归一、满额部署），第 3 只预算 0。"""
+    """单日建仓只数上限 N=2：仅强度 top-2 分配额度（在 2 只内归一满额部署），第 3 只 sizer 返 0。
+
+    评审三轮 EXEC-entry-01 复审（防优先级反转）：beyond-N 弱票【不进权重表】→ sizer 返 0，把名额留给更强的
+    top-N，避免弱票按竞价触发先后抢占强龙头名额。单日建仓【只数】另由 order_executor.place 的 committed 计数闸
+    动态收口（强票判弃→名额空置是正确的，不强行补买更弱替代票）。
+    """
     deps = _three_candidate_deps({"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_MAX_POSITIONS_PER_DAY": "2"})
     eng = build_engine(deps)
     eng.prewarm(T_BUY)  # 日初权益=100万，ratio=1.0 → ceiling=100万
     v1 = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
     v2 = eng._strength_budget_volume(eng._plan_map["600000.SH"], Decimal("10.50"))
     v3 = eng._strength_budget_volume(eng._plan_map["000001.SZ"], Decimal("10.50"))
-    assert v3 == 0                                   # 不在 top-2 名额内 → 不开仓
+    assert v3 == 0                                   # beyond-N 不在 top-2 名额内 → 不开仓（名额留给强票）
     assert v1 > v2 > 0
     # 权重在 top-2 内归一：90/150=0.6、60/150=0.4 → 预算 60万 / 40万（不被第 3 只摊薄、不闲置）
     assert v1 == (int(Decimal("600000") / Decimal("10.50")) // 100) * 100
@@ -387,3 +392,64 @@ def test_sell_fill_reduces_position_idempotently():
     # 同一 traded_id 重投 → 不重复扣减。
     eng._apply_trade_to_position(_Rec())
     assert eng._position.get_unit("acc1", "600036.SH").volume == 400
+
+
+# ===========================================================================
+# 评审三轮 EXEC-entry-05：缺强度票保守份额 + 不挤占 top-N + 全缺退化等权
+# ===========================================================================
+def _mixed_strength_deps(strengths, env=None):
+    """按给定 (code, strength) 列表构造候选 deps（strength 可为 None=缺强度）。"""
+    rows = []
+    for code, strength in strengths:
+        r = make_selected_row(
+            ts_code=code, signal_close=Decimal("10.00"), limit_up_price=Decimal("11.00"),
+            reasonable_open_high_low=Decimal("10.20"), reasonable_open_high_high=Decimal("10.80"),
+            market_state="启动", tradable_flag=True, leader_strength_score=strength,
+        )
+        r.strategy_family = "打板"
+        r.setup = "首板"
+        rows.append(r)
+    return _deps(env, source_rows=rows)
+
+
+def test_missing_strength_gets_conservative_share():
+    """缺强度票拿保守小份额（floor×系数），远小于真实强票，且强票不被稀释到等权。"""
+    deps = _mixed_strength_deps(
+        [("600036.SH", Decimal("90")), ("600000.SH", None)],
+        {"QMT_AUCTION_TIMING_ENABLED": "true"},
+    )
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    v_real = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
+    v_missing = eng._strength_budget_volume(eng._plan_map["600000.SH"], Decimal("10.50"))
+    assert v_real > v_missing > 0
+    # 真实强票份额 90/99≈0.909、缺强度票 9/99≈0.0909 → 真实票约 10 倍于缺强度票（非等权 0.5:0.5）。
+    assert v_real >= v_missing * 9
+
+
+def test_all_missing_strength_falls_back_equal_weight():
+    """全部候选缺强度 → 退化等权 1/N（两只相等且均 >0）。"""
+    deps = _mixed_strength_deps(
+        [("600036.SH", None), ("600000.SH", None)],
+        {"QMT_AUCTION_TIMING_ENABLED": "true"},
+    )
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    v1 = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
+    v2 = eng._strength_budget_volume(eng._plan_map["600000.SH"], Decimal("10.50"))
+    assert v1 == v2 > 0
+
+
+def test_missing_strength_not_preempt_top_n():
+    """cap=1：top-1 名额给真实强度票（缺强度票排序键极低不挤名额），缺强度票为 beyond-N → sizer 返 0。"""
+    deps = _mixed_strength_deps(
+        [("600036.SH", Decimal("90")), ("600000.SH", None)],
+        {"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_MAX_POSITIONS_PER_DAY": "1"},
+    )
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    v_real = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
+    v_missing = eng._strength_budget_volume(eng._plan_map["600000.SH"], Decimal("10.50"))
+    # top-1 满额给真实票（w=1.0）；缺强度票排序键极低落入 beyond-N → 不进权重表 → 返 0（不抢占强票名额）。
+    assert v_real > 0
+    assert v_missing == 0

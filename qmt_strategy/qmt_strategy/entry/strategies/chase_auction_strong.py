@@ -76,6 +76,14 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
                 )
             # 9:20 及以后仍整体不可得 → 确认降级 B，改判开盘后追（限价用涨停价/合理上沿兜底）。
             limit = plan.limit_up_price if plan.limit_up_price is not None else plan.reasonable_open_high
+            # fail-closed（评审三轮 EXEC-entry-02）：涨停价/合理上沿均缺失 → 无可信限价，不下抛 limit_price=None
+            # 的 BUY 决策（否则 entry_router 因无限价跳过 sizer、plan_volume 留 None，最终被 place fail-closed 拒，
+            # 属隐性失效路径）。这里直接 SKIP 更干净，避免无价 BUY 流入下游。
+            if limit is None:
+                return StrategyOutcome(
+                    action=EntryAction.SKIP,
+                    reason="CHASE_AUCTION_STRONG降级B:涨停价/合理上沿均缺失，无法定限价→弃",
+                )
             return StrategyOutcome(
                 action=EntryAction.CHASE_AUCTION_STRONG,
                 limit_price=limit,
@@ -113,13 +121,14 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
                 reason=f"CHASE_AUCTION_STRONG弃:未达强开档 open_pct={op} < overheat={thr.overheat_pct}",
             )
 
-        # —— 弃条件 4：竞价量能比未达标 → 承接不足，放弃。——
+        # —— 量能比：仅作弱量留痕、不再单独硬弃（评审三轮 EXEC-auction-05）。——
+        # auction_vol_ratio = 竞价段累计量 / first_board_vol(信号日全天量)：分子是 9:15–9:25 十分钟竞价量、
+        # 分母是全天量，量纲/时段不对等，比值结构性偏低(~1-5%)，回测标定前任何阈值都是占位。故缺失或低于
+        # _VOL_RATIO_MIN 时【不再 return SKIP】，仅置 weak_vol 标记记入买入 reason；买/弃由 open_pct(弃1/3)+
+        # centroid_trend(弃2/5)等量纲可信因子决定，避免量纲不对等的弱比值把 open_pct/重心均达标的强票误弃。
+        # 终态：分母改用首板日同时段(9:15–9:25)竞价量(量纲对等)后，再把本判据重启用为硬门槛(见 auction_factors TODO)。
         ratio = snap.auction_vol_ratio
-        if ratio is None or ratio < _VOL_RATIO_MIN:
-            return StrategyOutcome(
-                action=EntryAction.SKIP,
-                reason=f"CHASE_AUCTION_STRONG弃:量能不足 auction_vol_ratio={ratio}",
-            )
+        weak_vol = ratio is None or ratio < _VOL_RATIO_MIN
 
         # —— 弃条件 5：越竞越强需 centroid_trend=UP，否则（FLAT/数据不足）不追。——
         if snap.centroid_trend != CentroidTrend.UP:
@@ -140,7 +149,7 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
             limit_price=limit,
             reason=(
                 f"CHASE_AUCTION_STRONG买:强开越竞越强 open_pct={op}≥overheat={thr.overheat_pct} "
-                f"vol_ratio={ratio} centroid_trend=UP 竞价价={limit}"
+                f"vol_ratio={ratio}{'(弱量,仅留痕不弃)' if weak_vol else ''} centroid_trend=UP 竞价价={limit}"
             ),
             # 下单时段按 phase 判定（评审二轮 P1#17）：定盘前→AUCTION 竞价单；定盘段(9:25–9:30)→OPENING 开盘后单，
             # 避免在定盘段挂出 TTL 立即过期的竞价废单。

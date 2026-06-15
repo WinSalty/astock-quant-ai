@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from ...config.settings import Settings
 from ...contracts.enums import EntryAction, OrderPhase
 from ...contracts.models import AuctionSnapshot, PlanRow
@@ -59,8 +61,21 @@ class DipBuyMaStrategy(EntryStrategy):
                 reason=f"DIP_BUY_MA弃:高于低吸档上沿 open_pct={op} > lowbuy_high={thr.lowbuy_high}",
             )
 
-        # 限价取合理下沿（低吸目标价），缺失则回退末帧虚拟成交价（均不臆造价位）。
-        limit = plan.reasonable_open_low or snap.last_price
+        # 低吸限价取「末帧虚拟成交价 last_price」与「合理下沿 reasonable_open_low」中的【较低者】（评审三轮
+        # EXEC-entry-04）：低吸=不追价。原 `reasonable_open_low or last_price` 优先取下沿，当下沿高于现价时
+        # 挂限价=下沿=高于现价=追价买入，与低吸意图相悖、且与 leader_pullback 的 last_price 优先口径不一致。
+        # 取两者较小者：二者皆有取小（只在更低处低吸、不追高）；其一为 None 取另一个；皆 None 由下方守卫 SKIP。
+        # 脏 tick 防护（评审三轮 EXEC-entry-04 复审）：last_price 仅在【正值且不显著低于合理下沿】时才纳入取小——
+        # 正常低吸价与合理下沿仅差几个点，若 last_price 跌穿下沿 10% 以上（如 0.01 的坏帧），取小会挂出永不成交、
+        # 白占名额到 TTL 的死单；此时视为坏帧弃用 last_price、回退合理下沿，仍不臆造价位。
+        _floor = (plan.reasonable_open_low * Decimal("0.9")) if plan.reasonable_open_low is not None else None
+        _last_ok = (
+            snap.last_price is not None
+            and snap.last_price > 0
+            and (_floor is None or snap.last_price >= _floor)
+        )
+        _prices = [p for p in (snap.last_price if _last_ok else None, plan.reasonable_open_low) if p is not None]
+        limit = min(_prices) if _prices else None
         if limit is None:
             return StrategyOutcome(
                 action=EntryAction.SKIP,

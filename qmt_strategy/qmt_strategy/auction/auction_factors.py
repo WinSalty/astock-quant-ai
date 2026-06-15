@@ -76,9 +76,18 @@ def open_pct(auction_price: Optional[Decimal], pre_close: Optional[Decimal]) -> 
 def auction_volume_ratio(
     cum_vol: Optional[int], first_board_vol: Optional[int]
 ) -> Optional[Decimal]:
-    """竞价量能比 = 竞价累计撮合量 / 首板当日成交量（§3.4 因子 2）。
+    """竞价量能比 = 竞价段累计撮合量 cum_vol / 首板信号日全天成交量 first_board_vol（§3.4 因子 2）。
 
     业务意图：竞价就放出首板爆量的相当比例 → 承接资金活跃（强开）。
+
+    ⚠️ 量纲/时段不对等口径（评审三轮 EXEC-auction-05，务必固化）：
+    - 分子 cum_vol = 竞价段（9:15–9:25 十分钟）累计撮合量（手）；
+    - 分母 first_board_vol = 首板【信号日全天】成交量（手）。
+    二者时段不对等（十分钟 vs 全天），比值结构性偏低（经验 ~1–5%），**仅作相对强弱加分参考，回测标定前
+    不得单独构成硬弃门槛**（见 chase_auction_strong 弃条件已降级为 weak_vol 留痕）。
+    TODO（终态）：分母改用「首板日【同时段 9:15–9:25】竞价量」使量纲对等——需 PlanRow 新增 first_board_auction_vol
+    字段、由信号侧/分钟数据回填；量纲对等后再据标定结果把本因子重启用为硬门槛。
+
     边界：基准量 first_board_vol 为 None 或 0 → 返回 None（无基准不可比），标 NO_BASE_VOL；
     cum_vol 缺失 → 返回 None（竞价段拿不到撮合量，常见于降级 B）。
     """

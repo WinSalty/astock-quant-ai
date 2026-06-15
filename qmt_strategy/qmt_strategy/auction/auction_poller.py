@@ -120,11 +120,14 @@ class AuctionPoller:
             except Exception:  # noqa: BLE001 健康上报失败不得影响竞价采集
                 pass
 
-        # —— 逐 code 计算因子并推下游 ——
-        # 历史累积延后到整轮成功后统一提交（评审复审 P2#46）：原实现在循环内逐 code append 历史、紧接着调
-        # _router_sink（可能抛错）。若某 code 处抛错被上层(run)吞掉，已 append 的前序 code 历史会残留，下轮
-        # 重跑同一轮 tick 时再次 append → _history 重复累积、污染后续帧 Δvol/重心增量。改为本地缓冲，循环
-        # 全部跑完(无异常)才统一并入 _history；半轮失败则整轮历史不提交，下轮干净重跑。
+        # —— 两遍处理：第一遍纯计算 + 提交历史，第二遍逐票 push 且单票失败就地隔离（评审三轮 EXEC-auction-06）——
+        # 原实现把「计算/缓冲历史」与「_router_sink(push)」放在同一遍循环、历史在循环后才统一提交：半轮中若某
+        # code 的 push 抛错逸出，前序 code 已经 push 出去（下游已收帧）、但 pending_history 整轮被丢弃 → 形成
+        # 「已 push 未入历史」破坏不变量。改为：
+        #   第一遍——遍历 codes 仅算 snap、收集 snapshots，并把成功取到的 tick 收进 pending_history；
+        #   循环后立即统一提交历史（保证「要 push 的帧对应的 tick 一定已入历史」）；
+        #   第二遍——逐 snap push，单票 push 失败就地 try/except 吞掉并留痕、继续下一票，不回滚历史、不阻断其它票。
+        # 降级帧（tick 缺失）不入历史，避免污染 Δvol/重心增量。
         pending_history: List[tuple] = []
         for code in codes:
             plan = plans[code]
@@ -137,15 +140,20 @@ class AuctionPoller:
                 plan=plan,
                 now_utc=now_utc,
             )
-            # 仅把成功取到的完整 tick 缓冲（供整轮成功后入历史）；降级帧（tick 缺失）不入历史，避免污染 Δvol。
             if tick is not None:
                 pending_history.append((code, tick))
-            # push 给下游 entry_router 观测，本模块不在此下单（若抛错，pending_history 整轮丢弃）。
-            self._router_sink(snap)
             snapshots.append(snap)
-        # 整轮无异常 → 统一提交历史（半轮失败上面会在抛出前丢弃 pending_history）。
+        # 第一遍结束：先统一提交历史（push 之前），确保「push 出去的帧对应 tick 一定已在 _history」。
         for code, tick in pending_history:
             self._history.setdefault(code, []).append(tick)
+        # 第二遍：逐票 push，单票失败就地隔离——吞掉并留痕、继续下一票，不丢整轮历史、不影响其它票。
+        for snap in snapshots:
+            try:
+                self._router_sink(snap)
+            except Exception as exc:  # noqa: BLE001 单票 push 失败隔离，不回滚历史、不阻断其它票（下一轮重推）
+                self._logger.error(
+                    "auction_router_push_failed", ts_code=snap.ts_code, error=repr(exc)
+                )
 
         if degraded:
             # 留痕本轮降级帧数，便于复盘确认「竞价不可得 → 退化为开盘后确认」。

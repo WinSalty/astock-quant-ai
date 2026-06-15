@@ -535,3 +535,82 @@ def test_factors_snapshot_and_decided_at_utc():
     assert fs["is_limit_up"] is False
     assert decision.signal_trade_date == T_SIGNAL
     assert decision.target_trade_date == T_BUY
+
+
+# ===========================================================================
+# 评审三轮 EXEC-auction-05 / entry-02 / entry-04：策略层直测（绕过路由，专测 decide 行为）
+# ===========================================================================
+from qmt_strategy.entry.strategies.chase_auction_strong import ChaseAuctionStrongStrategy  # noqa: E402
+from qmt_strategy.entry.strategies.dip_buy_ma import DipBuyMaStrategy  # noqa: E402
+
+
+def test_chase_auction_strong_low_vol_ratio_not_hard_abandon():
+    """EXEC-auction-05：open_pct/重心均达标的强票，量能比低或缺失不再单独硬弃（仅 weak_vol 留痕）。"""
+    plan = make_plan_row(strategy_family="打板", setup="首板", market_state="启动")
+    strat = ChaseAuctionStrongStrategy()
+    s = _settings()
+    # open_pct=6% > overheat 5%，centroid UP；vol_ratio 极低 0.01(<0.02) → 不再弃。
+    snap_low = _snap(open_pct=Decimal("0.06"), centroid_trend=CentroidTrend.UP,
+                     auction_vol_ratio=Decimal("0.01"), last_price=Decimal("10.60"))
+    out_low = strat.decide(plan, snap_low, s)
+    assert out_low.action == EntryAction.CHASE_AUCTION_STRONG
+    assert "弱量" in out_low.reason
+    # vol_ratio 缺失同样不弃。
+    snap_none = _snap(open_pct=Decimal("0.06"), centroid_trend=CentroidTrend.UP,
+                      auction_vol_ratio=None, last_price=Decimal("10.60"))
+    assert strat.decide(plan, snap_none, s).action == EntryAction.CHASE_AUCTION_STRONG
+    # 真正的弃由 open_pct 决定：未达 overheat 仍弃（验证未把所有弃条件放开）。
+    snap_weakopen = _snap(open_pct=Decimal("0.02"), centroid_trend=CentroidTrend.UP,
+                          auction_vol_ratio=Decimal("0.5"), last_price=Decimal("10.20"))
+    assert strat.decide(plan, snap_weakopen, s).action == EntryAction.SKIP
+
+
+def test_chase_degrade_b_no_limit_price_skips():
+    """EXEC-entry-02：降级 B 且涨停价/合理上沿均缺失 → SKIP，不下抛 limit_price=None 的 BUY。"""
+    plan = make_plan_row(strategy_family="打板", setup="首板", market_state="启动",
+                         limit_up_price=None, reasonable_open_high=None)
+    strat = ChaseAuctionStrongStrategy()
+    s = _settings()
+    # 9:20 后(AUCTION_LOCKED) + NO_TICK → 确认降级 B；两个兜底价皆缺失 → SKIP。
+    snap = _snap(phase=AuctionPhase.AUCTION_LOCKED, last_price=None, pre_close=None,
+                 data_quality=[DQ_NO_TICK])
+    out = strat.decide(plan, snap, s)
+    assert out.action == EntryAction.SKIP
+    assert "无法定限价" in out.reason
+
+
+def test_dip_buy_ma_limit_not_above_last_price():
+    """EXEC-entry-04：合理下沿高于现价 → 低吸限价取较低的现价（不追价），不再取下沿。"""
+    plan = make_plan_row(strategy_family="低吸", setup="均线粘合", market_state="震荡",
+                         reasonable_open_low=Decimal("10.50"))  # 下沿高于现价
+    strat = DipBuyMaStrategy()
+    snap = _snap(open_pct=Decimal("-0.005"), centroid_trend=CentroidTrend.UP, last_price=Decimal("10.20"))
+    out = strat.decide(plan, snap, _settings())
+    assert out.action == EntryAction.DIP_BUY_MA
+    assert out.limit_price == Decimal("10.20")  # min(10.20, 10.50)，不追价
+
+
+def test_dip_buy_ma_limit_takes_lower_open_low_and_fallback():
+    """EXEC-entry-04：下沿低于现价取下沿；单边缺失取另一个；皆缺失 SKIP。"""
+    strat = DipBuyMaStrategy()
+    s = _settings()
+    # 下沿 9.90 低于现价 10.20 → 取较低的下沿。
+    plan = make_plan_row(strategy_family="低吸", setup="均线粘合", market_state="震荡",
+                         reasonable_open_low=Decimal("9.90"))
+    snap = _snap(open_pct=Decimal("-0.005"), centroid_trend=CentroidTrend.UP, last_price=Decimal("10.20"))
+    assert strat.decide(plan, snap, s).limit_price == Decimal("9.90")
+    # 现价缺失 → 取下沿。
+    snap_no_last = _snap(open_pct=Decimal("-0.005"), centroid_trend=CentroidTrend.UP, last_price=None)
+    assert strat.decide(plan, snap_no_last, s).limit_price == Decimal("9.90")
+
+
+def test_dip_buy_ma_rejects_garbage_low_last_price():
+    """EXEC-entry-04 复审：脏 tick(末帧价显著低于合理下沿)弃用之，回退合理下沿，不挂永不成交死单。"""
+    plan = make_plan_row(strategy_family="低吸", setup="均线粘合", market_state="震荡",
+                         reasonable_open_low=Decimal("10.20"))
+    strat = DipBuyMaStrategy()
+    # last_price=0.01 跌穿下沿 10% 以上 → 视为坏帧弃用，限价回退合理下沿 10.20。
+    snap = _snap(open_pct=Decimal("-0.005"), centroid_trend=CentroidTrend.UP, last_price=Decimal("0.01"))
+    out = strat.decide(plan, snap, _settings())
+    assert out.action == EntryAction.DIP_BUY_MA
+    assert out.limit_price == Decimal("10.20")
