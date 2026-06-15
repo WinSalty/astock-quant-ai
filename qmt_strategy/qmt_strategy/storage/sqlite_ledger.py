@@ -142,6 +142,14 @@ class PersistentLocalLedger:
         """
         return self._wq.flush_confirm(timeout)
 
+    def is_healthy(self) -> bool:
+        """透传写队列健康（评审三轮 EXEC-storage-01）：写线程存活 + 未失败 + 最近写成功。
+
+        供 OrderExecutor 在 flush_pending 返回 False 时区分两类：写线程死亡/commit 失败（确定性写丢失，
+        应 fail-closed 拒发单）vs 纯超时（队列拥堵但线程健康，可继续下单 + 强告警）。
+        """
+        return self._wq.is_healthy()
+
     def update(self, biz_order_no: str, **fields: Any) -> None:
         """按字段更新台账行：内存改完后镜像该 biz 的最新 entry。biz 不存在时内存层抛 KeyError（沿用语义）。"""
         with self._lock:

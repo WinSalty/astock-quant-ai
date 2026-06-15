@@ -146,6 +146,9 @@ class Engine:
         self._order = OrderExecutor(
             deps.trader, deps.account, deps.account_id, self._ledger, s, deps.clock, deps.logger,
             decision_emitter=self._decision_emitter,
+            # 下单通道健康回馈（评审三轮 EXEC-risk-05）：order_stock 同步失败/异常 → report_trade_conn(False)
+            # 冻结下单闸；成功 → report_trade_conn(True)。与盘中心跳互补，覆盖通道静默变坏的盲区。
+            conn_health_sink=self.report_trade_conn,
         )
         # 重启幂等（评审 P0-C4）：台账已由 LocalStorage.start()→load_from_db 重建，这里据此重置
         # biz 序号计数器，保证重启后新单序号严格大于历史、不与磁盘失败单同号覆盖/重复下单。

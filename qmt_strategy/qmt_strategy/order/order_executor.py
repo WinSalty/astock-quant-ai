@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..common.auction_window import is_cancel_forbidden, is_lunch_break
 from ..common.time_utils import east8_now_from_utc
@@ -60,9 +60,13 @@ class OrderExecutor:
         clock: Clock,
         logger: StructLogger,
         decision_emitter: Optional[Any] = None,
+        conn_health_sink: Optional[Callable[[bool], None]] = None,
     ) -> None:
         # 依赖注入：trader 是唯一下单/撤单出口；account 为下单/查询入参对象（StockAccount）。
         self._trader = trader
+        # 下单通道健康回馈（评审三轮 EXEC-risk-05）：order_stock 同步失败/异常 → sink(False) 冻结下单闸；
+        # 成功 → sink(True)。缺省 None（离线/单测兼容，无 sink 即旧行为）。Engine 装配时注入 report_trade_conn。
+        self._conn_health_sink = conn_health_sink
         self._account = account
         self._account_id = account_id
         self._ledger = ledger
@@ -88,18 +92,58 @@ class OrderExecutor:
         self._orders_count_by_date: Dict[Any, int] = {}
 
     def _sync_persist_before_order(self) -> None:
-        """发单前同步落盘关键台账行（评审 P0-C3）。
+        """发单后同步落盘 order_id 等关键台账行（评审 P0-C3）。
 
-        write-behind 下 insert 仅入队即返回；若在"已发券商委托、但 PLANNED 行尚未落盘"的窗口崩溃，
-        重启 load_from_db 读不到该行 → 重复下单。故在 order_stock 之前阻塞等待写队列清空，保证
-        "磁盘有计划单"先于"券商收到委托"。内存台账（无写队列/已即时持久）无 flush_pending → no-op。
+        write-behind 下 update 仅入队即返回；用于【发单成功后】把 SUBMITTED+order_id 行落盘，堵"券商有单、
+        台账只认 PLANNED（无 order_id）"的孤儿窗口。此处落盘失败不可再放弃下单（委托已发），仅强告警。
+        内存台账（无写队列/已即时持久）无 flush_pending → no-op。
         """
         flush = getattr(self._ledger, "flush_pending", None)
         if callable(flush):
             ok = flush()
             if ok is False:
-                # 落盘超时：仍继续下单（不下单会漏掉信号），但强告警——崩溃窗口未被完全堵住，需排查写线程。
-                self._logger.warn("order_ledger_flush_timeout_before_order", account_id=self._account_id)
+                # 落盘超时：委托已发，不可回退，仅强告警——崩溃窗口未被完全堵住，需排查写线程。
+                self._logger.warn("order_ledger_flush_timeout_after_order", account_id=self._account_id)
+
+    def _persist_critical_before_order(self, *, kind: str, biz_no: str) -> bool:
+        """发单【前】关键落盘 fail-closed（评审三轮 EXEC-storage-01）。
+
+        业务意图：原实现 flush_pending 返回 False 一律只 warn 后继续 order_stock——在"磁盘满/写线程死/
+        commit 失败"叠加崩溃重启时，券商已收委托但本机无 PLANNED 行 → 重复下单（P0-C3 要堵的窗口本身）。
+        这里区分两类 False：
+        - 写线程死亡/commit 失败（is_healthy()==False，确定性写丢失）→ 返回 False，调用方在 order_stock
+          之前 fail-closed 放弃下单（写队列内部已自带 on_failure→engine.on_storage_failure 停开新仓告警）；
+        - 纯超时（线程健康/无 is_healthy）→ 返回 True，保留"继续下单 + 强告警"（不漏信号，队列拥堵非确定故障）。
+        内存台账（无 flush_pending）→ no-op 返回 True（无 write-behind 崩溃窗口）。
+        """
+        flush = getattr(self._ledger, "flush_pending", None)
+        if not callable(flush):
+            return True
+        if flush() is not False:
+            return True
+        # flush 返回 False：用 is_healthy 区分确定性故障 vs 纯超时。
+        health = getattr(self._ledger, "is_healthy", None)
+        if callable(health) and health() is False:
+            self._logger.error(
+                "order_ledger_persist_failed_fail_closed",
+                kind=kind, biz_order_no=biz_no, account_id=self._account_id,
+            )
+            return False  # 写线程死/commit 失败 → 拒发单（堵重复下单窗口）
+        # 纯超时（线程仍健康/无 is_healthy）：继续下单但强告警。
+        self._logger.warn(
+            "order_ledger_flush_timeout_before_order",
+            kind=kind, biz_order_no=biz_no, account_id=self._account_id,
+        )
+        return True
+
+    def _report_conn(self, ok: bool) -> None:
+        """向下单通道健康源回馈（评审三轮 EXEC-risk-05）；全程吞异常，绝不影响下单热路径。"""
+        if self._conn_health_sink is None:
+            return
+        try:
+            self._conn_health_sink(ok)
+        except Exception:  # noqa: BLE001 健康回馈绝不影响下单
+            pass
 
     # ------------------------------------------------------------------
     # 重启幂等：从台账重建 biz 序号计数器（评审 P0-C4）
@@ -143,7 +187,11 @@ class OrderExecutor:
         """
         now = now if now is not None else self._clock.now_utc()
         ttl = timedelta(seconds=self._settings.order_ttl_seconds)
-        in_flight = (OrderState.SUBMITTED, OrderState.REPORTED, OrderState.PART_TRADED)
+        # CANCELLING 纳入重建（评审三轮 EXEC-order-08）：重启后卡在 CANCELLING 的单也须重建 TTL 截止，
+        # 否则撤单回执丢失 + 重启 = 永远不再被 sweep 盯防、永久占名额占预算。
+        in_flight = (
+            OrderState.SUBMITTED, OrderState.REPORTED, OrderState.PART_TRADED, OrderState.CANCELLING,
+        )
         ttl_rebuilt = 0
         counter: Dict[Any, int] = {}
         for e in self._ledger.all():
@@ -374,21 +422,41 @@ class OrderExecutor:
             updated_at=now,
         )
         self._ledger.insert(entry)
-        # 发单前同步落盘（评审 P0-C3）：保证"磁盘有计划单"先于"券商收到委托"，堵崩溃窗口重复下单。
-        self._sync_persist_before_order()
+        # 发单前关键落盘 fail-closed（评审三轮 EXEC-storage-01）：保证"磁盘有计划单"先于"券商收到委托"。
+        # 写线程死/commit 失败（确定性写丢失）→ 不发委托、台账置 ERROR 留痕 + 留痕决策，堵崩溃后重复下单。
+        if not self._persist_critical_before_order(kind="buy_planned", biz_no=biz_no):
+            self._ledger.update(
+                biz_no, state=OrderState.ERROR,
+                error_msg="发单前关键落盘失败(写线程死/commit失败),fail-closed 放弃下单",
+                updated_at=self._clock.now_utc(),
+            )
+            self._emit_decision(
+                decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=family,
+                order_phase=decision.order_phase,
+                reason="发单前关键落盘失败(写线程死/commit失败),fail-closed 拒发单", reason_code="persist_fail_closed",
+                biz_order_no=biz_no, limit_price=limit_price, plan_volume=plan_volume,
+            )
+            return None
 
         # —— 唯一下单点：限价单（不挂市价，避免滑点失控，§4.4(3)）——
         # price 转 float 仅在调用 trader 边界，Decimal 留作台账/计算口径。
-        order_id = self._trader.order_stock(
-            self._account,
-            decision.ts_code,
-            XT_ORDER_TYPE_BUY,
-            plan_volume,
-            XT_PRICE_TYPE_FIX,
-            float(limit_price) if limit_price is not None else 0.0,
-            decision.strategy_family or "",
-            remark,
-        )
+        # 下单通道健康回馈（评审三轮 EXEC-risk-05）：order_stock 抛异常 → sink(False) 后原样上抛。
+        try:
+            order_id = self._trader.order_stock(
+                self._account,
+                decision.ts_code,
+                XT_ORDER_TYPE_BUY,
+                plan_volume,
+                XT_PRICE_TYPE_FIX,
+                float(limit_price) if limit_price is not None else 0.0,
+                decision.strategy_family or "",
+                remark,
+            )
+        except Exception:  # noqa: BLE001 下单通道异常先反馈不健康再上抛（不吞异常）
+            self._report_conn(False)
+            raise
 
         # 单日下单次数 +1（评审 P0-B3）：真实发出 order_stock 即占配额（含同步失败，下同），
         # 防止转次优链 / 重复推送导致超频下单；幂等命中不会走到这里，故不重复计。
@@ -400,6 +468,7 @@ class OrderExecutor:
         # 业务意图：XtTraderLike.order_stock 约定 <0 为同步失败；若仍置 SUBMITTED，对账会把它误判为
         # 「漏单凭空消失」（missing_report），污染 §6.10 告警语义。这里落 ERROR 终态 + 留痕 + 转次优。
         if order_id is None or order_id < 0:
+            self._report_conn(False)  # 同步下单失败 = 通道可能不可用，反馈不健康（连续失败由 heartbeat/gate 冻结）
             self._ledger.update(
                 biz_no, order_id=order_id, state=OrderState.ERROR,
                 error_msg="order_stock 同步下单失败(返回<0)", updated_at=self._clock.now_utc(),
@@ -425,6 +494,7 @@ class OrderExecutor:
 
         # —— 回填 order_id + 推进到 SUBMITTED（已发 order_stock，待回报）——
         # 注意：到此为止状态最多 SUBMITTED；REPORTED/TRADED 由外部回报推进（§4.4(4)）。
+        self._report_conn(True)  # 同步下单成功 = 通道可用，反馈健康（清零 heartbeat 失败计数）
         self._ledger.update(biz_no, order_id=order_id, state=OrderState.SUBMITTED, updated_at=self._clock.now_utc())
         # 发单成功后【同步落盘 order_id】（评审二轮 P1#7）：原实现 order_id 仅异步镜像，崩溃窗口会产生
         # "券商有单、台账只认 PLANNED（无 order_id）"的孤儿单——重启后无法按 order_id 关联回报/撤单，
@@ -529,26 +599,42 @@ class OrderExecutor:
             updated_at=now,
         )
         self._ledger.insert(entry)
-        # 发单前同步落盘（评审 P0-C3）：卖单同样保证"磁盘有台账"先于"券商收到委托"。
-        self._sync_persist_before_order()
+        # 发单前关键落盘 fail-closed（评审三轮 EXEC-storage-01）：卖单同样保证"磁盘有台账"先于"券商收到委托"。
+        # 写线程死/commit 失败 → 不发卖单、台账置 ERROR 留痕（下一轮卖出巡检可重挂；不留孤儿卖单）。
+        if not self._persist_critical_before_order(kind="sell_planned", biz_no=biz_no):
+            self._ledger.update(
+                biz_no, state=OrderState.ERROR,
+                error_msg="发单前关键落盘失败(写线程死/commit失败),fail-closed 放弃卖单",
+                updated_at=self._clock.now_utc(),
+            )
+            self._logger.error(
+                "order_sell_persist_fail_closed",
+                ts_code=ts_code, account_id=self._account_id, biz_order_no=biz_no,
+            )
+            return None
 
         # —— 唯一下单点：限价卖单 ——
-        order_id = self._trader.order_stock(
-            self._account,
-            ts_code,
-            XT_ORDER_TYPE_SELL,
-            sell_vol,
-            XT_PRICE_TYPE_FIX,
-            float(price) if price is not None else 0.0,
-            "SELL",
-            remark,
-        )
+        try:
+            order_id = self._trader.order_stock(
+                self._account,
+                ts_code,
+                XT_ORDER_TYPE_SELL,
+                sell_vol,
+                XT_PRICE_TYPE_FIX,
+                float(price) if price is not None else 0.0,
+                "SELL",
+                remark,
+            )
+        except Exception:  # noqa: BLE001 下单通道异常先反馈不健康再上抛
+            self._report_conn(False)
+            raise
         # 单日下单次数 +1（评审 P0-B3）：卖单同样占下单次数配额（含同步失败）。
         self._orders_count_by_date[target_trade_date] = (
             self._orders_count_by_date.get(target_trade_date, 0) + 1
         )
 
         if order_id is None or order_id < 0:
+            self._report_conn(False)
             self._ledger.update(
                 biz_no, order_id=order_id, state=OrderState.ERROR,
                 error_msg="sell order_stock 同步下单失败(返回<0)", updated_at=self._clock.now_utc(),
@@ -562,6 +648,7 @@ class OrderExecutor:
             # ERROR 痕迹供对账），下一轮卖出巡检可对该单元重新下卖单。
             return None
 
+        self._report_conn(True)  # 卖单同步下单成功 = 通道可用
         self._ledger.update(biz_no, order_id=order_id, state=OrderState.SUBMITTED, updated_at=self._clock.now_utc())
         # 卖单同样同步落盘 order_id（评审二轮 P1#7）：保证"券商有单"先于台账只认 PLANNED 的孤儿窗口被堵。
         self._sync_persist_before_order()
@@ -608,6 +695,54 @@ class OrderExecutor:
             total += filled_amt + remaining_amt
         return total
 
+    def _held_value(self, ts_code: str) -> Decimal:
+        """该 ts_code 现有持仓市值（评审三轮 EXEC-risk-03）：单票上限净额校验须含既有持仓。
+
+        业务意图：max_position_per_stock 原只当「单笔预算上限」、不计已有持仓，跨日对隔夜持有的同票再
+        满额下单会累计突破单票上限（连板/打板龙头连续上榜正是本系统核心打法）。这里查 QMT 权威持仓取该票
+        市值。口径：market_value 优先，缺则 volume×(avg_price/open_price) 兜底，再缺记 0。
+        边界：查询失败保守返回 0（不臆造、不阻塞；与既有「资产查询失败不下单」由其它闸兜底口径一致）。
+        """
+        from ..common.identity import resolve_code
+
+        target = resolve_code(ts_code)
+        try:
+            rows = self._trader.query_stock_positions(self._account)
+        except Exception as exc:  # noqa: BLE001 持仓查询失败不臆造市值，保守返 0
+            self._logger.warn("order_held_value_query_failed", ts_code=ts_code, error=str(exc))
+            return Decimal("0")
+        total = Decimal("0")
+        for r in rows or []:
+            code = resolve_code(getattr(r, "stock_code", None) or getattr(r, "ts_code", None))
+            if code is None or code != target:
+                continue
+            mv = getattr(r, "market_value", None)
+            if mv is not None:
+                total += Decimal(str(mv))
+                continue
+            vol = getattr(r, "volume", None) or 0
+            px = getattr(r, "avg_price", None) or getattr(r, "open_price", None)
+            if vol and px is not None:
+                total += Decimal(str(vol)) * Decimal(str(px))
+        return total
+
+    def _committed_for_code(self, target_trade_date: Any, ts_code: str) -> Decimal:
+        """当日对该 ts_code 已承诺的活跃买入额（评审三轮 EXEC-risk-03）：单票上限须含当日在途/已成承诺。"""
+        from ..common.identity import resolve_code
+
+        target = resolve_code(ts_code)
+        active = OrderState.active()
+        total = Decimal("0")
+        for e in self._ledger.all_for_date(target_trade_date):
+            if not (e.side == TradeSide.BUY and e.state in active and e.plan_price is not None and e.plan_volume):
+                continue
+            if resolve_code(e.ts_code) != target:
+                continue
+            filled = min(e.filled_volume or 0, e.plan_volume)
+            remaining = e.plan_volume - filled
+            total += (e.avg_filled_price or e.plan_price) * Decimal(filled) + e.plan_price * Decimal(remaining)
+        return total
+
     # ------------------------------------------------------------------
     # 计划股数现算（§4.4(6) 资金口径）
     # ------------------------------------------------------------------
@@ -632,10 +767,28 @@ class OrderExecutor:
             remaining_total = Decimal(str(self._settings.max_total_exposure)) - committed
             if remaining_total < budget:
                 budget = remaining_total
-        # 单票 / 单笔金额上限：取已配置项中的较小值收紧（None 视为不限制）。
-        for cap in (self._settings.per_order_max_amount, self._settings.max_position_per_stock):
-            if cap is not None and Decimal(str(cap)) < budget:
-                budget = Decimal(str(cap))
+        # 单笔金额上限：单笔预算硬上限（不减持仓，None 视为不限制）。
+        if self._settings.per_order_max_amount is not None:
+            cap_order = Decimal(str(self._settings.per_order_max_amount))
+            if cap_order < budget:
+                budget = cap_order
+        # 单票金额上限（评审三轮 EXEC-risk-03）：净额校验须含「该票现有持仓市值 + 当日已承诺该票额」，
+        # effective_cap = cap - held - committed_for_code；<=0 则该票已达/超上限直接返 0 不再加仓（跨日同样生效）。
+        if self._settings.max_position_per_stock is not None:
+            cap_stock = Decimal(str(self._settings.max_position_per_stock))
+            held = self._held_value(decision.ts_code) + self._committed_for_code(
+                decision.target_trade_date, decision.ts_code
+            )
+            effective_cap = cap_stock - held
+            if effective_cap <= 0:
+                self._logger.info(
+                    "order_per_stock_cap_reached",
+                    ts_code=decision.ts_code, account_id=self._account_id,
+                    cap=str(cap_stock), held=str(held),
+                )
+                return 0
+            if effective_cap < budget:
+                budget = effective_cap
         if budget <= 0:
             return 0
         # 可买股数 = 预算 / 限价，向下取整到 100 股整手。
@@ -659,8 +812,19 @@ class OrderExecutor:
         if order_phase == OrderPhase.AUCTION:
             east8_now = east8_now_from_utc(now)
             east8_925 = east8_now.replace(hour=9, minute=25, second=0, microsecond=0)
+            offset = east8_925 - east8_now
+            # 9:25 后下/重投的竞价单防秒撤（评审三轮 EXEC-order-04）：offset<=0（已过定盘点，如 9:25 后补发/
+            # try_next_best 重投陈旧 AUCTION 候选/调度抖动）时不存在"到定盘撤"语义，退化为相对 TTL，绝不返回
+            # <=now 的截止（否则单一提交即被同轮 sweep_expired 秒判到期撤成废单，系统性买不进最强标的）。
+            if offset.total_seconds() <= 0:
+                self._logger.warn(
+                    "order_auction_ttl_after_0925_fallback_relative",
+                    account_id=self._account_id,
+                    note="9:25 后竞价单 TTL 退化为相对存活时限，杜绝提交即秒撤",
+                )
+                return now + timedelta(seconds=self._settings.order_ttl_seconds)
             # 截止偏移 = 东八区(9:25 - now)，加到 UTC naive 的 now 上（不手工 ±8h，仅取差值）。
-            return now + (east8_925 - east8_now)
+            return now + offset
         base = now
         if extend_to_open:
             east8_now = east8_now_from_utc(now)
@@ -694,9 +858,11 @@ class OrderExecutor:
         # 先收集到期 biz（避免遍历中修改字典）。
         due = [biz for biz, deadline in self._ttl_deadline.items() if now >= deadline]
         for biz in due:
-            self.on_ttl_expired(biz)
-            # 处理后移除截止表项，避免重复触发（已撤 / 已转次优 / 已留痕）。
+            # 先移除当前截止再处理（评审三轮 EXEC-order-08）：让 on_ttl_expired 内部对 CANCELLING/卡死单
+            # 续写的「二次截止」生效不被本轮 pop 反向覆盖——撤单回执丢失时该 CANCELLING 单仍会被下轮 sweep
+            # 重新盯防（幂等重发 cancel），而非永久卡 CANCELLING 占名额占预算。
             self._ttl_deadline.pop(biz, None)
+            self.on_ttl_expired(biz)
             handled.append(biz)
         return handled
 
@@ -764,8 +930,35 @@ class OrderExecutor:
                 decision = self._decision_by_biz.get(biz_no)
                 if decision is not None:
                     self.try_next_best(decision)
+            # 续二次截止（评审三轮 EXEC-order-08 + 评审复核 P0）：本单首次撤单进入 CANCELLING，sweep_expired
+            # 已先 pop 掉它的 deadline；若不在此续写，撤单回执丢失时该 CANCELLING 单下轮永不再被 sweep 触达、
+            # grace 重发 cancel 永不触发 = 永久卡名额/预算。故首次进 CANCELLING 即续 now+grace，与下面 CANCELLING
+            # 分支同口径，使其下一轮仍被盯防；CANCELLED 回报到达后单元进终态，再下一轮 sweep 走 else 分支自然清理。
+            grace = timedelta(seconds=getattr(self._settings, "cancel_grace_seconds", 30))
+            self._ttl_deadline[biz_no] = now + grace
+        elif entry.state == OrderState.CANCELLING:
+            # 撤单回执丢失兜底（评审三轮 EXEC-order-08）：已发撤单待回执的单若 CANCELLED 回报因断线/丢包
+            # 永不到达，会永久卡 CANCELLING（仍占建仓名额 + committed 预算，sweep 又已移出截止表）。这里：
+            # 超过宽限期仍 CANCELLING → 幂等重发 cancel（券商无此活动委托会自行拒绝），并续二次截止待下轮再盯；
+            # 未到宽限 → 只留痕、同样续二次截止，避免被永久遗忘。
+            grace = timedelta(seconds=getattr(self._settings, "cancel_grace_seconds", 30))
+            elapsed = now - (entry.updated_at or now)
+            if elapsed >= grace:
+                self._trader.cancel_order_stock(self._account, entry.order_id)
+                self._ledger.update(biz_no, updated_at=now)  # 重置进入 CANCELLING 计时，限制重发频率为每宽限期一次
+                self._logger.warn(
+                    "order_cancelling_recancel",
+                    biz_order_no=biz_no, account_id=self._account_id, order_id=entry.order_id,
+                )
+            else:
+                self._logger.info(
+                    "order_cancelling_within_grace",
+                    biz_order_no=biz_no, account_id=self._account_id, order_id=entry.order_id,
+                )
+            # 续二次截止：sweep 已先 pop 本项，这里重新写入使下轮继续盯防该 CANCELLING 单。
+            self._ttl_deadline[biz_no] = now + grace
         else:
-            # 其余态（CANCELLING 已在撤 / 终态）无需再撤，仅留痕。
+            # 终态（CANCELLED/TRADED/REJECTED/ERROR/...）无需再撤，仅留痕。
             self._logger.info(
                 "order_ttl_state_not_cancelable",
                 biz_order_no=biz_no,

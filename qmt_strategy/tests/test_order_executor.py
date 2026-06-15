@@ -635,3 +635,224 @@ def test_order_stock_uses_limit_price_type(clock_0916):
     assert call["order_type"] == XT_ORDER_TYPE_BUY
     assert call["price_type"] == XT_PRICE_TYPE_FIX
     assert call["price"] == 11.0
+
+
+# ===========================================================================
+# 评审三轮 批次2：发单前落盘 fail-closed / 通道健康回馈 / AUCTION TTL / CANCELLING / 单票上限含持仓
+# ===========================================================================
+from qmt_strategy.contracts.xt_objects import FakeXtPosition  # noqa: E402
+
+
+class _PersistSpyLedger(InMemoryLocalLedger):
+    """可注入 flush_pending/is_healthy 返回值的台账，用于验证发单前落盘 fail-closed（EXEC-storage-01）。"""
+
+    def __init__(self, flush_result=True, healthy=True):
+        super().__init__()
+        self._flush_result = flush_result
+        self._healthy = healthy
+        self.flush_calls = 0
+
+    def flush_pending(self, timeout: float = 5.0) -> bool:
+        self.flush_calls += 1
+        return self._flush_result
+
+    def is_healthy(self) -> bool:
+        return self._healthy
+
+
+class _RcTrader(FakeTrader):
+    """order_stock 返回可注入返回码（<0 模拟同步下单失败），并支持持仓查询。"""
+
+    def __init__(self, rc=1001, positions=None, **kw):
+        super().__init__(**kw)
+        self._rc = rc
+        self._positions = positions or []
+
+    def order_stock(self, account, stock_code, order_type, order_volume, price_type, price,
+                    strategy_name="", order_remark=""):
+        super().order_stock(account, stock_code, order_type, order_volume, price_type, price,
+                            strategy_name, order_remark)
+        return self._rc  # 注入返回码（>0 成功 oid，<0 同步失败）
+
+    def query_stock_positions(self, account):
+        return self._positions
+
+
+# —— EXEC-storage-01：发单前关键落盘 fail-closed ——
+def test_place_fail_closed_when_persist_thread_dead(clock_0916):
+    """写线程死/commit 失败（flush False + is_healthy False）→ 不发委托、台账 ERROR、强告警。"""
+    trader = FakeTrader()
+    led = _PersistSpyLedger(flush_result=False, healthy=False)
+    logger = RecordingLogger()
+    ex = _executor(trader, clock_0916, ledger=led, logger=logger)
+    biz = ex.place(_decision())
+    assert biz is None                              # fail-closed 放弃下单
+    assert trader.order_calls == []                 # 未发券商委托（堵重复下单窗口）
+    assert "order_ledger_persist_failed_fail_closed" in logger.events()
+
+
+def test_place_continues_on_pure_flush_timeout(clock_0916):
+    """纯超时（flush False 但 is_healthy True）→ 仍下单 + 强告警（不漏信号）。"""
+    trader = FakeTrader()
+    led = _PersistSpyLedger(flush_result=False, healthy=True)
+    logger = RecordingLogger()
+    ex = _executor(trader, clock_0916, ledger=led, logger=logger)
+    biz = ex.place(_decision())
+    assert biz is not None
+    assert len(trader.order_calls) == 1             # 拥堵超时仍下单
+    assert "order_ledger_flush_timeout_before_order" in logger.events()
+
+
+# —— EXEC-risk-05：order_stock 同步成败回馈通道健康 ——
+def test_order_stock_failure_reports_conn_down(clock_0916):
+    states = []
+    trader = _RcTrader(rc=-1)
+    ex = _executor(trader, clock_0916)
+    ex._conn_health_sink = states.append
+    ex.place(_decision(next_best=()))
+    assert states and states[-1] is False           # 同步失败 → 反馈不健康
+
+
+def test_order_stock_success_reports_conn_up(clock_0916):
+    states = []
+    trader = FakeTrader()
+    ex = _executor(trader, clock_0916)
+    ex._conn_health_sink = states.append
+    ex.place(_decision())
+    assert states == [True]                          # 成功 → 反馈健康
+
+
+# —— EXEC-order-04：AUCTION TTL 在 9:25 后退化为相对 TTL ——
+def test_auction_ttl_after_0925_uses_relative_ttl():
+    clock = FakeClock(utc_at_east8(T_BUY, 9, 26, 0))
+    ex = _executor(FakeTrader(), clock, settings=Settings(order_ttl_seconds=60))
+    now = clock.now_utc()
+    deadline = ex._compute_ttl_deadline(now, OrderPhase.AUCTION)
+    assert deadline > now                            # 绝不返回 <=now
+    assert (deadline - now).total_seconds() == 60    # 退化为相对 order_ttl_seconds
+
+
+def test_auction_ttl_before_0925_unchanged(clock_0916):
+    ex = _executor(FakeTrader(), clock_0916)
+    now = clock_0916.now_utc()
+    deadline = ex._compute_ttl_deadline(now, OrderPhase.AUCTION)
+    # 9:16 → 截止仍是当日 9:25 定盘（相对 now 偏移 9 分钟）。
+    assert (deadline - now).total_seconds() == 9 * 60
+
+
+def test_place_after_0925_not_swept_immediately():
+    clock = FakeClock(utc_at_east8(T_BUY, 9, 26, 0))
+    ex = _executor(FakeTrader(), clock, settings=Settings(order_ttl_seconds=60))
+    biz = ex.place(_decision(order_phase=OrderPhase.AUCTION))
+    handled = ex.sweep_expired(clock.now_utc())
+    assert biz not in handled                        # 提交即被秒撤的回归不再发生
+
+
+# —— EXEC-order-08：CANCELLING 撤单回执丢失兜底 ——
+def _to_cancelling(ex, led, biz, *, aged_seconds):
+    """把台账单置 CANCELLING，并把 updated_at 设到 aged_seconds 前（模拟撤单回执久未到达）。"""
+    from datetime import timedelta
+    past = ex._clock.now_utc() - timedelta(seconds=aged_seconds)
+    led.update(biz, state=OrderState.CANCELLING, updated_at=past)
+
+
+def test_cancelling_recancel_after_grace(clock_0916):
+    trader = FakeTrader()
+    led = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=led, settings=Settings(cancel_grace_seconds=30))
+    biz = ex.place(_decision())
+    oid = led.get(biz).order_id
+    trader.cancel_calls.clear()
+    _to_cancelling(ex, led, biz, aged_seconds=31)    # 超宽限
+    ex.on_ttl_expired(biz)
+    assert oid in trader.cancel_calls                # 超宽限幂等重发 cancel
+    assert biz in ex._ttl_deadline                   # 续二次截止待下轮再盯
+
+
+def test_cancelling_within_grace_not_recancelled(clock_0916):
+    trader = FakeTrader()
+    led = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=led, settings=Settings(cancel_grace_seconds=30))
+    biz = ex.place(_decision())
+    trader.cancel_calls.clear()
+    _to_cancelling(ex, led, biz, aged_seconds=5)     # 未到宽限
+    ex.on_ttl_expired(biz)
+    assert trader.cancel_calls == []                 # 未到宽限不重发
+    assert biz in ex._ttl_deadline                   # 但仍续截止不遗忘
+
+
+def test_cancelling_not_dropped_by_sweep(clock_0916):
+    trader = FakeTrader()
+    led = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=led, settings=Settings(cancel_grace_seconds=30))
+    biz = ex.place(_decision())
+    _to_cancelling(ex, led, biz, aged_seconds=5)
+    # 让 TTL 截止已过期 → sweep 处理；CANCELLING 不应被永久移出截止表。
+    from datetime import timedelta
+    ex._ttl_deadline[biz] = ex._clock.now_utc() - timedelta(seconds=1)
+    ex.sweep_expired(ex._clock.now_utc())
+    assert biz in ex._ttl_deadline                   # 续二次截止（未被 sweep 反向 pop 永久丢失）
+
+
+def test_rebuild_runtime_state_includes_cancelling(clock_0916):
+    trader = FakeTrader()
+    led = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=led)
+    biz = ex.place(_decision())
+    led.update(biz, state=OrderState.CANCELLING, updated_at=clock_0916.now_utc())
+    ex._ttl_deadline.clear()                          # 模拟重启清空运行态
+    ex.rebuild_runtime_state()
+    assert biz in ex._ttl_deadline                    # CANCELLING 单重启后重建 TTL 继续盯防
+
+
+# —— EXEC-risk-03：单票金额上限计入既有持仓 ——
+def test_plan_volume_zero_when_held_at_cap(clock_0916):
+    # 现有持仓市值已达单票上限 → 不再加仓（_plan_volume 返 0 → place 返回 None）。
+    pos = FakeXtPosition(account_id="acc", stock_code="600036.SH", volume=10000,
+                         can_use_volume=10000, open_price=Decimal("11.0"),
+                         market_value=Decimal("110000"))
+    trader = _RcTrader(rc=1001, positions=[pos])
+    ex = _executor(trader, clock_0916, settings=Settings(max_position_per_stock=Decimal("100000")))
+    biz = ex.place(_decision(plan_volume=None))       # 触发 _plan_volume 现算
+    assert biz is None
+    assert trader.order_calls == []
+
+
+def test_plan_volume_subtracts_held_position(clock_0916):
+    # 现有持仓占一半上限 → 新单金额钳到 cap-held 以内（不突破单票上限）。
+    pos = FakeXtPosition(account_id="acc", stock_code="600036.SH", volume=5000,
+                         can_use_volume=5000, open_price=Decimal("11.0"),
+                         market_value=Decimal("55000"))
+    trader = _RcTrader(rc=1001, positions=[pos], cash="1000000")
+    ex = _executor(trader, clock_0916,
+                   settings=Settings(max_position_per_stock=Decimal("100000")))
+    biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
+    assert biz is not None
+    call = trader.order_calls[0]
+    # 新单金额 = vol×price <= cap-held = 100000-55000 = 45000。
+    assert call["order_volume"] * call["price"] <= 45000
+
+
+def test_cancelling_real_chain_recancel_after_grace():
+    """评审复核 P0：走真实链路（非手工置态）——SUBMITTED 单到期撤成 CANCELLING 后仍被持续盯防，
+    撤单回执丢失时超 grace 由 sweep 幂等重发 cancel（验证首次进 CANCELLING 已续 deadline）。"""
+    from datetime import timedelta
+    # 09:31 连续交易段（可撤、非午休），TTL 短、grace 短便于推进。
+    clock = FakeClock(utc_at_east8(T_BUY, 9, 31, 0))
+    trader = FakeTrader()
+    led = InMemoryLocalLedger()
+    ex = _executor(trader, clock, ledger=led,
+                   settings=Settings(order_ttl_seconds=10, cancel_grace_seconds=30))
+    biz = ex.place(_decision(order_phase=OrderPhase.OPENING))
+    oid = led.get(biz).order_id
+    # 推进过 TTL → sweep#1：撤单 → CANCELLING，且 deadline 仍被续上（非永久丢失）。
+    clock.advance(11)
+    ex.sweep_expired(clock.now_utc())
+    assert led.get(biz).state == OrderState.CANCELLING
+    assert biz in ex._ttl_deadline                      # 首次进 CANCELLING 已续 deadline
+    assert trader.cancel_calls == [oid]
+    # 模拟撤单回执丢失：推进过 grace → sweep#2 幂等重发 cancel。
+    clock.advance(31)
+    ex.sweep_expired(clock.now_utc())
+    assert trader.cancel_calls == [oid, oid]            # 超 grace 幂等重发
+    assert biz in ex._ttl_deadline                      # 仍续二次截止待回执/再撤
