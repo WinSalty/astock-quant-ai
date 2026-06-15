@@ -119,6 +119,13 @@ class SellDecider:
 
         prior_strong = self._is_prior_strong(unit, prior)
 
+        # —— 盘口缺失安全默认（评审三轮 EXEC-position-08）：盘口竞价信息整体缺失（open_pct 为 None 且各结构
+        # 布尔全 False、open_times 0）时，原兜底分支会对先验弱标的以「弱开」口径误清仓——违背 §5.4.3「没有可信
+        # 盘口不做实时卖出决策」与 main.py「book is None 不卖」口径。这里显式区分「盘口缺失→HOLD」与「open_pct<=0
+        # 真实弱开→reduce_or_clear」：盘口缺失一律安全默认 HOLD，不在无可信盘口下卖在竞价低点。
+        if self._is_book_missing(book):
+            return self._hold(unit, reason="盘口缺失,安全默认不卖", phase="auction")
+
         # —— 扳机一：量价背离（盘口背离 或 命中 fail_conditions 背离类）→ 一票否决续持 ——
         # 业务意图：高开但量能虚高 / 骤缩，封板预期落空，即便先验强也转减 / 清（盘口一票否决，§5.3.1）。
         if book.price_volume_diverge or self._hit_fail(prior, _FAIL_KW_DIVERGE):
@@ -322,6 +329,24 @@ class SellDecider:
         if book.open_pct is None:
             return False
         return book.open_pct > Decimal("0")
+
+    def _is_book_missing(self, book: OrderBook) -> bool:
+        """盘口竞价信息整体缺失判定（评审三轮 EXEC-position-08）。
+
+        判据：open_pct 为 None（无高开幅度）且各结构布尔全 False（未背离/未封板/未炸板/未跌破支撑/未放量）
+        且 open_times==0 且 last_price 缺失——即盘口对象存在但字段整体空白（数据未到/降级 B），与「确实弱开
+        (open_pct<=0)」区分。缺失时安全默认 HOLD，避免无可信盘口误清仓。
+        """
+        return (
+            book.open_pct is None
+            and book.last_price is None
+            and not book.price_volume_diverge
+            and not book.is_sealed
+            and not book.broke_board
+            and not book.below_support
+            and not book.volume_surge
+            and book.open_times == 0
+        )
 
     def _is_weak_open(self, book: OrderBook) -> bool:
         """平开 / 低开走弱：open_pct <= 0（高开幅度非正即视为弱开）。

@@ -29,6 +29,7 @@ from ..contracts.enums import (
     EntryAction,
     OrderPhase,
     OrderState,
+    OrderStatus,
     PositionState,
     RiskVerdict,
     SellActionType,
@@ -361,6 +362,9 @@ class Engine:
         self._market_state = self._extract_market_state(ctx)
         # 推进持仓状态：跨买入日 LOCKED_T1 → HOLDING，并刷新先验挂接（§5.6）。
         self._position.refresh_state(today)
+        # 盘前对账跨日卡死 SELLING 单元（评审三轮 EXEC-position-04）：隔夜/断线重启后昨日 SELLING 单元若其卖单
+        # 实际已撤/废且复位回调丢失，会跨日卡 SELLING 永久漏卖；这里主动 query 券商委托终态、零成交终态则复位重挂。
+        self._reconcile_stuck_selling(today)
         # 用 QMT 权威持仓重建/校准持仓状态机（评审二轮 P0#6/#29/#30/#38）：重启/断线后隔夜 T+1 持仓
         # 必定进入卖出决策，且可卖量以 QMT 为权威。须在 refresh_state 之后，保证 QMT can_use 是最终口径。
         self._rebuild_positions_from_broker(today)
@@ -392,6 +396,52 @@ class Engine:
     # ------------------------------------------------------------------
     # 账户级风控输入（评审 P0-B2：喂给 risk.gate，使账户回撤击穿真正触发 FREEZE）
     # ------------------------------------------------------------------
+    def _reconcile_stuck_selling(self, today: date) -> None:
+        """盘前对账跨日卡死 SELLING 单元（评审三轮 EXEC-position-04）。
+
+        查 QMT query_stock_orders 建「ts_code → 当日卖单终态」映射（归一码），交 PositionManager.reconcile_stuck_selling
+        对跨日仍 SELLING 的单元裁决：零成交终态(撤/废/拒/错)→复位重挂；已成/部成/仍在途→不动；查不到→保守不动+告警。
+        边界：query_stock_orders 失败/未实测口径时整体保守跳过（不复位、不误判），仅告警。
+        order_type==XT_ORDER_TYPE_SELL 识别卖单方向；order_status 经 status_resolver 归一为 OrderStatus 再映射。
+        """
+        from ..common.identity import resolve_code
+        from ..data_writer import normalize as _normalize
+        from ..order.order_executor import XT_ORDER_TYPE_SELL
+
+        try:
+            orders = self._deps.trader.query_stock_orders(self._deps.account)
+        except Exception as exc:  # noqa: BLE001 查询失败保守跳过（不复位、不误判），仅告警
+            self._logger.warn("engine_stuck_selling_query_failed", error=str(exc))
+            return
+        # OrderStatus → reconcile 终态字符串（撤/废/拒/错=复位；已成=交回报；在途=不动）。
+        _term = {
+            OrderStatus.CANCELLED: "CANCELLED", OrderStatus.REJECTED: "REJECTED",
+            OrderStatus.ERROR: "ERROR", OrderStatus.TRADED: "FILLED",
+            OrderStatus.PART_TRADED: "PARTIAL", OrderStatus.REPORTED: "ACTIVE",
+        }
+        state_by_code: Dict[str, str] = {}
+        for o in orders or []:
+            try:
+                if getattr(o, "order_type", None) != XT_ORDER_TYPE_SELL:
+                    continue  # 只看卖单方向（买单不参与卖出卡死对账）
+                code = resolve_code(getattr(o, "stock_code", None))
+                if code is None:
+                    continue
+                status = _normalize.default_status_resolver(getattr(o, "order_status", None))
+                term = _term.get(status)
+                if term is not None:
+                    # 同票多卖单取「更靠终态」的：已撤/废优先于在途（保证卡死能被识别复位）。
+                    prev = state_by_code.get(code)
+                    if prev is None or term in ("CANCELLED", "REJECTED", "ERROR"):
+                        state_by_code[code] = term
+            except Exception:  # noqa: BLE001 单条委托解析失败跳过，不拖垮整体对账
+                continue
+
+        def _query(account_id: str, ts_code: str):
+            return state_by_code.get(ts_code)
+
+        self._position.reconcile_stuck_selling(today, _query)
+
     def _rebuild_positions_from_broker(self, today: date) -> None:
         """盘前 / 重连后用 QMT 权威持仓重建 / 校准持仓状态机（评审二轮 P0#6/#29/#30/#38）。
 
@@ -658,17 +708,13 @@ class Engine:
                     rec, rec.trade_date, account_id=self._account_id, ts_code=ts_code
                 )
             elif side == TradeSide.SELL:
-                # 卖出：扣减对应单元（无该单元则忽略——手工单/非本系统单）。
-                unit = self._position.get_unit(self._account_id, ts_code)
-                if unit is None:
-                    return
-                # 卖出成交按 traded_id 去重（复用单元去重集合），防券商重投/断线重放重复扣减。
-                if traded_id is not None:
-                    if traded_id in unit.counted_trade_ids:
-                        return
-                    unit.counted_trade_ids.add(traded_id)
-                if traded_volume:
-                    self._position.apply_sell_fill(unit, int(traded_volume))
+                # 卖出：经原子方法一体完成「去重 + 扣减 + 状态推进」（评审三轮 EXEC-position-01+EXEC-DW-04）：
+                # 原实现 get_unit 拿 live 引用后在锁外 counted_trade_ids 判重/add + apply_sell_fill 三步，去重检查
+                # 与扣减之间的窗口可被另一回调线程插入导致重复扣减/丢更新；改走 apply_sell_fill_by_trade 临界区原子化。
+                self._position.apply_sell_fill_by_trade(
+                    self._account_id, ts_code, traded_id,
+                    int(traded_volume) if traded_volume else 0,
+                )
         except Exception as exc:  # noqa: BLE001 回写失败不得吞掉成交落库/台账事实，仅告警
             self._logger.error(
                 "position_writeback_failed",
@@ -683,10 +729,10 @@ class Engine:
         把对应 (account_id, ts_code) 持仓单元从 SELLING 复位回 HOLDING，使下一轮卖出巡检可重新挂单，
         止损/破位清仓不再因一次挂单失败而永久失效。无该单元（手工/非本系统）则忽略。
         """
-        unit = self._position.get_unit(self._account_id, ts_code)
-        if unit is None:
-            return
-        self._position.revert_selling(unit, reason="sell_order_terminal_failed")
+        # 原子复位（评审三轮 EXEC-position-01）：不再 get_unit 拿 live 引用在锁外改，改走 revert_selling_by_code。
+        self._position.revert_selling_by_code(
+            self._account_id, ts_code, reason="sell_order_terminal_failed"
+        )
 
     # ------------------------------------------------------------------
     # 竞价轮询（§3 / §4 建仓链路）
@@ -923,15 +969,19 @@ class Engine:
                 "engine_sell_state_not_sellable", ts_code=unit.ts_code, state=str(unit.state)
             )
             return False
+        # 可卖上限扣减在途未成卖量（评审三轮 EXEC-position-03）：可卖基数用 sellable_remaining(=can_use_volume
+        # - on_road_sell_volume) 而非 can_use_volume，防 REDUCE 部成后 PART_SOLD 单元相邻 tick 就「在途未成量」
+        # 重复挂减仓单超挂。
+        avail = self._position.sellable_remaining(unit)
         if action_type == SellActionType.CLEAR:
             # 清仓卖全部可用量（含不足整手的零股——A 股允许一次性清掉零股余额）。
-            decision_vol = unit.can_use_volume
+            decision_vol = avail
         else:
             # 减仓须为整手（评审二轮 P2#37）：按比例算出的减仓量【向下取整到 100 股】，否则奇数股卖单被券商
             # 拒为废单（部分卖出会留下余仓，必须整手；清仓才允许零股）。不足一手则减仓量为 0、本轮不卖。
             ratio = reduce_ratio if reduce_ratio is not None else Decimal("0.5")
-            decision_vol = (int(unit.can_use_volume * ratio) // 100) * 100
-        sell_vol = self._risk.clamp_sell_volume(decision_vol, unit.can_use_volume)
+            decision_vol = (int(avail * ratio) // 100) * 100
+        sell_vol = self._risk.clamp_sell_volume(decision_vol, avail)
         if sell_vol <= 0:
             return False
         # 价位取实时盘口现价（评审 P2）：优先 book.last_price（须 >0）；缺失/非正才回退成本价并告警。
@@ -973,7 +1023,8 @@ class Engine:
         # 把该单元推进（刚发卖单秒成 → PART_SOLD/SOLD，或并发推进）。仅当单元仍处可发卖态才 mark_selling，避免对
         # 已被回调推进的单元强行改写而抛 ValueError 中断整轮卖出（持仓事实以回调推进为准）。
         if unit.state in (PositionState.HOLDING, PositionState.PART_SOLD):
-            self._position.mark_selling(unit)
+            # 冻结本次在途委托量（评审三轮 EXEC-position-03）：传 sell_volume 使 on_road_sell_volume += sell_vol。
+            self._position.mark_selling(unit, sell_volume=sell_vol)
         else:
             self._logger.info(
                 "engine_sell_unit_already_advanced", ts_code=unit.ts_code, state=str(unit.state)

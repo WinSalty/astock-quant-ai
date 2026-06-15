@@ -298,6 +298,13 @@ class PositionUnit:
     buy_date: Optional[date] = None         # 买入日 B（= target_trade_date）
     # 去重：已计入的 traded_id，防重复回报重复加仓（§5.6 幂等）
     counted_trade_ids: set = field(default_factory=set)
+    # 在途未成卖出量（评审三轮 EXEC-position-03）：已挂出但尚未成交的卖单量。可卖上限 =
+    # can_use_volume - on_road_sell_volume，防 REDUCE 部成后 PART_SOLD 单元相邻 tick 就在途未成量重复挂减仓单。
+    # mark_selling 时 += 本次卖量冻结，apply_sell_fill 成交回扣，revert_selling 终态失败清零。
+    on_road_sell_volume: int = 0
+    # 量权威标记（评审三轮 EXEC-position-07）：True 表示 volume 来自券商快照/重建权威量，迟到/重复买入
+    # 回调只登记 traded_id 去重、不再二次累加 volume（避免在权威量上重复加仓多报持仓）；下次快照重新校准。
+    volume_authoritative: bool = False
 
 
 @dataclass

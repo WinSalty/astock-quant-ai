@@ -166,23 +166,152 @@ def test_fifo_weighted_avg_cost(calendar):
 # 补充：卖出成交回写——全成 SOLD、部成 PART_SOLD（覆盖 mark_selling / apply_sell_fill）
 # ---------------------------------------------------------------------------
 def test_apply_sell_fill_full_and_part(calendar):
+    # 评审三轮 EXEC-position-01：get_unit 返回只读深拷贝，写入走原子方法（apply_sell_fill_by_trade）；
+    # 发卖单用 sellable_units 的 live 引用（卖出 pass 口径）。
     pm = _make_pm(calendar)
     pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
     pm.refresh_state(T_SELL)
-    unit = pm.get_unit(ACCOUNT, TS)
 
-    # 发卖出委托：进入 SELLING。
-    pm.mark_selling(unit)
-    assert unit.state == PositionState.SELLING
+    # 发卖出委托：进入 SELLING（live 引用）。
+    live = pm.sellable_units(T_SELL)[0]
+    pm.mark_selling(live)
+    assert pm.get_unit(ACCOUNT, TS).state == PositionState.SELLING
 
-    # 部成 600：PART_SOLD，剩余 400。
-    pm.apply_sell_fill(unit, 600)
-    assert unit.state == PositionState.PART_SOLD
-    assert unit.volume == 400
+    # 部成 600（原子方法，按 traded_id 去重+扣减）：PART_SOLD，剩余 400。
+    pm.apply_sell_fill_by_trade(ACCOUNT, TS, "S1", 600)
+    u = pm.get_unit(ACCOUNT, TS)
+    assert u.state == PositionState.PART_SOLD
+    assert u.volume == 400
 
     # 剩余 400 全成：SOLD、单元归零关闭。
-    pm.apply_sell_fill(unit, 400)
-    assert unit.state == PositionState.SOLD
-    assert unit.volume == 0
+    pm.apply_sell_fill_by_trade(ACCOUNT, TS, "S2", 400)
+    u = pm.get_unit(ACCOUNT, TS)
+    assert u.state == PositionState.SOLD
+    assert u.volume == 0
     # 已关闭单元不再进入可卖集合。
     assert pm.sellable_units(T_SELL) == []
+
+
+# ===========================================================================
+# 评审三轮 批次3：字段级并发安全 / 在途量冻结 / 量权威 / 卡死 SELLING 对账
+# ===========================================================================
+import threading  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+
+def _pos_rec(ts_code=TS, volume=1000, can_use=1000, avg=Decimal("10.0"), account_id=ACCOUNT):
+    """构造 rebuild_from_broker_positions 的券商持仓记录（PositionRecord 等价对象）。"""
+    return SimpleNamespace(ts_code=ts_code, volume=volume, can_use_volume=can_use,
+                           avg_price=avg, account_id=account_id)
+
+
+# —— EXEC-position-01：get_unit 只读快照 + 原子方法去重/无丢更新 ——
+def test_get_unit_returns_readonly_snapshot(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    snap = pm.get_unit(ACCOUNT, TS)
+    snap.volume = 999  # 改快照不应影响内部 live 单元
+    assert pm.get_unit(ACCOUNT, TS).volume == 1000
+
+
+def test_apply_sell_fill_by_trade_idempotent(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    pm.refresh_state(T_SELL)
+    pm.apply_sell_fill_by_trade(ACCOUNT, TS, "SX", 300)
+    pm.apply_sell_fill_by_trade(ACCOUNT, TS, "SX", 300)  # 同 traded_id 重投：只扣一次
+    assert pm.get_unit(ACCOUNT, TS).volume == 700
+
+
+def test_concurrent_sell_fill_no_lost_update(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=10000), T_BUY, account_id=ACCOUNT)
+    pm.refresh_state(T_SELL)
+    n = 20
+
+    def worker(i):
+        pm.apply_sell_fill_by_trade(ACCOUNT, TS, f"S{i}", 100)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert pm.get_unit(ACCOUNT, TS).volume == 10000 - 100 * n  # 无丢更新
+
+
+# —— EXEC-position-03：在途未成卖量冻结 ——
+def test_mark_selling_freezes_on_road_and_sellable_remaining(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    pm.refresh_state(T_SELL)
+    live = pm.sellable_units(T_SELL)[0]
+    pm.mark_selling(live, sell_volume=600)
+    assert pm.sellable_remaining(live) == 400        # 1000 - 在途 600
+    # 部成 300 → PART_SOLD，可卖上限 = (1000-300) - (600-300) = 400（不含在途未成 300）。
+    pm.apply_sell_fill_by_trade(ACCOUNT, TS, "S1", 300)
+    u = pm.sellable_units(T_SELL)[0]
+    assert u.state == PositionState.PART_SOLD
+    assert pm.sellable_remaining(u) == 400
+
+
+def test_revert_selling_clears_on_road(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    pm.refresh_state(T_SELL)
+    live = pm.sellable_units(T_SELL)[0]
+    pm.mark_selling(live, sell_volume=600)
+    pm.revert_selling_by_code(ACCOUNT, TS, reason="terminal_fail")
+    u = pm.get_unit(ACCOUNT, TS)
+    assert u.state == PositionState.HOLDING
+    assert u.on_road_sell_volume == 0                # 终态失败清零在途
+
+
+# —— EXEC-position-07：量权威迟到回调不二次累加 ——
+def test_rebuild_then_late_buy_callback_no_double_count(calendar):
+    pm = _make_pm(calendar)
+    pm.rebuild_from_broker_positions([_pos_rec(volume=1000, can_use=1000)], T_SELL)
+    assert pm.get_unit(ACCOUNT, TS).volume_authoritative is True
+    # 迟到买入回调（已被权威量计入）：新 traded_id，但权威量不再二次累加。
+    pm.mark_position_on_fill(_fill(traded_id="LATE", volume=1000), T_SELL, account_id=ACCOUNT)
+    u = pm.get_unit(ACCOUNT, TS)
+    assert u.volume == 1000                          # 不二次累加
+    assert "LATE" in u.counted_trade_ids             # 但登记去重
+
+
+def test_normal_buy_still_accumulates(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(traded_id="A", volume=1000), T_BUY, account_id=ACCOUNT)
+    pm.mark_position_on_fill(_fill(traded_id="B", volume=500), T_BUY, account_id=ACCOUNT)
+    assert pm.get_unit(ACCOUNT, TS).volume == 1500   # 非权威单元正常加仓
+
+
+# —— EXEC-position-04：盘前对账跨日卡死 SELLING ——
+def test_reconcile_stuck_selling_reverts_on_cancelled(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    pm.refresh_state(T_SELL)
+    pm.mark_selling(pm.sellable_units(T_SELL)[0], sell_volume=1000)
+    n = pm.reconcile_stuck_selling(T_SELL, lambda a, c: "CANCELLED")
+    assert n == 1
+    assert pm.get_unit(ACCOUNT, TS).state == PositionState.HOLDING  # 零成交终态复位重挂
+
+
+def test_reconcile_stuck_selling_keeps_on_unknown(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    pm.refresh_state(T_SELL)
+    pm.mark_selling(pm.sellable_units(T_SELL)[0], sell_volume=1000)
+    n = pm.reconcile_stuck_selling(T_SELL, lambda a, c: None)  # 查不到 → 保守不动
+    assert n == 0
+    assert pm.get_unit(ACCOUNT, TS).state == PositionState.SELLING
+
+
+def test_reconcile_stuck_selling_keeps_on_filled(calendar):
+    pm = _make_pm(calendar)
+    pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    pm.refresh_state(T_SELL)
+    pm.mark_selling(pm.sellable_units(T_SELL)[0], sell_volume=1000)
+    n = pm.reconcile_stuck_selling(T_SELL, lambda a, c: "FILLED")  # 已成 → 交回报，不复位
+    assert n == 0
+    assert pm.get_unit(ACCOUNT, TS).state == PositionState.SELLING

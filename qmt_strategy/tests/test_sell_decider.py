@@ -397,3 +397,32 @@ def test_strong_prior_neutral_book_holds_intraday(decider: SellDecider) -> None:
     action = decider.decide_intraday(unit, _prior(continuation_prob=Decimal("0.8")), book)
     assert action.action is SellActionType.HOLD
     assert action.reason == "盘口未触发，维持续持"
+
+
+# ===========================================================================
+# 评审三轮 EXEC-position-08：竞价盘口缺失安全默认 HOLD（区别于 open_pct<=0 真实弱开）
+# ===========================================================================
+def test_auction_missing_book_holds(decider: SellDecider) -> None:
+    # 盘口整体缺失（open_pct None + last_price None + 各结构布尔全 False + open_times 0）+ 先验弱：
+    # 应安全默认 HOLD，不再以"弱开"误清仓（与 main.py book is None 不卖口径对齐）。
+    unit = _unit(mode=PositionMode.TECH_EXIT)
+    book = _book()  # 全缺失
+    action = decider.decide_auction(unit, None, book)
+    assert action.action is SellActionType.HOLD
+    assert "盘口缺失" in action.reason
+
+
+def test_auction_flat_open_zero_still_exits(decider: SellDecider) -> None:
+    # 平开 open_pct==0（<=0 真实弱开，非缺失：open_pct 非 None）→ 仍走 reduce_or_clear，不被误判为缺失。
+    unit = _unit(mode=PositionMode.TECH_EXIT)
+    book = _book(open_pct=Decimal("0"))
+    action = decider.decide_auction(unit, None, book)
+    assert action.action in (SellActionType.CLEAR, SellActionType.REDUCE)
+
+
+def test_auction_missing_open_pct_but_sealed_not_treated_missing(decider: SellDecider) -> None:
+    # open_pct None 但 is_sealed=True（有结构信号）→ 不算缺失，按封板续持路径，不误 HOLD-盘口缺失。
+    unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
+    book = _book(is_sealed=True, seal_to_float_ratio=Decimal("0.05"))
+    action = decider.decide_auction(unit, _prior(continuation_prob=Decimal("0.8")), book)
+    assert action.reason != "盘口缺失,安全默认不卖"
