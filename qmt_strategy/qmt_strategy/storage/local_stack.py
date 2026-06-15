@@ -64,8 +64,13 @@ class LocalStorage:
         )
         self._started = False
 
-    def start(self) -> None:
-        """建表（幂等）→ 起写线程 → 重建内存台账（重启幂等）。进程启动时调用一次。"""
+    def start(self, today: Optional[date] = None) -> None:
+        """建表（幂等）→ 起写线程 → 重建内存台账（重启幂等）。进程启动时调用一次。
+
+        today（评审三轮 EXEC-storage-05）：传入东八区当日时，load_from_db 只装载近 N 日窗口的台账行
+        （防跨日只增不减、find_active 不随天数膨胀）；缺省 None 退化全量装载（向后兼容）。生产由 run.py
+        传 east8 当日启用窗口。
+        """
         if self._started:
             return
         # 建表用独立连接（与写线程连接分离），完成即关。
@@ -76,7 +81,7 @@ class LocalStorage:
             conn.close()
         self._wq.start()
         # 从 SQLite 重建内存下单台账：重启后 has_active 仍有效 → 不重复下单（关键不变量「重启幂等」）。
-        self.ledger.load_from_db()
+        self.ledger.load_from_db(today=today)
         self._started = True
         self._logger.info("local_storage_started", db_path="***", account_id="***")
 

@@ -40,12 +40,13 @@ def _entry(
     order_id=None,
     ts_code: str = "600036.SH",
     strategy_family: str = "打板",
+    target_trade_date: date = T_BUY,
 ) -> LedgerEntry:
     """构造一行台账：默认主板打板计划单。"""
     return LedgerEntry(
         biz_order_no=biz,
         account_id="acc1",
-        target_trade_date=T_BUY,
+        target_trade_date=target_trade_date,
         ts_code=ts_code,
         strategy_family=strategy_family,
         side=TradeSide.BUY,
@@ -233,3 +234,108 @@ def test_write_does_not_block_when_writer_stalled(db_path):
     finally:
         blocker.set()  # 释放写线程
         wq.stop()
+
+
+# ===========================================================================
+# 评审三轮 EXEC-order-01 / storage-05：成交明细去重重建 + 窗口装载 + 盘后清理
+# ===========================================================================
+def test_fill_detail_idempotent_across_restart(db_path, write_queue):
+    """EXEC-order-01：同 traded_id 重投 + 重启按明细重算 → filled_volume 不翻倍，明细表只一行。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="b1", order_id=1, plan_volume=1000, state=OrderState.SUBMITTED))
+    led.add_fill(1, "t1", 500, Decimal("11.00"))
+    led.add_fill(1, "t1", 500, Decimal("11.00"))   # 重投（同 traded_id）
+    assert led.flush_pending(2.0)
+
+    led2 = _new_ledger(db_path, write_queue)
+    led2.load_from_db()
+    assert led2.get("b1").filled_volume == 500     # 去重，不翻倍
+
+    conn = sqlite3.connect(db_path)
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM local_order_fill WHERE biz_order_no='b1'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 1                                  # 明细表唯一键去重，只一行
+
+
+def test_fill_detail_recompute_corrects_stale_snapshot(db_path, write_queue):
+    """EXEC-order-01：崩溃窗口（整行快照偏旧）重启后，以明细重算纠正 filled_volume 并按量收口状态。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="b2", order_id=2, plan_volume=1000, state=OrderState.SUBMITTED))
+    led.add_fill(2, "t1", 600, Decimal("11.00"))
+    led.add_fill(2, "t2", 400, Decimal("11.00"))   # 累计达计划量 1000 → TRADED
+    assert led.flush_pending(2.0)
+    # 人为把整行快照的 filled_volume 改旧（模拟崩溃窗口快照偏差），明细表不动。
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE local_order_ledger SET filled_volume=600, state='PART_TRADED' WHERE biz_order_no='b2'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    led2 = _new_ledger(db_path, write_queue)
+    led2.load_from_db()
+    e = led2.get("b2")
+    assert e.filled_volume == 1000                 # 以明细重算纠正快照偏差
+    assert e.state == OrderState.TRADED            # 达量重新收口
+    # 重启后同 traded_id 再投不二次累计（counted_trade_ids 已由明细重建）
+    led2.add_fill(2, "t1", 600, Decimal("11.00"))
+    assert led2.get("b2").filled_volume == 1000
+
+
+def test_fill_missing_traded_id_synthetic_key(db_path, write_queue):
+    """EXEC-order-01：traded_id 缺失走合成键，重投两次明细仍只一行、filled 不翻倍。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="b3", order_id=3, plan_volume=1000, state=OrderState.SUBMITTED))
+    led.add_fill(3, None, 300, Decimal("11.00"))
+    led.add_fill(3, None, 300, Decimal("11.00"))   # 同合成键 → 去重
+    assert led.flush_pending(2.0)
+    led2 = _new_ledger(db_path, write_queue)
+    led2.load_from_db()
+    assert led2.get("b3").filled_volume == 300
+    conn = sqlite3.connect(db_path)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM local_order_fill WHERE biz_order_no='b3'").fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 1
+
+
+def test_load_from_db_window_filters_old_dates(db_path, write_queue):
+    """EXEC-storage-05：load_from_db(today, keep_days) 只装载窗口内行，窗口外历史行不进内存。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="recent", target_trade_date=date(2026, 6, 15)))
+    led.insert(_entry(biz="old", target_trade_date=date(2026, 5, 1)))   # 30+ 天前
+    assert led.flush_pending(2.0)
+
+    led2 = _new_ledger(db_path, write_queue)
+    led2.load_from_db(today=date(2026, 6, 16), keep_days=7)
+    assert led2.get("recent") is not None
+    assert led2.get("old") is None                 # 窗口外未装载
+
+
+def test_purge_before_removes_expired_rows(db_path, write_queue):
+    """EXEC-storage-05：purge_before 清理过期台账行及其成交明细，当日行与明细保留。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="keep", order_id=10, target_trade_date=date(2026, 6, 16),
+                      state=OrderState.SUBMITTED))
+    led.insert(_entry(biz="expire", order_id=11, target_trade_date=date(2026, 5, 1),
+                      state=OrderState.SUBMITTED))
+    led.add_fill(10, "k1", 500, Decimal("11.00"))   # keep 的明细
+    led.add_fill(11, "e1", 500, Decimal("11.00"))   # expire 的明细
+    assert led.flush_pending(2.0)
+
+    led.purge_before(date(2026, 6, 1))              # 清理 < 2026-06-01 的行
+    assert led.flush_pending(2.0)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        ledger_bizes = {r[0] for r in conn.execute("SELECT biz_order_no FROM local_order_ledger")}
+        fill_bizes = {r[0] for r in conn.execute("SELECT biz_order_no FROM local_order_fill")}
+    finally:
+        conn.close()
+    assert "keep" in ledger_bizes and "expire" not in ledger_bizes
+    assert "keep" in fill_bizes and "expire" not in fill_bizes   # 明细随台账一并清理

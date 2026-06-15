@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Callable, Dict, List, Optional
 
@@ -1137,6 +1137,17 @@ class Engine:
             needs_backfill=report.needs_backfill,
             reconcile_blocked=self._reconcile_blocked,
         )
+        # —— 盘后清理过期台账（评审三轮 EXEC-storage-05）——
+        # 删 target_trade_date < td-N 的终态行及其成交明细，防 local_order_ledger/local_order_fill 跨日只增不减。
+        # best-effort：仅 PersistentLocalLedger 支持 purge_before；cutoff 远早于任何在途单（N=保留窗口），不误删活跃单。
+        # 失败不拖垮收盘主流程（清理是运维健壮性、非交易正确性）。
+        purge = getattr(self._ledger, "purge_before", None)
+        if callable(purge):
+            try:
+                from ..storage.sqlite_ledger import DEFAULT_LEDGER_KEEP_DAYS
+                purge(td - timedelta(days=DEFAULT_LEDGER_KEEP_DAYS))
+            except Exception as exc:  # noqa: BLE001 清理失败不影响收盘对账主流程
+                self._logger.warn("engine_ledger_purge_failed", trade_date=str(td), error=str(exc))
 
     # ------------------------------------------------------------------
     # 对账阻断标志的持久读写（评审二轮 P1#9）

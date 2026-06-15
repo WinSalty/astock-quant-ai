@@ -18,14 +18,18 @@
 from __future__ import annotations
 
 import threading
-from datetime import date
-from typing import Any, List, Optional
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..contracts.enums import OrderState
 from ..contracts.models import LedgerEntry
 from ..order.local_ledger import InMemoryLocalLedger
 from . import mappers, sqlite_sql
 from .write_queue import AsyncWriteQueue
+
+# 启动重建 / 盘后清理的默认保留天数（评审三轮 EXEC-storage-05）：load_from_db 只装载 target_trade_date 在
+# [today-N, today] 的台账行；N 须覆盖最长在途周期——T+1 买入 + 跨周末/长假（A 股最长 9 天假），故取 14 天留余量。
+DEFAULT_LEDGER_KEEP_DAYS = 14
 
 
 class PersistentLocalLedger:
@@ -41,7 +45,8 @@ class PersistentLocalLedger:
         self._wq = write_queue
         self._logger = logger
         # 内存权威：复用 InMemoryLocalLedger 的全部内存语义（幂等判定、成交去重、状态收口、反查索引）。
-        self._mem = InMemoryLocalLedger()
+        # 注入 logger 供 order_id 跨日冲突告警（评审三轮 EXEC-order-06）。
+        self._mem = InMemoryLocalLedger(logger=logger)
         # 可重入锁：保护内存权威的并发访问。RLock 允许同线程内嵌套调用（写方法内复用读方法时不自锁）。
         self._lock = threading.RLock()
         # 预生成台账整行 replace 的 SQL 与列序（单一来源，避免列序漂移）。biz_order_no 为 PK，整行覆盖最新内存态。
@@ -50,27 +55,84 @@ class PersistentLocalLedger:
     # ------------------------------------------------------------------
     # 启动重建（重启幂等的落地手段）
     # ------------------------------------------------------------------
-    def load_from_db(self) -> None:
-        """进程启动时从 SQLite 重建内存台账（含 order_id 反查索引）。
+    def load_from_db(
+        self, today: Optional[date] = None, keep_days: int = DEFAULT_LEDGER_KEEP_DAYS
+    ) -> None:
+        """进程启动时从 SQLite 重建内存台账（含两套反查索引），并按成交明细重算 filled_volume。
 
-        业务意图：上一进程异步镜像落盘的台账行，在本进程启动时全量读回内存，
-        使重启后 has_active / get_by_order_id 立即有效 → 同一计划不会被重复下单（重启幂等）。
+        业务意图：上一进程异步镜像落盘的台账行，在本进程启动时读回内存，使重启后 has_active /
+        get_by_order_id 立即有效 → 同一计划不会被重复下单（重启幂等）。
+        窗口装载（评审三轮 EXEC-storage-05）：传入 today 时只装载 target_trade_date >= today-keep_days 的行
+        （配合 purge_before 防 local_order_ledger 跨日只增不减、内存与 find_active 不随天数线性膨胀）；
+        today=None 时退化为【全量装载】（向后兼容旧调用/单测）。窗口配合 EXEC-order-06 两级 order_id 索引，
+        即便装载多日也不会跨日串单。
+        明细重算（评审三轮 EXEC-order-01）：整行台账的 filled_volume 是 write-behind 累计快照，崩溃窗口重启会
+        读回旧值；这里读 local_order_fill（append-only + 唯一键去重）按 biz 聚合重算 filled/均价/counted_trade_ids
+        （以明细为权威），纠正快照偏差，使同一 traded_id 二次回报绝不二次累计。
         重跑口径：本方法应在对外提供读写前调用一次；用短连接读、读完即关，不占写线程。
         """
+        cutoff_iso: Optional[str] = None
+        if today is not None and keep_days is not None:
+            cutoff_iso = (today - timedelta(days=keep_days)).isoformat()
         conn = sqlite_sql.read_conn(self._db_path)
         try:
-            # 全表扫描重建：台账规模为「当日计划单」量级（百级），一次性读回内存代价可忽略。
-            rows = conn.execute("SELECT * FROM local_order_ledger").fetchall()
+            if cutoff_iso is not None:
+                ledger_rows = conn.execute(
+                    "SELECT * FROM local_order_ledger WHERE target_trade_date >= ?", (cutoff_iso,)
+                ).fetchall()
+            else:
+                ledger_rows = conn.execute("SELECT * FROM local_order_ledger").fetchall()
+            # 成交明细：一次性读回（明细表受 purge_before 约束、规模有界），在内存里按 biz 聚合。
+            fill_rows = conn.execute(
+                "SELECT biz_order_no, traded_id, traded_volume, traded_price FROM local_order_fill"
+            ).fetchall()
         finally:
             conn.close()
+        # 明细按 biz 聚合为 {biz: [(dedup_key, vol, price), ...]}。
+        fills_by_biz: Dict[str, List[Tuple[str, int, Any]]] = {}
+        for fr in fill_rows:
+            fills_by_biz.setdefault(fr["biz_order_no"], []).append(
+                (fr["traded_id"], fr["traded_volume"], fr["traded_price"])
+            )
         count = 0
         with self._lock:
-            for row in rows:
+            for row in ledger_rows:
                 entry = mappers.row_to_ledger(row)
-                # 复用内存 insert：同时维护 _by_biz 与 order_id → biz 反查索引（与运行期写入同一口径）。
+                # 复用内存 insert：同时维护 _by_biz 与两套反查索引（与运行期写入同一口径）。
                 self._mem.insert(entry)
+                # 有明细的计划单：以明细重算 filled/counted（权威），纠正整行快照在崩溃窗口的偏差。
+                detail = fills_by_biz.get(entry.biz_order_no)
+                if detail:
+                    self._mem.reconcile_fills_from_detail(entry.biz_order_no, detail)
                 count += 1
-        self._logger.info("ledger_reload_from_db", count=count, db=self._db_path)
+        self._logger.info(
+            "ledger_reload_from_db", count=count, db=self._db_path, window_cutoff=cutoff_iso
+        )
+
+    def purge_before(self, cutoff: date) -> None:
+        """盘后清理：删除 target_trade_date < cutoff 的过期台账行及其成交明细（评审三轮 EXEC-storage-05）。
+
+        归档=丢弃不再管：只清【明显过期】的终态行，cutoff 必须严格小于任何可能仍活跃的 target_trade_date
+        （调用方传足够早的日期，如 today-DEFAULT_LEDGER_KEEP_DAYS），绝不误删当日/在途活跃单。
+        先删明细（按将被清理的 biz）再删台账行；都经写队列在写线程串行执行，不阻塞热路径。本方法只清 SQLite，
+        内存由下次重启 load_from_db 的窗口装载自然收敛。
+        """
+        cutoff_iso = cutoff.isoformat()
+        # 第 1 步：删将被清理台账行对应的成交明细（子查询定位 biz）。
+        self._wq.submit(
+            lambda conn: conn.execute(
+                "DELETE FROM local_order_fill WHERE biz_order_no IN "
+                "(SELECT biz_order_no FROM local_order_ledger WHERE target_trade_date < ?)",
+                (cutoff_iso,),
+            )
+        )
+        # 第 2 步：删过期台账行本身。
+        self._wq.submit(
+            lambda conn: conn.execute(
+                "DELETE FROM local_order_ledger WHERE target_trade_date < ?", (cutoff_iso,)
+            )
+        )
+        self._logger.info("ledger_purge_before", cutoff=cutoff_iso, db=self._db_path)
 
     # ------------------------------------------------------------------
     # 内部：把单条最新内存 entry 异步镜像落盘（write-behind，绝不在锁内做 I/O）
@@ -175,7 +237,23 @@ class PersistentLocalLedger:
         签名与 InMemoryLocalLedger 对齐：(order_id, traded_id, traded_volume, traded_price)。
         幂等：同 traded_id 重投在内存层已被去重（filled_volume 不翻倍），镜像的是去重后的权威态。
         边界：未知 order_id / 无效成交量在内存层忽略；此处仅在 entry 存在时镜像（_mirror 对 None 跳过）。
+
+        成交明细落盘（评审三轮 EXEC-order-01）：内存 add_fill 真正【新计入】一笔时返回 (biz, dedup_key, vol, price)，
+        据此把该笔写入 local_order_fill（INSERT OR IGNORE，append-only 幂等）；崩溃重启 load_from_db 据明细重算
+        filled_volume，杜绝整行快照在崩溃窗口被同一 traded_id 二次回报二次累计。被去重/忽略时返回 None，不落明细。
         """
         with self._lock:
-            self._mem.add_fill(order_id, traded_id, traded_volume, traded_price)
+            recorded = self._mem.add_fill(order_id, traded_id, traded_volume, traded_price)
             self._mirror(self._mem.get_by_order_id(order_id))
+            if recorded is not None:
+                biz, dedup_key, vol, price = recorded
+                price_text = str(price) if price is not None else None
+                # INSERT OR IGNORE：同 (biz, dedup_key) 重投天然幂等；闭包捕获本次参数，写线程内执行。
+                self._wq.submit(
+                    lambda conn: conn.execute(
+                        "INSERT OR IGNORE INTO local_order_fill"
+                        "(biz_order_no, order_id, traded_id, traded_volume, traded_price) "
+                        "VALUES (?,?,?,?,?)",
+                        (biz, order_id, dedup_key, vol, price_text),
+                    )
+                )

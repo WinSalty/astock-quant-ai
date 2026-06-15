@@ -22,7 +22,7 @@ from typing import Optional, Tuple
 from ..adapters import xt_real
 from ..auction.tick_source import XtdataTickSource
 from ..common.logger import StructLoggerImpl
-from ..common.time_utils import SystemClock
+from ..common.time_utils import SystemClock, east8_trade_date
 from ..common.trade_calendar import StaticTradeCalendar, WeekdayTradeCalendar
 from ..config.settings import Settings
 from ..connection.connection_guard import ConnectionGuard
@@ -221,7 +221,8 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     # —— 本地 SQLite 数据栈：建表 + 起写线程 + 重建台账（重启幂等）——
     remote = _build_remote_repo(settings, logger)
     stack = LocalStorage(settings.local_db_path, logger, account_id, remote_repo=remote)
-    stack.start()
+    # 传 east8 当日启用台账窗口装载（评审三轮 EXEC-storage-05）：只重建近 N 日活跃单，防跨日只增不减。
+    stack.start(today=east8_trade_date(clock.now_utc()))
 
     # —— TraderHolder：引擎始终指向当前 trader（重连换实例不影响下单/查询）——
     holder = xt_real.TraderHolder()

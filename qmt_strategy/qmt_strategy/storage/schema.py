@@ -148,6 +148,19 @@ _DDL: Dict[str, str] = {
             miss_reason TEXT, cancel_failed INTEGER NOT NULL DEFAULT 0, error_id INTEGER,
             error_msg TEXT, created_at TEXT, updated_at TEXT, counted_trade_ids TEXT
         )""",
+    # 成交明细去重表（评审三轮 EXEC-order-01）：以 (biz_order_no, traded_id) 为主键，INSERT OR IGNORE 天然幂等。
+    # 用途：整行台账 local_order_ledger 的 filled_volume 是 write-behind 累计快照——崩溃窗口（内存已累计但镜像未
+    # drain）重启后读回旧快照，同一 traded_id 回报重投会二次累计。明细表 append-only + 唯一键去重，重启 load 时
+    # 按 biz_order_no 聚合重算 filled_volume / counted_trade_ids（以明细为权威），杜绝二次累计。
+    # 主键用 biz_order_no（非 order_id）：QMT order_id 按交易日重置可跨日复用，按 biz 聚合天然不跨日污染
+    # （配合 EXEC-order-06 两级反查索引）。traded_id 缺失时存合成键（与 local_ledger 的 _noid_ 去重口径一致）。
+    "local_order_fill": """
+        CREATE TABLE IF NOT EXISTS local_order_fill (
+            biz_order_no TEXT NOT NULL, order_id INTEGER, traded_id TEXT NOT NULL,
+            traded_volume INTEGER NOT NULL, traded_price TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (biz_order_no, traded_id)
+        )""",
     "watchlist": """
         CREATE TABLE IF NOT EXISTS watchlist (
             ts_code TEXT NOT NULL, trade_date TEXT, target_trade_date TEXT NOT NULL,
