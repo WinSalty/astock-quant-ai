@@ -3,7 +3,7 @@
 > 范围：信号侧 `stock-ah-premium-ai` 的「LLM 多阶段打板报告 + watchlist（`limit_up_selected_stock`）」生成链路。
 > 目标：评估代码逻辑、提示词、整体步骤，以及是否需要补充 Tushare 资金流向 / 打板专题数据，并给出**经过对抗式核验、真实可落地**的优化建议。
 > 产出口径：仅按阶段 + 验收 + 依赖顺序组织，不含工时/人天预估（沿用工作区文档约束）。
-> 关联文档：本仓库 [`08-评审报告`](08-信号侧与执行侧量化交易代码评审报告.md)/[`09-修复台账`](09-两侧代码修复计划与执行清单.md)；信号侧 `stock-ah-premium-ai/resources/doc/` 内 `limit-up-llm-push-design.md`、`limit-up-multi-stage-analysis-refactor-plan.md`、`limit-up-analysis-improvement-implementation-summary.md`、`llm-tushare-on-demand-stock-data-plan.md`、`stock-selection-factor-design.md`。
+> 关联文档：本仓库 [`08-评审报告`](已归档-完成不再维护/08-信号侧与执行侧量化交易代码评审报告.md)/[`09-修复台账`](已归档-完成不再维护/09-两侧代码修复计划与执行清单.md)（均已归档）；信号侧 `stock-ah-premium-ai/resources/doc/` 内 `limit-up-llm-push-design.md`、`limit-up-multi-stage-analysis-refactor-plan.md`、`limit-up-analysis-improvement-implementation-summary.md`、`llm-tushare-on-demand-stock-data-plan.md`、`stock-selection-factor-design.md`。
 
 ---
 
