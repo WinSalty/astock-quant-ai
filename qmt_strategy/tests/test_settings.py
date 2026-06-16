@@ -131,6 +131,31 @@ def test_assert_safe_to_trade_allows_verified_or_disabled():
     s2.assert_safe_to_trade()
 
 
+# ---------------------------------------------------------------------------
+# 国金对接核对 B1/H1：盘中卖出链生产门控 + 开启时强制配单票浮亏止损
+# ---------------------------------------------------------------------------
+def test_sell_pass_live_defaults_off():
+    s = Settings.from_env({})
+    assert s.sell_pass_live is False                 # 默认关：生产不自动卖出
+    s2 = Settings.from_env({"QMT_SELL_PASS_LIVE": "true"})
+    assert s2.sell_pass_live is True
+
+
+def test_assert_safe_to_trade_blocks_sell_pass_live_without_stop_loss():
+    import pytest
+
+    s = Settings.from_env({"QMT_SELL_PASS_LIVE": "true"})   # 开了卖出链但没配浮亏止损
+    assert s.stock_float_loss_limit is None
+    with pytest.raises(RuntimeError, match="QMT_STOCK_FLOAT_LOSS_LIMIT"):
+        s.assert_safe_to_trade()
+
+
+def test_assert_safe_to_trade_allows_sell_pass_live_with_stop_loss():
+    # 开卖出链 + 配了单票浮亏止损 → 放行（不抛）。
+    s = Settings.from_env({"QMT_SELL_PASS_LIVE": "true", "QMT_STOCK_FLOAT_LOSS_LIMIT": "0.05"})
+    s.assert_safe_to_trade()
+
+
 def test_per_interface_token_fallback_and_override():
     """评审三轮 XCUT-01：watchlist/ingest 分接口 token 缺省回落统一 signal token，配置后各取各自。"""
     from qmt_strategy.config.settings import Settings

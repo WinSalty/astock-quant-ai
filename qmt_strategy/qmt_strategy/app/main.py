@@ -62,6 +62,7 @@ from ..entry.entry_router import EntryRouter
 from ..order.local_ledger import InMemoryLocalLedger
 from ..order.order_executor import OrderExecutor
 from ..position.position_manager import PositionManager
+from ..position.sell_book_builder import build_order_book
 from ..position.sell_decider import SellDecider
 from ..reconcile.reconcile import Reconcile
 from ..risk.risk import Risk
@@ -134,6 +135,8 @@ class Engine:
         self._watchlist = WatchlistLoader(
             deps.selected_source, deps.calendar, deps.logger, s, fallback=deps.fallback_source
         )
+        # 行情取数源（竞价轮询 + 盘中卖出盘口构造共用；阶段0-C build_sell_books 用它派生卖出 OrderBook）。
+        self._tick_source = deps.tick_source
         self._position = PositionManager(deps.calendar, deps.clock, deps.logger, deps.prior_provider)
         self._risk = Risk(s, deps.clock, deps.logger)
         # 决策采集器（可选，注入则各决策点 best-effort 采集；与下单热路径物理隔离，绝不影响交易）。
@@ -890,6 +893,49 @@ class Engine:
     # ------------------------------------------------------------------
     # 卖出链路（§5：守 T+1 + 风控闸门 + 竞价/分时定夺）
     # ------------------------------------------------------------------
+    def build_sell_books(self, today: date) -> Dict[str, OrderBook]:
+        """构造当前可卖持仓的实时盘口 {ts_code: OrderBook}（阶段0-C T0.1 卖出链接线）。
+
+        业务意图：盘中/竞价段卖出决策需实时盘口，原 sell_books_provider 未接线 → run_sell_pass 生产永不执行。
+        本方法由 run.py 注入 DailyScheduler(sell_books_provider=engine.build_sell_books)，使卖出链真正可达。
+        流程：取可卖持仓 ts_code → 批量 get_full_tick → 逐票经 sell_book_builder 派生 OrderBook（复用买入侧
+        auction_factors 同构纯函数）。
+
+        安全/降级口径：
+        - 批量取数失败（get_full_tick 抛 TickSourceError）→ **向上抛**，由 scheduler._run_sell_with_feed_health
+          捕获置 report_market_feed(False)（行情不可信→盘中保守不卖），绝不在此吞掉。
+        - 单票无 tick / 现价无效 / 构造异常 → **不纳入 books**（跳过），使 run_sell_pass 对该票走「book is None
+          安全默认不卖」，单票坏数据不拖垮整批。
+        - 跨帧字段（炸板/破位等）本版保守默认，破位/炸板细粒度止损待阶段1 T1.2 真机实现；单帧浮亏止损已生效。
+        ⚠️ 已知限制（国金对接核对 B1，故生产由 QMT_SELL_PASS_LIVE 门控、默认关）：is_sealed 依赖 _plan_map
+        （今日 watchlist）提供今日涨停价；不在今日名单的真封板隔夜票 plan 缺失 → is_sealed=False，若又无强先验
+        会被 decider 兜底误清仓；watchlist 取数失败时更会批量误清。隔夜持仓 is_sealed/封流比补数与跨帧保真同属
+        T1.2，**保真+真机实测前不得开 QMT_SELL_PASS_LIVE**（见 doc/16）。
+        """
+        units = self._position.sellable_units(today)
+        codes = [u.ts_code for u in units]
+        if not codes:
+            return {}
+        # 批量取盘口：失败抛 TickSourceError（由调度层置 feed 不健康、不卖），不在此 try 吞。
+        ticks = self._tick_source.get_full_tick(codes) or {}
+        books: Dict[str, OrderBook] = {}
+        for code in codes:
+            tick = ticks.get(code)
+            if tick is None:
+                continue  # 无该票实时盘口 → 不纳入,run_sell_pass 走 book is None 安全默认不卖
+            plan = self._plan_map.get(code)
+            try:
+                ob = build_order_book(code, tick, plan)
+            except Exception as exc:  # noqa: BLE001 单票构造异常不拖垮整批卖出盘口
+                self._logger.warn("sell_book_build_failed", ts_code=code, error=str(exc))
+                continue
+            if ob.last_price is None:
+                # 取到 tick 但无有效现价(脏数据) → 不纳入,安全默认不卖(避免据坏价误清/挂废单)。
+                self._logger.warn("sell_book_no_last_price", ts_code=code)
+                continue
+            books[code] = ob
+        return books
+
     def run_sell_pass(self, today: date, books: Dict[str, OrderBook], *, session: str = "intraday") -> List[str]:
         """对当前可卖持仓跑一遍卖出决策并下单（§5.3 决策表）。
 

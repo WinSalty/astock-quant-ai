@@ -203,6 +203,54 @@ def _build_calendar(settings: Settings, logger):
     )
 
 
+def _build_prior_provider(stack: LocalStorage, logger):
+    """构造续板先验取数 (ts_code, today) -> Optional[SignalPrior]（阶段0-C T0.2）。
+
+    业务意图：从本机当日 watchlist（SelectedStockRow，target_trade_date=today）映射出续板先验，供持仓
+    续持决策（position_manager.refresh_state 定 SIGNAL_DRIVEN/TECH_EXIT、sell_decider 吃 continuation_prob）。
+    取不到（持仓不在今日名单=次日没续板/退出信号池）→ 返回 None = 纯技术退出（安全方向正确）。
+
+    按日缓存：先验在盘前 refresh_state 与盘中每轮卖出评估被【逐票】调用，若每次重查全表开销大；这里按
+    target_trade_date 缓存一次当日名单映射（{norm_code: SignalPrior}）。调用方全在【调度线程】单线程串行
+    （prewarm / run_sell_pass 均由 DailyScheduler.run 驱动），故无需加锁。
+    边界：fetch 异常 → 当日按空名单处理（降级为全 TECH_EXIT，不抛、不拖垮调度）；代码归一后匹配。
+    """
+    from ..common.identity import resolve_code
+    from ..contracts.models import SignalPrior
+
+    cache: dict = {"day": None, "by_code": {}}
+
+    def _provider(ts_code: str, today: date):
+        # 当日名单未缓存或跨日 → 重建一次（fetch 当日 target_trade_date=today 的 SelectedStockRow）。
+        if cache["day"] != today:
+            by_code: dict = {}
+            try:
+                rows = stack.watchlist_source.fetch(today)
+            except Exception as exc:  # noqa: BLE001 取名单失败按空名单降级(全 TECH_EXIT)，不拖垮调度
+                logger.warn("prior_provider_fetch_failed", today=str(today), error=str(exc))
+                rows = []
+            for r in rows:
+                code = resolve_code(r.ts_code)
+                if code is None:
+                    continue
+                by_code[code] = SignalPrior(
+                    ts_code=code,
+                    trade_date=r.trade_date,
+                    target_trade_date=r.target_trade_date,
+                    continuation_prob=r.continuation_prob,
+                    boost=r.boost,
+                    fail_conditions=list(r.fail_conditions or []),
+                    market_state=r.market_state,
+                    role=r.role,
+                    strategy=r.strategy,
+                )
+            cache["day"] = today
+            cache["by_code"] = by_code
+        return cache["by_code"].get(resolve_code(ts_code))
+
+    return _provider
+
+
 def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalStorage, ConnectionGuard, SystemClock, object]:
     """装配真实引擎：本地 SQLite 栈 + xtquant 适配器 + Engine + 连接守护。
 
@@ -246,13 +294,15 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     # —— 决策采集器（复盘用、best-effort、与交易热路径物理隔离，整条崩溃也不影响交易）——
     decision_emitter = _build_decision_emitter(settings, logger, account_id, clock)
 
-    # TODO(落地)：prior_provider 读当日本机 watchlist 表得续板先验（SignalPrior）；缺省 None=纯技术退出。
+    # prior_provider（阶段0-C T0.2）：读本机当日 watchlist 得续板先验（SignalPrior），喂持仓续持决策；
+    # 取不到（次日没续板/退出信号池）→ None = 纯技术退出。不接则所有持仓恒 TECH_EXIT、续板增强不生效。
+    prior_provider = _build_prior_provider(stack, logger)
     deps = EngineDeps(
         settings=settings, clock=clock, logger=logger, calendar=calendar,
         trader=holder, account=account, account_id=account_id,
         tick_source=tick_source, selected_source=stack.watchlist_source,
         repository=stack.repository, ledger=stack.ledger, flush_hook=stack.flush,
-        decision_emitter=decision_emitter,
+        decision_emitter=decision_emitter, prior_provider=prior_provider,
     )
     engine = build_engine(deps)
 
@@ -339,12 +389,28 @@ def main() -> None:
 
     # —— 启动调度线程：按东八区钟点触发 盘前装载 / 竞价 / 盘中巡检 / 收盘对账 / 盘后同步（设计 §7.5）——
     # 调度细节全在 DailyScheduler；本入口只负责装配与「主线程 run_forever 接收回调」。
+    # 卖出链接线（阶段0-C T0.1）+ 生产门控（fail-closed，国金对接核对 B1/H1）：
+    #   注入 engine.build_sell_books（由 xtdata 实时盘口派生 {ts_code: OrderBook}）后，盘中/竞价段才会真正跑
+    #   run_sell_pass（止损/弱开/秒板续持/尾盘了结，§5.3）。但最小版跨帧破位/炸板未保真、且不在今日 watchlist
+    #   的真封板隔夜票会被误判非封板 → **默认门控关（sell_pass_live=False）即 provider=None，回退到接线前的
+    #   安全行为（盘中只 sweep_ttl、不自动卖）**，杜绝误清仓/批量误清；待阶段1 T1.2 保真 + 真机实测后，显式配
+    #   QMT_SELL_PASS_LIVE=true 开启（届时 assert_safe_to_trade 已强制要求配单票浮亏止损）。
+    if settings.sell_pass_live:
+        sell_books_provider = engine.build_sell_books
+        logger.warn(
+            "sell_pass_live_enabled",
+            note="盘中卖出链已开启(QMT_SELL_PASS_LIVE=true)；确认已完成 T1.2 跨帧盘口保真 + 真机实测",
+        )
+    else:
+        sell_books_provider = None
+        logger.info(
+            "sell_pass_gated_off",
+            note="卖出链已接线但生产门控默认关(QMT_SELL_PASS_LIVE=false)，盘中不自动卖出；T1.2 保真+实测后再开",
+        )
     scheduler = DailyScheduler(
         engine, guard, stack, clock, logger, calendar=calendar,
         close_time=parse_hhmm(settings.close_snapshot_time, dtime(15, 5)),
-        # TODO(落地)：sell_books_provider 注入「由 xtdata 实时盘口构造 {ts_code: OrderBook}」的函数后，
-        #   盘中才会跑 run_sell_pass（卖出决策需实时盘口，§5.3）；缺省只跑 sweep_ttl（超时撤单巡检）。
-        sell_books_provider=None,
+        sell_books_provider=sell_books_provider,
         watchlist_prefetch=watchlist_prefetch,
     )
     scheduler.start_thread()

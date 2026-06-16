@@ -153,6 +153,11 @@ class Settings:
     # 竞价择时实测放行标记（fail-closed）：仅当在国金真机完成竞价数据能力实测（§A4）后显式置 True，才允许
     # auction_timing_enabled=True 真实启动；否则 assert_safe_to_trade 启动期拒启，杜绝「未实测就开竞价择时」。
     auction_timing_verified: bool = False     # QMT_AUCTION_TIMING_VERIFIED：默认 False
+    # 盘中卖出链生产放行门控（阶段0-C 接线 + fail-closed，国金对接核对 B1/H1）：默认 False=不接 provider、
+    # 生产不自动卖出（与接线前安全行为一致）。**必须保持关，直到阶段1 T1.2 跨帧盘口保真（隔夜持仓 is_sealed/
+    # 封流比补数、破位/炸板帧历史）完成 + 真机实测**——否则最小版会把「不在今日 watchlist 的真封板隔夜票」误判
+    # 非封板、且 watchlist 取数失败时批量误清仓。开启时 assert_safe_to_trade 强制要求配单票浮亏止损（唯一价位安全网）。
+    sell_pass_live: bool = False              # QMT_SELL_PASS_LIVE：默认 False（生产卖出门控）
     kill_switch: bool = False                 # QMT_KILL_SWITCH：True 则只采集不下单
 
     # —— 下单/台账参数 ——
@@ -258,6 +263,7 @@ class Settings:
             decision_log_batch_size=_as_int(g("QMT_DECISION_LOG_BATCH_SIZE")) or 50,
             auction_timing_enabled=_as_bool(g("QMT_AUCTION_TIMING_ENABLED") or "false"),
             auction_timing_verified=_as_bool(g("QMT_AUCTION_TIMING_VERIFIED") or "false"),
+            sell_pass_live=_as_bool(g("QMT_SELL_PASS_LIVE") or "false"),
             kill_switch=_as_bool(g("QMT_KILL_SWITCH") or "false"),
             order_ttl_seconds=_as_int(g("QMT_ORDER_TTL_SECONDS")) or 60,
             trade_conn_heartbeat_fail_threshold=(
@@ -334,6 +340,14 @@ class Settings:
                 "竞价择时已开(QMT_AUCTION_TIMING_ENABLED=true)但未标记实测通过"
                 "(QMT_AUCTION_TIMING_VERIFIED 未置真)。竞价数据能力须先在目标机(国金 miniQMT)完成 §A4 "
                 "实测，确认后显式配 QMT_AUCTION_TIMING_VERIFIED=true 方可开启；拒绝启动以防未实测即真金竞价下单。"
+            )
+        # 卖出链放行 fail-closed（国金对接核对 H1）：最小版跨帧破位/炸板止损未保真，单帧浮亏止损是开启生产
+        # 卖出时唯一的价位安全网；若开了卖出链却没配单票浮亏止损阈值，深套位将无任何价位止损，故强制必配。
+        if self.sell_pass_live and self.stock_float_loss_limit is None:
+            raise RuntimeError(
+                "盘中卖出链已开(QMT_SELL_PASS_LIVE=true)但未配单票浮亏止损(QMT_STOCK_FLOAT_LOSS_LIMIT)。"
+                "最小版跨帧破位/炸板止损未保真(待 T1.2)，单帧浮亏止损是唯一价位安全网，须显式配置(如 0.05)"
+                "方可开启生产卖出；拒绝启动以防卖出链开启却无价位止损兜底。"
             )
         return None
 
