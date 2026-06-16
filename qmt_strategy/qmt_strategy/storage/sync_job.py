@@ -160,6 +160,34 @@ class RemoteSyncJob:
 
         self._wq.submit(_task)
 
+    def pending_dates(self) -> List[date]:
+        """扫描四表所有仍有 synced=0 残留行的【交易日】，升序去重返回（国金对接核对 F05 重同步入口用）。
+
+        业务意图：当日 SYNC 失败行保 synced=0、不自动重跑；运维补同步需先知道「哪些交易日还有未同步行」。
+        本方法跨四表取 DISTINCT trade_date(synced=0) 的并集，供 LocalStorage.resync_pending 逐日补同步。
+        边界：读用短连接（不阻塞写线程）；解析 ISO 日期失败的脏行跳过，不拖垮扫描。
+        """
+        from datetime import date as _date
+
+        seen: set = set()
+        for table in QMT_TABLES:
+            conn = read_conn(self._db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT trade_date FROM %s WHERE synced=0" % table
+                ).fetchall()
+            finally:
+                conn.close()
+            for r in rows:
+                raw = r[0]
+                if raw is None:
+                    continue
+                try:
+                    seen.add(_date.fromisoformat(str(raw)))
+                except ValueError:
+                    continue  # 脏日期行跳过，不影响其余
+        return sorted(seen)
+
     def _count_remaining(self, table: str, trade_date_iso: str) -> int:
         """读当日仍未同步（synced=0）行数（短连接，对账用）。"""
         conn = read_conn(self._db_path)

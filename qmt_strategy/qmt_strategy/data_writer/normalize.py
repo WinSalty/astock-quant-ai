@@ -113,6 +113,15 @@ _STATUS_NUM_MAP = {
     55: OrderStatus.PART_TRADED,   # 部成
     56: OrderStatus.TRADED,        # 已成
     57: OrderStatus.REJECTED,      # 废单（来自 on_stock_order 的拒单/废单）
+    # 255 ORDER_UNKNOWN（国金对接核对补）：xtquant 另有未知状态 255。显式映射为 REJECTED 终态而非落
+    # 兜底 REPORTED(在途)——否则某废单/异常单回 255 会被长期当在途、卖单 SELLING 迟迟不复位漏重挂。
+    # 取终态使其促发 SELLING 复位/释放名额；残留风险（极少见的「255 实为活单被提前终态」）由成交回报
+    # on_stock_trade（持仓权威源）+ 收盘持仓快照对账兜底，不会算错真实持仓。
+    # ⚠️ 卖单侧短窗：255→REJECTED 会触发持仓 revert_selling→重挂；若该 255 卖单实际仍在券商挂着，存在
+    # 「同票两笔活卖单」的短窗，由 can_use_volume / 券商超量拒单兜住（非 255 独有，是任何终态失败→revert
+    # 的共性）。**真机须确认 255 是否可能为活单**（见待办 §A9），必要时对 SELL 的 255 复位加「确认券商无该
+    # 活动委托」前置校验。
+    255: OrderStatus.REJECTED,     # ORDER_UNKNOWN
 }
 
 # 已是标准字符串时的直传映射（大小写不敏感），兼容上游已规整场景。

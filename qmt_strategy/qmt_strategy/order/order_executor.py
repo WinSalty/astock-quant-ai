@@ -145,6 +145,27 @@ class OrderExecutor:
         except Exception:  # noqa: BLE001 健康回馈绝不影响下单
             pass
 
+    def _safe_cancel(self, order_id: int, biz_no: str) -> bool:
+        """撤单容错（国金对接核对）：吞 cancel_order_stock 异常并留痕，返回是否受理成功。
+
+        业务意图：cancel_order_stock 对【已成交/已撤/不存在的 order_id】在部分券商/版本可能【抛异常】
+        （待 §A9 真机实测确认国金行为）。on_ttl_expired 在 sweep_expired 的循环里逐单撤单，若撤单异常
+        直接冒泡，会打断【整轮】sweep → 同批其它到期单当轮漏撤、TTL 兜底链中断（资金/名额被占）。
+        这里把单次撤单异常隔离为「留痕 + 返回 False」，由调用方续二次截止下轮重试，绝不拖垮整轮巡检。
+        """
+        try:
+            self._trader.cancel_order_stock(self._account, order_id)
+            return True
+        except Exception as exc:  # noqa: BLE001 撤单异常不得打断整轮 sweep
+            self._logger.error(
+                "order_cancel_failed",
+                biz_order_no=biz_no,
+                account_id=self._account_id,
+                order_id=order_id,
+                error=repr(exc),
+            )
+            return False
+
     # ------------------------------------------------------------------
     # 重启幂等：从台账重建 biz 序号计数器（评审 P0-C4）
     # ------------------------------------------------------------------
@@ -234,8 +255,11 @@ class OrderExecutor:
         """构造 order_remark：``LUP|{signal_trade_date:%Y-%m-%d}|{ts_code}``（§4.4(5)）。
 
         业务意图：透传信号日 T，供回流侧据此回填 signal_trade_date，无需反推交易日历。
-        边界：长度受 QMT 限制（≤255）；超长时【优先保 LUP|<T> 段】，从 ts_code 尾部截断，
-        保证回流解析关键的 signal_trade_date 不丢失（§4.4(5) 截断口径）。
+        边界：本地台账列 ≤255（_REMARK_MAX_LEN，对齐 qmt_order VARCHAR(255)）；超长时【优先保 LUP|<T> 段】，
+        从 ts_code 尾部截断，保证回流解析关键的 signal_trade_date 不丢失（§4.4(5) 截断口径）。
+        注（国金对接核对 §A10）：xtquant/券商侧 order_remark 官方建议 ≤20 字符，本格式
+        `LUP|YYYY-MM-DD|600000.SH` 约 24 字符，可能被券商进一步截断；因头部 `LUP|<日期>|` 在前，即便券商
+        硬截断 signal_trade_date 仍可解析。真机确认券商实际上限（§A10）后，可据此把 _REMARK_MAX_LEN 收紧。
         """
         head = f"LUP|{decision.signal_trade_date.strftime('%Y-%m-%d')}|"
         remark = f"{head}{decision.ts_code}"
@@ -600,6 +624,9 @@ class OrderExecutor:
 
         biz_no = self._build_sell_biz_no(ts_code, target_trade_date)
         now = self._clock.now_utc()
+        # SELL remark 为自由文本 reason，截到台账列上限 _REMARK_MAX_LEN(255)。注（§A10）：券商侧 order_remark
+        # 官方建议 ≤20 字符，可能进一步截断；SELL remark 不参与回流关键解析(signal_trade_date 来自 BUY remark)，
+        # 故截断仅影响留痕可读性、不丢关键数据。
         remark = f"SELL|{reason}"[:_REMARK_MAX_LEN]
         # 先落台账（state=PLANNED）再发单，保证可对账（与买入同口径）。
         entry = LedgerEntry(
@@ -921,7 +948,12 @@ class OrderExecutor:
         # 已发 order_stock 拿到 order_id 但久无 on_stock_order 回报本身即异常（卡单/丢回报），且 cancel 携 order_id
         # 对券商安全（无此单则券商自行拒绝），故按 TTL 一并撤单，避免永久占用。
         if entry.state in (OrderState.SUBMITTED, OrderState.REPORTED, OrderState.PART_TRADED):
-            self._trader.cancel_order_stock(self._account, entry.order_id)
+            # 撤单容错（国金对接核对）：cancel 抛异常不打断整轮 sweep；失败则不进 CANCELLING、不做
+            # miss/next_best，续二次截止下轮重试（订单仍在途，下轮再撤）。
+            if not self._safe_cancel(entry.order_id, biz_no):
+                grace = timedelta(seconds=getattr(self._settings, "cancel_grace_seconds", 30))
+                self._ttl_deadline[biz_no] = now + grace
+                return
             self._ledger.update(biz_no, state=OrderState.CANCELLING, updated_at=now)
             self._logger.info(
                 "order_ttl_cancel_sent",
@@ -970,12 +1002,15 @@ class OrderExecutor:
             grace = timedelta(seconds=getattr(self._settings, "cancel_grace_seconds", 30))
             elapsed = now - (entry.updated_at or now)
             if elapsed >= grace:
-                self._trader.cancel_order_stock(self._account, entry.order_id)
-                self._ledger.update(biz_no, updated_at=now)  # 重置进入 CANCELLING 计时，限制重发频率为每宽限期一次
-                self._logger.warn(
-                    "order_cancelling_recancel",
-                    biz_order_no=biz_no, account_id=self._account_id, order_id=entry.order_id,
-                )
+                # 撤单容错（国金对接核对）：重发 cancel 抛异常不打断整轮 sweep。仅在受理成功时重置
+                # updated_at（限制重发频率为每宽限期一次）；失败则不重置 updated_at → 下个宽限期到点时
+                # elapsed 仍 >= grace、即再次重撤（每宽限期一次的节奏，不会 busy 重撤风暴）。
+                if self._safe_cancel(entry.order_id, biz_no):
+                    self._ledger.update(biz_no, updated_at=now)
+                    self._logger.warn(
+                        "order_cancelling_recancel",
+                        biz_order_no=biz_no, account_id=self._account_id, order_id=entry.order_id,
+                    )
             else:
                 self._logger.info(
                     "order_cancelling_within_grace",

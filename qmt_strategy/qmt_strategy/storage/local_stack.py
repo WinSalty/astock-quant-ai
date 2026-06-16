@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from datetime import date
 from typing import List, Optional
@@ -73,6 +74,11 @@ class LocalStorage:
         """
         if self._started:
             return
+        # 父目录守卫（国金对接核对 F08）：QMT_LOCAL_DB_PATH 配成父目录不存在的绝对路径时，sqlite3.connect
+        # 会抛 OperationalError 启动崩。这里在任何连接前先建好父目录（dirname 非空才建，默认相对路径不触发）。
+        db_dir = os.path.dirname(self._db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         # 建表用独立连接（与写线程连接分离），完成即关。
         conn = sqlite3.connect(self._db_path)
         try:
@@ -115,10 +121,51 @@ class LocalStorage:
         return n
 
     def sync_to_remote(self, trade_date: date) -> dict:
-        """盘后把本机 qmt_* 当日数据幂等同步回远端 MySQL。未配 remote_repo 则跳过并告警。"""
+        """盘后把本机 qmt_* 当日数据幂等同步回远端 MySQL。未配 remote_repo 则跳过并告警。
+
+        分级告警（国金对接核对 F05）：当日 SYNC 一次性触发、失败行保 synced=0 不自动重跑，故 ok=False
+        必须升级为 error 级告警（含各表 errors/remaining 计数）让运维可见，而非无条件 info 静默；
+        否则部分回流失败时远端 qmt_* 长期残缺却无人发现。残留 synced=0 可经 resync_pending 手动补同步。
+        """
         if self._sync_job is None:
             self._logger.warn("remote_sync_skipped_no_remote", trade_date=str(trade_date))
             return {"ok": False, "reason": "no_remote_repo"}
         report = self._sync_job.run(trade_date)
-        self._logger.info("remote_sync_done", trade_date=str(trade_date), ok=report.get("ok"))
+        if report.get("ok"):
+            self._logger.info("remote_sync_done", trade_date=str(trade_date), ok=True)
+        else:
+            # 汇总各表 errors/remaining 供排查；error 级触发告警（部分回流失败、远端数据不齐）。
+            errors = {t: v for t, v in report.items()
+                      if isinstance(v, dict) and (v.get("errors") or v.get("remaining"))}
+            self._logger.error(
+                "remote_sync_incomplete",
+                trade_date=str(trade_date),
+                ok=False,
+                detail=errors,
+                note="部分回流失败/未同步,远端 qmt_* 当日数据不齐;失败行保 synced=0,可经 resync_pending 手动补同步",
+            )
         return report
+
+    def resync_pending(self, max_dates: Optional[int] = None) -> dict:
+        """运维入口（国金对接核对 F05）：手动重同步历史所有 synced=0 残留行。
+
+        业务意图：当日 SYNC 失败行保 synced=0 不自动重跑，需一个可手动触发的补同步入口。本方法扫描四表
+        中仍有 synced=0 的【全部交易日】，逐日调 sync_to_remote（其本身按 synced=0 幂等挑行、可安全重跑）。
+        返回 {trade_date_iso: 该日 report}；无 remote_repo / 无残留则返回空结果并留痕。
+        边界：max_dates 限制单次处理的日期数（防一次扫太多）；按交易日升序处理。
+        """
+        if self._sync_job is None:
+            self._logger.warn("resync_pending_skipped_no_remote")
+            return {"ok": False, "reason": "no_remote_repo"}
+        dates = self._sync_job.pending_dates()
+        if max_dates is not None:
+            dates = dates[:max_dates]
+        if not dates:
+            self._logger.info("resync_pending_nothing")
+            return {"ok": True, "resynced_dates": 0, "reports": {}}
+        reports: dict = {}
+        for d in dates:
+            reports[d.isoformat()] = self.sync_to_remote(d)
+        all_ok = all(r.get("ok") for r in reports.values())
+        self._logger.info("resync_pending_done", resynced_dates=len(dates), ok=all_ok)
+        return {"ok": all_ok, "resynced_dates": len(dates), "reports": reports}
