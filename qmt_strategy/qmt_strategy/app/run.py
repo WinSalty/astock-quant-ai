@@ -110,19 +110,15 @@ def _build_remote_repo(settings: Settings, logger):
 
         return HttpIngestQmtRepository(client, logger)
 
-    # 2) 回落直连 MySQL（保留旧通道，仅当显式配 DSN）。
+    # 2) 回落直连 MySQL（旧方案 A）：当前未落地，配 DSN 即启动期 fail-closed 拒启（国金对接核对 F12）。
+    #    背景：原实现 conn_factory 抛 NotImplementedError 被推迟到盘后首行 upsert 才触发，导致「配了
+    #    QMT_MYSQL_DSN 却整条回流静默全失败、无 error 告警、运维以为正常」。生产默认走 HTTP 回流
+    #    (signal_base_url)，本直连通道未实现；显式配 DSN 即在装配期清晰报错，避免误以为 MySQL 回落可用。
     if settings.mysql_dsn:
-        from ..data_writer.repository import MySqlQmtRepository
-
-        def conn_factory():
-            import pymysql  # 惰性 import（CI/测试不强依赖）
-
-            # TODO(实测/落地)：解析 settings.mysql_dsn → pymysql.connect(host/port/user/password/db, ...)。
-            #   用仅对 qmt_* 四表有 INSERT/UPDATE/SELECT 权限的独立账号；敏感信息不入库/不进日志（§6.10）。
-            raise NotImplementedError("TODO(落地)：由 QMT_MYSQL_DSN 解析并返回 pymysql.connect(...)")
-
-        return MySqlQmtRepository(
-            conn_factory, unique_with_trade_date=settings.repository_unique_with_trade_date
+        raise RuntimeError(
+            "QMT_MYSQL_DSN 指定了 MySQL 直连回落通道，但该通道(MySqlQmtRepository.conn_factory)尚未落地。"
+            "请改用 HTTP 回流：配置 QMT_SIGNAL_BASE_URL + ingest token；或先实现 conn_factory(解析 DSN→"
+            "pymysql.connect，仅 qmt_* 四表写权限独立账号、敏感信息不入日志)后再启用本通道。"
         )
 
     # 3) 未配任何远端写端。
@@ -216,7 +212,24 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     """
     logger = logger or StructLoggerImpl()
     clock = SystemClock()
-    account_id = settings.account_id or "UNKNOWN"
+    # —— 启动期 fail-closed 配置校验（go-live 审计 / 国金对接核对 F06/F07）——
+    # 参照交易日历 fail-closed 模式：account_id / mini_path 是「真金账户」与「miniQMT 连接」的根口径，
+    # 缺配绝不静默回落。原 `account_id or "UNKNOWN"` 会把假账户号贯穿台账/持仓单元键/qmt_* 四表/回流信封/
+    # 对账，造成真实资金口径污染、串账户；mini_path 缺配传空串则建 trader 行为不可控。缺失直接拒启动，
+    # 强制由 env（run_qmt.bat）显式提供。注：本校验先于本地栈/xtquant 触发，缺配即快速失败。
+    if not (settings.account_id and settings.account_id.strip()):
+        raise RuntimeError(
+            "未配置 QMT_ACCOUNT_ID（QMT 资金账号）。缺配会用假账户号污染台账/qmt_* 四表/回流/对账，拒绝启动；"
+            "请在 env（run_qmt.bat）显式配置真实资金账号。"
+        )
+    if not (settings.mini_path and settings.mini_path.strip()):
+        raise RuntimeError(
+            "未配置 QMT_MINI_PATH（miniQMT userdata_mini 路径）。缺配会以空路径建 trader、连接行为不可控，"
+            "拒绝启动；请配置如 D:\\国金证券QMT交易端\\userdata_mini。"
+        )
+    # 竞价择时未实测放行 fail-closed（§7.1.6）：auction_timing_enabled=True 但未 verified 即拒启动。
+    settings.assert_safe_to_trade()
+    account_id = settings.account_id
 
     # —— 本地 SQLite 数据栈：建表 + 起写线程 + 重建台账（重启幂等）——
     remote = _build_remote_repo(settings, logger)
@@ -252,7 +265,7 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
 
     # —— 连接守护：trader_factory 顺手 set 进 holder；回调用 ABI 适配壳包住引擎 ExecCallback ——
     callback = xt_real.make_trader_callback(engine.callback)    # 触发 xtquant
-    trader_factory = xt_real.make_trader_factory(settings.mini_path or "", holder)
+    trader_factory = xt_real.make_trader_factory(settings.mini_path, holder)
     guard = ConnectionGuard(
         trader_factory=trader_factory, account=account, callback=callback,
         clock=clock, logger=logger, session_id_provider=_make_session_id_provider(settings),

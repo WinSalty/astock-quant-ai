@@ -83,6 +83,54 @@ def test_build_calendar_static_from_file(tmp_path):
     assert cal.is_open(date(2026, 6, 12)) and not cal.is_open(date(2026, 6, 13))
 
 
+# ---------------------------------------------------------------------------
+# 国金对接核对 F06/F07：account_id / mini_path 启动期 fail-closed（缺配拒启动）
+# ---------------------------------------------------------------------------
+def test_build_real_engine_fail_closed_without_account_id():
+    """缺 QMT_ACCOUNT_ID → build_real_engine 启动期拒启（防假账户号污染台账/回流）。"""
+    import pytest
+    from qmt_strategy.app.run import build_real_engine
+    from qmt_strategy.common.logger import RecordingLogger
+
+    s = Settings.from_env({"QMT_MINI_PATH": "D:/qmt/userdata_mini"})  # 有 mini_path、无 account_id
+    with pytest.raises(RuntimeError, match="QMT_ACCOUNT_ID"):
+        build_real_engine(s, RecordingLogger())
+
+
+def test_build_real_engine_fail_closed_without_mini_path():
+    """缺 QMT_MINI_PATH → build_real_engine 启动期拒启（防空 userdata 路径建 trader）。"""
+    import pytest
+    from qmt_strategy.app.run import build_real_engine
+    from qmt_strategy.common.logger import RecordingLogger
+
+    s = Settings.from_env({"QMT_ACCOUNT_ID": "acc1"})  # 有 account_id、无 mini_path
+    with pytest.raises(RuntimeError, match="QMT_MINI_PATH"):
+        build_real_engine(s, RecordingLogger())
+
+
+# ---------------------------------------------------------------------------
+# §7.1.6 fail-closed：竞价择时未实测放行不得开启（assert_safe_to_trade）
+# ---------------------------------------------------------------------------
+def test_assert_safe_to_trade_blocks_unverified_auction_timing():
+    import pytest
+
+    s = Settings.from_env({"QMT_AUCTION_TIMING_ENABLED": "true"})  # 开了但未标记 verified
+    assert s.auction_timing_verified is False
+    with pytest.raises(RuntimeError, match="QMT_AUCTION_TIMING_VERIFIED"):
+        s.assert_safe_to_trade()
+
+
+def test_assert_safe_to_trade_allows_verified_or_disabled():
+    # 已实测放行：开 + verified → 放行（不抛）
+    s1 = Settings.from_env(
+        {"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_AUCTION_TIMING_VERIFIED": "true"}
+    )
+    s1.assert_safe_to_trade()
+    # 默认关：不抛
+    s2 = Settings.from_env({})
+    s2.assert_safe_to_trade()
+
+
 def test_per_interface_token_fallback_and_override():
     """评审三轮 XCUT-01：watchlist/ingest 分接口 token 缺省回落统一 signal token，配置后各取各自。"""
     from qmt_strategy.config.settings import Settings

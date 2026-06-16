@@ -121,7 +121,11 @@ class PositionState(StrEnum):
     SELLING = "SELLING"       # 已发卖出委托，在途
     SOLD = "SOLD"             # 全部卖出，单元关闭
     PART_SOLD = "PART_SOLD"   # 部分卖出（减仓）
-    FROZEN = "FROZEN"         # 风控冻结态
+    # 风控冻结态（保留·当前无赋值点）：单票/账户风控走 RiskVerdict.FREEZE 每 tick 即时裁决、不回写单元
+    # 持久态，故本态目前不会被任何路径置入；position_manager 的 refresh_state/sellable_units 守卫保留对
+    # FROZEN 的排除作为防御性冗余（契约漂移/未来扩展时不误推进/误卖冻结单元）。若未来要落地「单票止损后
+    # 持久冻结至人工恢复」语义，需补 state=FROZEN 赋值点 + 恢复入口（见 doc/16 T0.5）。
+    FROZEN = "FROZEN"
 
 
 class PositionMode(StrEnum):

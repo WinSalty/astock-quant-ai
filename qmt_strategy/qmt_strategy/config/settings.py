@@ -57,7 +57,10 @@ class Settings:
 
     # —— 7.1.1 账户与连接（敏感，不入库/不进日志）——
     account_id: Optional[str] = None          # QMT_ACCOUNT_ID：QMT 资金账号（落 qmt_*.account_id）
-    account_type: Optional[int] = None        # QMT_ACCOUNT_TYPE：账号类型枚举（实测为准）
+    # QMT_ACCOUNT_TYPE：账号类型（保留·当前未接入 StockAccount 构造）。是否需透传待 §A10 国金真机确认——
+    # 纯现货账户单参 StockAccount(account_id) 即可（account_type 默认 'STOCK'）；两融账户需传 'CREDIT'。
+    # 注意官方第二参是字符串('STOCK'/'CREDIT')，与此处 int 解析口径不一致，启用前须一并改为字符串映射（见 doc/16 T0.5）。
+    account_type: Optional[int] = None        # QMT_ACCOUNT_TYPE
     mini_path: Optional[str] = None           # QMT_MINI_PATH：userdata_mini 路径
     session_id: Optional[int] = None          # QMT_SESSION_ID：交易 session id（重连须换新）
     mysql_dsn: Optional[str] = None           # QMT_MYSQL_DSN：仅 qmt_* 四表写权限的独立账号连接串
@@ -92,9 +95,10 @@ class Settings:
     http_timeout_seconds: float = 10.0        # QMT_HTTP_TIMEOUT_SECONDS：单次接口超时秒数
 
     # —— 7.1.3 竞价轮询与采集节奏 ——
+    # 注：原 auction_window / intraday_snapshot_minutes 两项已删除（国金对接核对 F09）——真实竞价时段
+    # 由 common/auction_window.py 硬编码（交易所固定结构、不可配），盘中快照节奏由调度 poll 驱动，二者
+    # 从无消费者，属「假可配置」误导运维，故移除。
     auction_poll_interval_sec: float = 3.0    # QMT_AUCTION_POLL_INTERVAL_SEC（默认 3s，§7.1.3）
-    auction_window: str = "09:15-09:25"       # QMT_AUCTION_WINDOW
-    intraday_snapshot_minutes: int = 5        # QMT_INTRADAY_SNAPSHOT_MINUTES
     close_snapshot_time: str = "15:05"        # QMT_CLOSE_SNAPSHOT_TIME
 
     # —— 7.1.4 各战法阈值与开关（对齐竞价观察清单口径）——
@@ -146,6 +150,9 @@ class Settings:
 
     # —— 7.1.6 竞价择时总开关（实测前必须关，§7.1.6 强约束）——
     auction_timing_enabled: bool = False      # QMT_AUCTION_TIMING_ENABLED：默认 False
+    # 竞价择时实测放行标记（fail-closed）：仅当在国金真机完成竞价数据能力实测（§A4）后显式置 True，才允许
+    # auction_timing_enabled=True 真实启动；否则 assert_safe_to_trade 启动期拒启，杜绝「未实测就开竞价择时」。
+    auction_timing_verified: bool = False     # QMT_AUCTION_TIMING_VERIFIED：默认 False
     kill_switch: bool = False                 # QMT_KILL_SWITCH：True 则只采集不下单
 
     # —— 下单/台账参数 ——
@@ -211,8 +218,6 @@ class Settings:
             signal_ingest_token_file=g("QMT_SIGNAL_INGEST_TOKEN_FILE") or None,
             http_timeout_seconds=_as_float(g("QMT_HTTP_TIMEOUT_SECONDS")) or 10.0,
             auction_poll_interval_sec=_as_float(g("QMT_AUCTION_POLL_INTERVAL_SEC")) or 3.0,
-            auction_window=g("QMT_AUCTION_WINDOW") or "09:15-09:25",
-            intraday_snapshot_minutes=_as_int(g("QMT_INTRADAY_SNAPSHOT_MINUTES")) or 5,
             close_snapshot_time=g("QMT_CLOSE_SNAPSHOT_TIME") or "15:05",
             auction_abandon_pct=_as_decimal(g("QMT_AUCTION_ABANDON_PCT")),
             auction_lowbuy_pct_low=_as_decimal(g("QMT_AUCTION_LOWBUY_PCT_LOW")),
@@ -252,6 +257,7 @@ class Settings:
             decision_log_queue_size=_as_int(g("QMT_DECISION_LOG_QUEUE_SIZE")) or 2000,
             decision_log_batch_size=_as_int(g("QMT_DECISION_LOG_BATCH_SIZE")) or 50,
             auction_timing_enabled=_as_bool(g("QMT_AUCTION_TIMING_ENABLED") or "false"),
+            auction_timing_verified=_as_bool(g("QMT_AUCTION_TIMING_VERIFIED") or "false"),
             kill_switch=_as_bool(g("QMT_KILL_SWITCH") or "false"),
             order_ttl_seconds=_as_int(g("QMT_ORDER_TTL_SECONDS")) or 60,
             trade_conn_heartbeat_fail_threshold=(
@@ -314,10 +320,21 @@ class Settings:
         )
 
     def assert_safe_to_trade(self) -> None:
-        """下单前安全校验（§7.1.6）：竞价择时开关只有在显式置真时才允许，
-        且 kill_switch 为真时禁止任何下单（由调用方据返回的 kill_switch 决定）。
-        这里只做配置自洽校验，不做行情判断。"""
-        # 占位校验点：真实落地可在此追加「未实测不得开竞价择时」的外部标志校验。
+        """启动期配置自洽校验（§7.1.6 fail-closed）：竞价择时未实测放行不得开启。
+
+        业务意图：竞价择时（auction_timing_enabled）是真金下单的高风险开关，红线为「§A4 真机竞价数据
+        能力实测通过前必须关」。本方法把该红线从「仅靠默认 False + 文档」升级为启动期强制校验：
+        若 auction_timing_enabled=True 但 auction_timing_verified=False（未显式标记实测通过）→ 抛
+        RuntimeError 拒绝启动，杜绝「误配 QMT_AUCTION_TIMING_ENABLED=true 就直接开竞价真金下单」。
+        由 build_real_engine 装配期调用（离线/单测直接构造 Engine 不经此，不影响既有用例）。
+        边界：只做配置自洽校验，不做行情判断；kill_switch 的全局熔断由 order_executor.place 直接消费。
+        """
+        if self.auction_timing_enabled and not self.auction_timing_verified:
+            raise RuntimeError(
+                "竞价择时已开(QMT_AUCTION_TIMING_ENABLED=true)但未标记实测通过"
+                "(QMT_AUCTION_TIMING_VERIFIED 未置真)。竞价数据能力须先在目标机(国金 miniQMT)完成 §A4 "
+                "实测，确认后显式配 QMT_AUCTION_TIMING_VERIFIED=true 方可开启；拒绝启动以防未实测即真金竞价下单。"
+            )
         return None
 
     def redacted(self) -> dict:

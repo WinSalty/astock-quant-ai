@@ -71,6 +71,12 @@ def test_trader_holder_delegation():
 
 def test_build_real_engine_requires_xtquant(tmp_path):
     """无 xtquant 时 build_real_engine 抛清晰 RuntimeError（本地 SQLite 栈会先建好，属预期）。"""
-    s = Settings.from_env({"QMT_LOCAL_DB_PATH": str(tmp_path / "q.db"), "QMT_ACCOUNT_ID": "acc1"})
+    # 提供完整必配（account_id + mini_path）以越过启动期 fail-closed 校验，使本用例真正测到「xtquant 缺失」
+    # 这一目标点（否则会先因 mini_path 缺配拒启，测不到 xtquant 触发）。
+    s = Settings.from_env({
+        "QMT_LOCAL_DB_PATH": str(tmp_path / "q.db"),
+        "QMT_ACCOUNT_ID": "acc1",
+        "QMT_MINI_PATH": str(tmp_path / "userdata_mini"),
+    })
     with pytest.raises(RuntimeError):
         run_mod.build_real_engine(s, RecordingLogger())

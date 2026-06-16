@@ -5,8 +5,9 @@ subscribe → run_forever 常驻」固定时序与「断线重建（换新 sessi
 避免下单链路各处自行管理连接状态导致口径漂移。
 
 关键口径（与设计文档 §2.2 / §2.6 / §2.8 一致）：
-- 就绪判定**只读 ``connect()`` 返回值**（0 即连上），QMT 无 ``on_connected`` 回调；本模块
-  代码中不得引用 on_connected，防止误把就绪态绑定到不存在的回调上。
+- 就绪判定**只读 ``connect()`` 返回值**（0 即连上）：xtquant 虽有 ``on_connected`` 回调，但 QMT
+  官方推荐靠 ``connect()`` 返回值判就绪，本引擎据此判定、**不依赖 on_connected**（避免把就绪态绑定到
+  回调时序上）。
 - ``connect()`` 或 ``subscribe()`` 任一返回非 0 → 视为未就绪：``ready=False``，且
   connect 失败时**不再调用 subscribe / 不进入就绪态 / 不调 run_forever**，盘中不发起新开仓。
 - **每次重连必须使用新 session_id**（≠ 旧值），旧 session 不复用——复用已断 session 可能

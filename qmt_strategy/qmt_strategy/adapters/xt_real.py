@@ -39,7 +39,8 @@ def _require_xtquant() -> None:
 class RealXtTrader:
     """实现 contracts.XtTraderLike：包住 xtquant.xttrader.XtQuantTrader，逐方法转发。
 
-    强约束（§2.2）：connect() 返回 0 视为成功；无 on_connected；断开不自动重连；须 run_forever 常驻。
+    强约束（§2.2）：connect() 返回 0 视为成功；不依赖 on_connected（xtquant 有该回调，但靠 connect()
+    返回值判就绪，§连接守护）；断开不自动重连；须 run_forever 常驻。
     """
 
     def __init__(self, userdata_path: str, session_id: int):

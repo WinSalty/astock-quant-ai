@@ -77,7 +77,8 @@ class SelectedStockSource(Protocol):
 class XtTraderLike(Protocol):
     """xttrader（XtQuantTrader）交易接口抽象（§2.2 / §6.2）。
 
-    强约束：无 on_connected；connect() 返回 0 视为成功；断开不自动重连；须 run_forever 常驻。
+    强约束：不依赖 on_connected（xtquant 有该回调，但靠 connect() 返回值判就绪）；connect() 返回 0 视为成功；
+    断开不自动重连；须 run_forever 常驻。
     """
 
     def register_callback(self, callback: Any) -> None: ...
@@ -129,6 +130,8 @@ class XtDataLike(Protocol):
         """批量取全推 tick，返回 {ts_code: 原始 tick dict}。"""
         ...
 
+    # 注：xtquant 真实 subscribe_quote 默认 period='1d'；此处默认 'tick' 仅为本引擎语义，
+    # 调用处（tick_source._ensure_subscribed）显式传 'tick'，故真实默认值不影响行为。
     def subscribe_quote(self, code: str, period: str = "tick") -> int: ...
 
 
