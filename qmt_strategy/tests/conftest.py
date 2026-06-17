@@ -78,8 +78,14 @@ def make_selected_row(
     strategy_family=None,
     setup=None,
     fail_conditions=None,
+    board_level=None,
+    tier=None,
 ) -> SelectedStockRow:
-    """构造一行信号契约，默认值即「主板可交易强势票」。"""
+    """构造一行信号契约，默认值即「主板可交易强势票」。
+
+    board_level/tier 默认 None（无连板维度证据，buy_prefilter 据此放行）；
+    测试禁买四板及以上时显式传 board_level>=4 或 tier="HIGH_BOARD"。
+    """
     return SelectedStockRow(
         ts_code=ts_code,
         trade_date=trade_date,
@@ -99,6 +105,8 @@ def make_selected_row(
         strategy_family=strategy_family,
         setup=setup,
         fail_conditions=fail_conditions,
+        board_level=board_level,
+        tier=tier,
     )
 
 
@@ -117,6 +125,8 @@ def make_plan_row(
     tradable_flag: bool = True,
     continuation_prob: Decimal = Decimal("0.6"),
     leader_strength_score: Decimal = Decimal("0.8"),
+    board_level=None,
+    tier=None,
 ) -> PlanRow:
     return PlanRow(
         ts_code=ts_code,
@@ -134,6 +144,8 @@ def make_plan_row(
         tradable_flag=tradable_flag,
         continuation_prob=continuation_prob,
         leader_strength_score=leader_strength_score,
+        board_level=board_level,
+        tier=tier,
     )
 
 

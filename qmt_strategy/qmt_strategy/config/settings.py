@@ -124,6 +124,10 @@ class Settings:
     # 满额部署不闲置现金），叠加 order_executor 下单层硬闸（占名额口径：在途/部成/已成占名额，
     # 终态零成交=没买进不占）双保险。设 0/负数或极大值可放宽（QMT_MAX_POSITIONS_PER_DAY 覆盖）。
     max_positions_per_day: Optional[int] = 5          # QMT_MAX_POSITIONS_PER_DAY
+    # 禁买四板及以上阈值（doc/18 买入前置过滤层硬规则）：连板高度 board_level >= 本值即禁买（默认 4=四板及以上）。
+    # 由 buy_prefilter 在 loader/entry_router/order_executor 三层统一消费；信号侧 tier==HIGH_BOARD 兜底拦 4+ 板
+    # （board_level 缺失时）。调低（如 3）拦更多板，调大/置 0 放宽（0=关闭高板口径，仅特殊场景）。
+    forbid_board_level_min: int = 4                   # QMT_FORBID_BOARD_LEVEL_MIN
     per_order_max_amount: Optional[Decimal] = None    # QMT_PER_ORDER_MAX_AMOUNT
     # 强度加权资金分配（按 leader_strength_score 分预算，强的分得多）：可分配总预算上限 = 日初权益×本比例。
     # 默认 1.0=用全部日初权益作上限（强度权重在候选间归一分配）；可调小以留现金（如 0.8 只用八成仓）。
@@ -255,6 +259,10 @@ class Settings:
                 _as_int(g("QMT_MAX_POSITIONS_PER_DAY"))
                 if g("QMT_MAX_POSITIONS_PER_DAY")
                 else 5
+            ),
+            # 禁买四板及以上阈值（doc/18）：is-not-None 守卫——显式配 0（关闭高板口径）不被 `or 默认` 吞成 4。
+            forbid_board_level_min=(
+                _v if (_v := _as_int(g("QMT_FORBID_BOARD_LEVEL_MIN"))) is not None else 4
             ),
             per_order_max_amount=_as_decimal(g("QMT_PER_ORDER_MAX_AMOUNT")),
             # 目标仓位比（评审二轮 P2#33 / 复审 P2-3）：必须区分"未配置"与"显式配 0"。原 `_as_decimal(...) or

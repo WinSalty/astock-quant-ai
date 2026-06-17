@@ -76,6 +76,11 @@ class SelectedStockRow:
     # 漏判 5% 顶板)。信号侧契约补此显式布尔后，board_rules/loader 优先采用 is_st，不再单点押在 name 上。
     # None=信号侧未下发(回退 name 判定)；True/False=显式 ST 与否。
     is_st: Optional[bool] = None
+    # 连板维度（doc/18 禁买四板及以上硬规则）：信号侧 watchlist 契约已下发，执行侧据此做「禁买四板及以上」前置过滤。
+    # board_level=连板高度（KPL「N 天 M 板/X 连/首板」解析，可空）；tier=入选分层 FIRST_BOARD/CHAIN/HIGH_BOARD
+    # （信号侧恒非空，HIGH_BOARD ⟺ board_level>=4）。二者经 buy_prefilter 双源判高板：board_level 优先、tier 兜底。
+    board_level: Optional[int] = None
+    tier: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +124,10 @@ class TradableEntry:
     # 不再只在 loader 单点判定后丢失。name=证券名（live ST 兜底），is_st=信号侧显式布尔（None=未下发回退 name）。
     name: Optional[str] = None
     is_st: Optional[bool] = None
+    # 连板维度透传（doc/18 禁买四板及以上）：board_level/tier 一路带到 PlanRow/EntryDecision，
+    # 使「禁买四板及以上」三层闸（loader 前置过滤 / entry_router / order_executor）都拿得到连板高度信号。
+    board_level: Optional[int] = None
+    tier: Optional[str] = None
 
     def to_plan_row(self) -> "PlanRow":
         """转为 auction/entry 消费的计划行（窄视图）。"""
@@ -144,6 +153,9 @@ class TradableEntry:
             # ST 信号透传给路由/下单层做禁买 ST 闸（禁买 ST 硬规则）。
             name=self.name,
             is_st=self.is_st,
+            # 连板维度透传给路由/下单层做禁买四板及以上闸（doc/18）。
+            board_level=self.board_level,
+            tier=self.tier,
         )
 
 
@@ -191,6 +203,10 @@ class PlanRow:
     # entry_router._should_skip 据此对 ST 标的一律 SKIP，绝不产 BUY 决策。
     name: Optional[str] = None
     is_st: Optional[bool] = None
+    # 连板维度（doc/18 禁买四板及以上）：board_level=连板高度、tier=入选分层（HIGH_BOARD ⟺ 4 板+）；
+    # entry_router._should_skip 经 buy_prefilter 据此对四板及以上标的一律 SKIP，绝不产 BUY 决策。
+    board_level: Optional[int] = None
+    tier: Optional[str] = None
 
 
 @dataclass
@@ -250,6 +266,10 @@ class EntryDecision:
     # 禁买 ST 最终闸标志（禁买 ST 硬规则第 3 层）：_build_decision 据统一口径 is_st_stock 算定；
     # order_executor.place 见此为真即拒单——所有买入（含转次优）必过唯一下单点，是绝不买入 ST 的最终硬保证。
     is_st: bool = False
+    # 连板维度锚定（doc/18 禁买四板及以上第 3 层）：_build_decision 从 plan 透传，order_executor.place 据此
+    # 经 buy_prefilter 复核四板及以上——所有买入必过唯一下单点，是绝不买入四板及以上的最终硬保证。
+    board_level: Optional[int] = None
+    tier: Optional[str] = None
 
 
 @dataclass

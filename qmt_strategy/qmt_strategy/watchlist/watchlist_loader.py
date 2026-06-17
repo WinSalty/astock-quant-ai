@@ -15,7 +15,7 @@ from __future__ import annotations
 from datetime import date
 from typing import List, Optional, Tuple
 
-from ..common import board_rules, identity, universe_filter
+from ..common import board_rules, buy_prefilter, identity, universe_filter
 from ..config.settings import Settings
 from ..contracts.errors import WatchlistLoadError
 from ..contracts.models import (
@@ -265,12 +265,28 @@ class WatchlistLoader:
             watch_only.append(self._to_entry(row, norm_code=norm, price=price, today=today))
             return
 
-        # 2.1) ST / 退市整理 live 过滤（评审二轮 P1#10/#18 + 三轮 F3 + 禁买 ST 硬规则第 1 层）：统一走
-        #      is_st_stock——显式 is_st=True 或证券名含 ST/退 即判 ST → 剔出可交易名单、转观察（不下单）。
-        #      「绝不买入 ST」由本层(universe) + entry_router(_should_skip) + order_executor(place) 三层叠加兜底。
-        if universe_filter.is_st_stock(getattr(row, "is_st", None), row.name):
+        # 2.1) 买入前置过滤层（doc/18 第 1 层）：统一委托 buy_prefilter 跑「禁买」硬规则集——命中任一
+        #      （ST/退市整理 或 四板及以上）即剔出可交易名单、转观察（不下单）。ST 口径不变（显式 is_st=True
+        #      或证券名含 ST/退）；四板及以上按 board_level>=阈值 或 tier==HIGH_BOARD 兜底。
+        #      「绝不买入」由本层(loader 前置过滤) + entry_router(_should_skip) + order_executor(place) 三层叠加兜底。
+        verdict = buy_prefilter.evaluate(
+            buy_prefilter.CandidateView(
+                ts_code=norm,
+                name=row.name,
+                is_st=getattr(row, "is_st", None),
+                board_level=row.board_level,
+                tier=row.tier,
+            ),
+            high_board_min_level=self._settings.forbid_board_level_min,
+        )
+        if not verdict.allowed:
             self._logger.info(
-                "watchlist_st_reject", norm_code=norm, name=row.name, trade_date=str(today)
+                "watchlist_prefilter_reject",
+                norm_code=norm,
+                name=row.name,
+                trade_date=str(today),
+                rule_code=verdict.rule_code,
+                reason=verdict.reason,
             )
             watch_only.append(self._to_entry(row, norm_code=norm, price=price, today=today))
             return
@@ -379,4 +395,8 @@ class WatchlistLoader:
             # order_executor 的禁买 ST 闸复核——即便本票漏过 universe 层（如 DB 直读源未走本拆名单），下游仍拦得住。
             name=row.name,
             is_st=row.is_st,
+            # 连板维度透传（doc/18 禁买四板及以上）：board_level/tier 一路带到 PlanRow/EntryDecision，
+            # 供 entry_router 与 order_executor 的禁买四板及以上闸复核（与 ST 同样三层兜底）。
+            board_level=row.board_level,
+            tier=row.tier,
         )

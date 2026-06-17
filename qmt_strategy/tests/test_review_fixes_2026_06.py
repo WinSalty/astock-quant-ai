@@ -154,6 +154,130 @@ def test_st_decision_carries_flag_and_order_refuses_layer3():
     assert trader.order_calls == []   # 绝不发买单
 
 
+# ===========================================================================
+# 一·B、绝不买入四板及以上硬规则（doc/18：买入前置过滤层三层 + 连板维度透传 round-trip）
+# ===========================================================================
+def test_board_level_tier_round_trip_through_sqlite():
+    """board_level/tier 经 selected_to_row → row_to_selected 无损 round-trip（doc/18）。"""
+    from qmt_strategy.storage.mappers import row_to_selected, selected_to_row
+
+    for bl, tier in [(4, "HIGH_BOARD"), (2, "CHAIN"), (1, "FIRST_BOARD"), (None, None)]:
+        r = make_selected_row(ts_code="600036.SH", board_level=bl, tier=tier)
+        back = row_to_selected(selected_to_row(r))
+        assert back.board_level == bl, f"board_level round-trip 丢失: {bl}"
+        assert back.tier == tier, f"tier round-trip 丢失: {tier}"
+
+
+def test_board_dims_persist_through_sqlite_save_load(tmp_path):
+    """board_level/tier 经本机 SQLite watchlist 表 save_watchlist → fetch 实库 round-trip（含建表/迁移）。"""
+    import sqlite3 as _sqlite3
+
+    from qmt_strategy.storage.schema import init_db
+    from qmt_strategy.storage.watchlist_source import SqliteSelectedStockSource
+
+    db = str(tmp_path / "wl.db")
+    conn = _sqlite3.connect(db)
+    init_db(conn)
+    conn.close()
+    src = SqliteSelectedStockSource(db, RecordingLogger())
+    src.save_watchlist([
+        make_selected_row(ts_code="600037.SH", board_level=4, tier="HIGH_BOARD"),
+        make_selected_row(ts_code="600036.SH", board_level=2, tier="CHAIN"),
+    ])
+    got = {r.ts_code: r for r in src.fetch(T_BUY)}
+    assert got["600037.SH"].board_level == 4 and got["600037.SH"].tier == "HIGH_BOARD"
+    assert got["600036.SH"].board_level == 2 and got["600036.SH"].tier == "CHAIN"
+
+
+def test_watchlist_item_maps_board_level_tier():
+    """信号侧 item['board_level']/['tier'] → SelectedStockRow（doc/18 透传）；缺字段 → None（放行）。"""
+    from qmt_strategy.watchlist.remote_watchlist import watchlist_item_to_selected
+
+    row = watchlist_item_to_selected(
+        {"ts_code": "600036.SH", "trade_date": "2026-06-11", "board_level": 5, "tier": "HIGH_BOARD"},
+        target_trade_date=T_BUY,
+    )
+    assert row.board_level == 5
+    assert row.tier == "HIGH_BOARD"
+    row2 = watchlist_item_to_selected(
+        {"ts_code": "600036.SH", "trade_date": "2026-06-11"}, target_trade_date=T_BUY
+    )
+    assert row2.board_level is None and row2.tier is None
+
+
+def test_high_board_excluded_from_tradable_layer1():
+    """第 1 层：四板及以上票（board_level>=4 或 tier=HIGH_BOARD 兜底）被 loader 剔出可交易名单、转观察。"""
+    rows = [
+        make_selected_row(ts_code="600036.SH", market_state="启动", board_level=2, tier="CHAIN"),       # 两连放行
+        make_selected_row(ts_code="600037.SH", market_state="启动", board_level=4, tier="HIGH_BOARD"),  # 四板禁买
+        make_selected_row(ts_code="600038.SH", market_state="启动", board_level=None, tier="HIGH_BOARD"),  # 板高缺失走 tier 兜底
+    ]
+    ctx = _st_loader(rows).load(T_BUY)
+    assert "600036.SH" in ctx.tradable
+    assert "600037.SH" not in ctx.tradable
+    assert "600038.SH" not in ctx.tradable
+    watch_codes = {e.norm_code for e in ctx.watch_only}
+    assert {"600037.SH", "600038.SH"} <= watch_codes
+
+
+def test_high_board_router_skips_layer2():
+    """第 2 层：四板及以上计划行经 entry_router → SKIP（即便竞价强势顶板），决策锚 board_level/tier。"""
+    plan = make_plan_row(ts_code="600036.SH", board_level=4, tier="HIGH_BOARD")
+    dec = _router().route(plan, _auction_snap())
+    assert dec.action == EntryAction.SKIP
+    assert "四板及以上" in dec.reason
+    assert dec.board_level == 4 and dec.tier == "HIGH_BOARD"   # 维度已锚到决策供第 3 层复核
+    # board_level 缺失但 tier=HIGH_BOARD 兜底同样 SKIP。
+    plan2 = make_plan_row(ts_code="600036.SH", board_level=None, tier="HIGH_BOARD")
+    assert _router().route(plan2, _auction_snap()).action == EntryAction.SKIP
+
+
+def test_high_board_order_refuses_layer3():
+    """第 3 层：唯一下单点 place 对四板及以上决策拒单（绝不发买单），即便绕过前两层强喂 BUY。"""
+    buy_high = EntryDecision(
+        ts_code="600036.SH", signal_trade_date=T_SIGNAL, target_trade_date=T_BUY,
+        strategy_family="打板", setup="连板接力", action=EntryAction.CHASE_LIMIT_UP,
+        decided_at=datetime(2026, 6, 12, 1, 16, 0), reason="forced", limit_price=Decimal("11.00"),
+        plan_volume=1000, order_phase=OrderPhase.OPENING, board_level=5, tier="HIGH_BOARD",
+    )
+    trader = _RecTrader()
+    ex = OrderExecutor(trader, FakeStockAccount("acc1"), "acc1", InMemoryLocalLedger(),
+                       Settings(), FakeClock(utc_at_east8(T_BUY, 9, 16)), RecordingLogger())
+    assert ex.place(buy_high) is None
+    assert trader.order_calls == []   # 绝不发买单
+
+
+def test_three_board_not_blocked_by_high_board_rule():
+    """边界：三连板（board_level=3, tier=CHAIN）不被四板规则禁买——loader 放行、router 不因四板 SKIP。"""
+    rows = [make_selected_row(ts_code="600036.SH", market_state="启动", board_level=3, tier="CHAIN")]
+    ctx = _st_loader(rows).load(T_BUY)
+    assert "600036.SH" in ctx.tradable
+    plan = make_plan_row(ts_code="600036.SH", board_level=3, tier="CHAIN")
+    dec = _router().route(plan, _auction_snap())
+    assert "四板及以上" not in (dec.reason or "")   # 三连不触发四板禁买
+
+
+def test_forbid_board_level_min_configurable():
+    """阈值可配：QMT_FORBID_BOARD_LEVEL_MIN=3 → 三连板也被 loader 禁买。"""
+    from qmt_strategy.watchlist.sources import CallableSelectedStockSource
+    from qmt_strategy.watchlist.watchlist_loader import WatchlistLoader
+
+    class _Cal:
+        def is_open(self, d):
+            return True
+        def next_open(self, d):
+            return d + timedelta(days=1)
+        def prev_open(self, d):
+            return d - timedelta(days=1)
+
+    settings = Settings.from_env({"QMT_FORBID_BOARD_LEVEL_MIN": "3"})
+    assert settings.forbid_board_level_min == 3
+    rows = [make_selected_row(ts_code="600036.SH", market_state="启动", board_level=3, tier="CHAIN")]
+    src = CallableSelectedStockSource(lambda d: rows, source_name="t")
+    ctx = WatchlistLoader(src, _Cal(), RecordingLogger(), settings).load(T_BUY)
+    assert "600036.SH" not in ctx.tradable   # 阈值降到 3 → 三连被禁买
+
+
 class _RecTrader:
     def __init__(self, cash="1000000", positions=None):
         self.order_calls = []

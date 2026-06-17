@@ -46,9 +46,11 @@
 - **调度（`DailyScheduler`）**：东八区钟点触发 盘前装载 → 竞价 → 盘中 sweep/卖出 → 收盘对账 → 盘后同步。
 - **适配器（`adapters/xt_real.py`）**：把 xtquant 翻译成 `Protocol`（**唯一 import xtquant 处**，仅 Windows 运行）；非 Windows 用 fake 跑全部单测。
 - **建仓时点口径**：建仓决策由**集合竞价 + 定盘窗（9:15–9:30）的因子轮询**驱动（`AuctionPoller`，9:30 退出）；竞价段（强开追/竞价卖）默认只采集（竞价择时实测前关），**定盘窗（9:25–9:30）对竞价封板/强开票产出 `OPENING` 限价单挂出、待开盘成交**（TTL 顺延至开盘起算）。**当前不做开盘后连续交易段（9:30+）的盘中买入轮询**——即只打「竞价/一字封板」一类，盘中(如 10:30)才封板的票不追（有意设计：竞价定夺 + 挂 OPENING 单待成交）；卖出（止盈止损/炸板/尾盘）则覆盖盘中（由 `QMT_SELL_PASS_LIVE` 门控）。
-- **绝不买入 ST**：ST/*ST/退市整理标的**一律不买入**（硬规则），三层闸叠加——盘前 universe 剔出可交易名单 + 建仓路由 SKIP + 唯一下单点最终拒单；判定口径 = 信号侧显式 `is_st` 为真 **或** 当日证券名含 `ST/退`（`is_st` 经 HTTP→SQLite→PlanRow 可靠透传，不再单点押在 name 上）。
+- **买入前置过滤层（绝不买入 ST / 四板及以上）**：执行侧把所有「禁买」硬规则收敛为统一的**买入前置过滤层**（`common/buy_prefilter.py`：有序规则集 + 结构化裁决，单一来源），三层闸叠加贯彻——盘前 watchlist 装载剔出可交易名单 + 建仓路由 SKIP + 唯一下单点最终拒单：
+  - **绝不买入 ST**：ST/*ST/退市整理标的一律不买入；判定 = 信号侧显式 `is_st` 为真 **或** 当日证券名含 `ST/退`（`is_st` 经 HTTP→SQLite→PlanRow 可靠透传，不再单点押在 name 上）。
+  - **禁买四板及以上**：连板高度 `board_level >= 4`（阈值 `QMT_FORBID_BOARD_LEVEL_MIN`，默认 4），或信号侧分层 `tier==HIGH_BOARD` 兜底（`board_level` 缺失时按 4+ 板 fail-closed 保守拦）；`board_level`/`tier` 经 HTTP→SQLite→PlanRow→EntryDecision 与 `is_st` 同路透传（见 [doc/18](18-watchlist买入前置过滤层抽象与四板及ST禁买-设计与台账.md)）。
 
-**贯穿全局的硬口径**：守 T+1 双保险 · 三层幂等（业务单号+DB唯一键+traded_id）· 时间口径无 ±8h（东八区↔UTC naive）· 安全默认「契约残缺/中断→只守仓不开新仓」· **绝不买入 ST（三层闸）** · `KILL_SWITCH` 一键熔断 · 竞价择时实测前关。
+**贯穿全局的硬口径**：守 T+1 双保险 · 三层幂等（业务单号+DB唯一键+traded_id）· 时间口径无 ±8h（东八区↔UTC naive）· 安全默认「契约残缺/中断→只守仓不开新仓」· **买入前置过滤层：绝不买入 ST + 禁买四板及以上（三层闸）** · `KILL_SWITCH` 一键熔断 · 竞价择时实测前关。
 
 ---
 
@@ -155,6 +157,7 @@
 |---|---|---|
 | `QMT_TARGET_POSITION_RATIO` | 总预算上限 = 日初权益 × 本比例 | `1.0`（满仓上限；调小留现金，`0`=空跑不开新仓） |
 | `QMT_MAX_POSITIONS_PER_DAY` | 单日建仓**只数**上限（不同标的数） | `5`（设 0/负/极大值放宽不限） |
+| `QMT_FORBID_BOARD_LEVEL_MIN` | 禁买连板高度下限（`board_level >= 本值` 即禁买；买入前置过滤层硬规则，三层闸 + `tier==HIGH_BOARD` 兜底） | `4`（=禁买四板及以上）；调低（如 `3`）拦更多板，置 `0`/负=关闭高板口径（值进 `Settings.redacted()` 启动快照可核对） |
 | `QMT_MAX_ORDERS_PER_DAY` | 单日下单**次数**上限（含转次优/卖出，区别于只数） | 无 |
 | `QMT_PER_ORDER_MAX_AMOUNT` | 单笔金额上限 | 无 |
 | `QMT_MAX_POSITION_PER_STOCK` | 单票持仓金额上限 | 无 |

@@ -121,6 +121,11 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
         # 显式 ST 标志（禁买 ST 硬规则 + F08）：信号侧契约若下发 is_st 布尔则透传（保留 None 三态），
         # 使执行侧「绝不买入 ST」三层闸拿到可靠显式信号，不再单点押在 name 文本上（name 偶发缺失会漏判）。
         is_st=_to_bool(item.get("is_st")),
+        # 连板维度（doc/18 禁买四板及以上）：信号侧契约已下发 board_level（连板高度，可空）与 tier
+        # （入选分层 FIRST_BOARD/CHAIN/HIGH_BOARD，恒非空）；透传供执行侧 buy_prefilter 做四板及以上前置过滤。
+        # 缺字段（老契约）→ board_level=None / tier=None，buy_prefilter 无证据时放行（不无证据全拦）。
+        board_level=_to_int(item.get("board_level")),
+        tier=item.get("tier"),
         leader_strength_score=_to_decimal(item.get("leader_strength_score")),
         role=_first_role(item.get("role_tags")),
         # 信号侧只给 strategy_family/setup（无单值 strategy），strategy 留空，路由按 family+setup。

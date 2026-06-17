@@ -301,6 +301,9 @@ def selected_to_row(r: SelectedStockRow) -> Dict[str, Any]:
         "name": r.name,  # 评审二轮 P1#18/#63：透传证券名称供执行侧 ST 识别/过滤
         # 禁买 ST 硬规则 + F08：显式 ST 标志落 0/1，None(未下发)落 NULL，bool_int 保三态。
         "is_st": bool_int(r.is_st),
+        # 连板维度（doc/18 禁买四板及以上）：board_level=连板高度（int 直存，None→NULL），tier=入选分层（TEXT 直存）。
+        "board_level": r.board_level,
+        "tier": r.tier,
     }
 
 
@@ -323,4 +326,10 @@ def row_to_selected(row: Any) -> SelectedStockRow:
         name=_g(row, "name"),  # 评审二轮 P1#18/#63
         # 禁买 ST 硬规则 + F08：NULL→None(回退 name 判定)，0/1→False/True，保三态无损 round-trip。
         is_st=(None if (_st := _g(row, "is_st")) is None else int_bool(_st)),
+        # 连板维度（doc/18 禁买四板及以上）：board_level NULL→None，tier 直读。
+        # 安全前提：board_level/tier 两列由 init_db→_apply_column_migrations 对旧库幂等补齐；本方法消费的行均来自
+        # init_db 之后的 `SELECT *`，故 _g 取列必有值。注意 sqlite3.Row 对【不存在的列】是抛 IndexError（非返 None），
+        # 故绝不能在未跑迁移的库上 SELECT 老列集再喂本方法——保护来自强制迁移，不是 _g 的容错。
+        board_level=_g(row, "board_level"),
+        tier=_g(row, "tier"),
     )

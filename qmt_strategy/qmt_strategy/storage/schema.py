@@ -80,6 +80,8 @@ TABLE_META: Dict[str, Dict[str, List[str]]] = {
             "fail_conditions", "signal_close", "limit_up_price", "reasonable_open_high_low",
             "reasonable_open_high_high", "first_board_vol", "float_mktcap", "strategy_family", "setup",
             "name", "is_st",
+            # 连板维度（doc/18 禁买四板及以上）：board_level=连板高度、tier=入选分层，经 SQLite 无损 round-trip。
+            "board_level", "tier",
         ],
         "unique": ["ts_code", "target_trade_date"],
         "coalesce": [],
@@ -169,6 +171,7 @@ _DDL: Dict[str, str] = {
             fail_conditions TEXT, signal_close TEXT, limit_up_price TEXT,
             reasonable_open_high_low TEXT, reasonable_open_high_high TEXT, first_board_vol INTEGER,
             float_mktcap TEXT, strategy_family TEXT, setup TEXT, name TEXT, is_st INTEGER,
+            board_level INTEGER, tier TEXT,
             PRIMARY KEY (ts_code, target_trade_date)
         )""",
     # 系统标志位 kv（评审二轮 P1#9）：跨进程/跨日持久的运行态标记，如对账未通过阻断次日开仓。
@@ -181,8 +184,11 @@ _DDL: Dict[str, str] = {
 # 增量列迁移（评审二轮 P1#18/#63 + 禁买 ST 硬规则 is_st）：对已存在的 watchlist 表补列（CREATE TABLE
 # IF NOT EXISTS 不会给旧表加列）。{表: [(列, 列定义), ...]}，init_db 幂等执行（已存在的列跳过）。
 # is_st（禁买 ST 硬规则 + F08）：旧库无此列时补上，使信号侧显式 ST 标志可经 SQLite 无损 round-trip。
+# board_level/tier（doc/18 禁买四板及以上）：旧库无此列时补上，使信号侧连板高度/分层可经 SQLite 无损 round-trip。
 _COLUMN_MIGRATIONS = {
-    "watchlist": [("name", "TEXT"), ("is_st", "INTEGER")],
+    "watchlist": [
+        ("name", "TEXT"), ("is_st", "INTEGER"), ("board_level", "INTEGER"), ("tier", "TEXT"),
+    ],
 }
 
 # 索引：对账 / 同步按 (trade_date) 查；台账按 (target_trade_date, ts_code, strategy_family) 查活跃单。
