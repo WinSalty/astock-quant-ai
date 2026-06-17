@@ -841,6 +841,60 @@ def test_plan_volume_subtracts_held_position(clock_0916):
     assert call["order_volume"] * call["price"] <= 45000
 
 
+# —— 评审 doc/19 M-2：持仓查询失败时单票上限净额校验 fail-closed ——
+class _PosFailTrader(_RcTrader):
+    """query_stock_positions 抛异常（模拟券商持仓查询抖动/超时），用于 M-2 fail-closed 验证。"""
+
+    def query_stock_positions(self, account):
+        raise RuntimeError("position query timeout")
+
+
+def test_plan_volume_fail_closed_when_position_query_fails(clock_0916):
+    """M-2：配了单票上限且持仓查询失败 → 无法核验隔夜持仓 → fail-closed 拒单（不当作无持仓满额买）。"""
+    trader = _PosFailTrader(rc=1001, cash="1000000")
+    logger = RecordingLogger()
+    ex = _executor(trader, clock_0916, logger=logger,
+                   settings=Settings(max_position_per_stock=Decimal("100000"),
+                                     allow_plan_volume_fallback=True))
+    biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
+    assert biz is None                                          # 拒单
+    assert trader.order_calls == []                             # 未发券商委托
+    assert "order_per_stock_cap_held_unknown_reject" in logger.events()
+
+
+def test_plan_volume_proceeds_when_position_query_ok_no_holding(clock_0916):
+    """对照：持仓查询成功且该票无持仓 → held_known=True、敞口 0 → 正常下单（M-2 不误拒成功查询）。"""
+    trader = _RcTrader(rc=1001, positions=[], cash="1000000")
+    ex = _executor(trader, clock_0916,
+                   settings=Settings(max_position_per_stock=Decimal("100000"),
+                                     allow_plan_volume_fallback=True))
+    biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
+    assert biz is not None
+    assert len(trader.order_calls) == 1
+
+
+def test_plan_volume_no_cap_unaffected_by_position_query_failure(clock_0916):
+    """边界：未配单票上限时，持仓查询失败不影响下单（M-2 守卫只在 max_position_per_stock 配了时生效）。"""
+    trader = _PosFailTrader(rc=1001, cash="1000000")
+    ex = _executor(trader, clock_0916,
+                   settings=Settings(allow_plan_volume_fallback=True))  # 不配单票上限
+    biz = ex.place(_decision(plan_volume=None, limit_price=Decimal("11.00")))
+    assert biz is not None                                      # 未配上限 → 不触发 M-2 fail-closed
+    assert len(trader.order_calls) == 1
+
+
+def test_exposure_for_code_checked_flags_query_failure(clock_0916):
+    """exposure_for_code_checked 直接验证：查询成功 held_known=True，查询失败 held_known=False。"""
+    ok_trader = _RcTrader(rc=1001, positions=[], cash="1000000")
+    ex_ok = _executor(ok_trader, clock_0916)
+    _exp, known = ex_ok.exposure_for_code_checked(T_BUY, "600036.SH")
+    assert known is True
+    fail_trader = _PosFailTrader(rc=1001, cash="1000000")
+    ex_fail = _executor(fail_trader, clock_0916)
+    _exp2, known2 = ex_fail.exposure_for_code_checked(T_BUY, "600036.SH")
+    assert known2 is False
+
+
 def test_cancelling_real_chain_recancel_after_grace():
     """评审复核 P0：走真实链路（非手工置态）——SUBMITTED 单到期撤成 CANCELLING 后仍被持续盯防，
     撤单回执丢失时超 grace 由 sweep 幂等重发 cancel（验证首次进 CANCELLING 已续 deadline）。"""

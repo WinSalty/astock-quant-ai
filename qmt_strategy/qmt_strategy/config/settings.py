@@ -137,6 +137,9 @@ class Settings:
     # 装配/限价异常，拒单留痕而非用【不含强度份额】的 _plan_volume 退化口径绕过强度与名额约束。仅离线/无
     # sizer 的兼容场景显式置 True 才启用回退（QMT_ALLOW_PLAN_VOLUME_FALLBACK）。
     allow_plan_volume_fallback: bool = False          # QMT_ALLOW_PLAN_VOLUME_FALLBACK
+    # 限价相对参考价偏离护栏（评审 doc/19 H-3 升级为装配期 fail-closed）：默认 None；assert_safe_to_trade
+    # 要求生产显式配置(如 0.10=偏离盘口现价10%即拒发)，缺配拒启动——杜绝「忘配=偏离护栏静默放行」。显式关停
+    # 配大值(如 0.99，实际永不触发)而非 0(0=零容忍最严)。
     price_deviation_guard_pct: Optional[Decimal] = None  # QMT_PRICE_DEVIATION_GUARD_PCT
     # QMT_MARKET_STATE_BLOCK：禁开仓集合（评审 2.5 口径修正）。
     # 信号侧 watchlist 的 market_state 只有三档：空仓 / 谨慎参与 / 参与（六档情绪周期已在信号侧
@@ -148,6 +151,10 @@ class Settings:
     market_state_block: List[str] = field(
         default_factory=lambda: ["空仓", "谨慎参与", "退潮", "冰点"]
     )
+    # 账户级当日回撤阈值（§5.4.1；评审 doc/19 H-3 升级为装配期 fail-closed）：默认 None；assert_safe_to_trade
+    # 要求生产显式配置(如 0.05=日内回撤5%熔断禁开新仓)，缺配拒启动——杜绝「忘配=回撤熔断静默形同虚设」。显式关停
+    # 配大值(如 0.99，实际永不触发)而非 0(0=任何亏损即熔断)。配了即生效：盘前日初权益基线抓取失败时 fail-closed
+    # 禁开新仓(不冻结卖出，见 main._open_blocked_by_risk 的 F15 分支)。
     account_drawdown_limit: Optional[Decimal] = None  # 账户级当日回撤阈值（§5.4.1）
     account_loss_limit: Optional[Decimal] = None      # 账户级当日已实现亏损阈值
     stock_float_loss_limit: Optional[Decimal] = None  # 单票浮亏阈值
@@ -385,6 +392,25 @@ class Settings:
                 "盘中卖出链已开(QMT_SELL_PASS_LIVE=true)但未配单票浮亏止损(QMT_STOCK_FLOAT_LOSS_LIMIT)。"
                 "最小版跨帧破位/炸板止损未保真(待 T1.2)，单帧浮亏止损是唯一价位安全网，须显式配置(如 0.05)"
                 "方可开启生产卖出；拒绝启动以防卖出链开启却无价位止损兜底。"
+            )
+        # 账户回撤闸 / 限价偏离闸装配期强校验（评审 doc/19 H-3）：这两道是 README「风控五道闸」中的资金/价位护栏，
+        # 原实现默认 None → risk._breached / _limit_price_sane 对 None 整段放行（fail-open）、且无任何启动期提醒，
+        # 运维易误以为护栏已生效。这里把它们升级为与竞价择时/卖出链同级的【启动期 fail-closed 强校验】：
+        # 缺配即拒启，强制运维显式做出风控决策，杜绝「忘配=两道护栏静默形同虚设」。
+        # 关停口径：这两闸的观测值（回撤/偏离）恒 >=0，配 0 表示「零容忍」(最严，非关停)，故【显式关停】
+        # 应配一个大到实际永不触发的阈值（如回撤 0.99=99%、偏离 0.99=99%），而非 0；这样既满足「显式配置」，
+        # 又把「我确实不要这道闸」变成一次有痕可审计的主动决策（值进 redacted() 启动快照可核对）。
+        if self.account_drawdown_limit is None:
+            raise RuntimeError(
+                "账户级当日回撤闸未配置(QMT_ACCOUNT_DRAWDOWN_LIMIT 缺失)。它是「风控五道闸」之一，"
+                "未配时回撤熔断对开新仓零作用(爆亏当天仍可继续开仓至现金耗尽)。须显式配置(如 0.05=回撤5%熔断)；"
+                "若确需关停，配一个实际永不触发的大值(如 0.99)以留下有痕的主动决策。拒绝启动以防账户级止损静默失效。"
+            )
+        if self.price_deviation_guard_pct is None:
+            raise RuntimeError(
+                "限价偏离护栏未配置(QMT_PRICE_DEVIATION_GUARD_PCT 缺失)。它是「风控五道闸」之一，"
+                "未配时价位口径错位/追高失控只剩「超法定涨停价」一道兜底。须显式配置(如 0.10=偏离盘口现价10%即拒)；"
+                "若确需关停，配一个实际永不触发的大值(如 0.99)以留下有痕的主动决策。拒绝启动以防限价护栏静默失效。"
             )
         return None
 

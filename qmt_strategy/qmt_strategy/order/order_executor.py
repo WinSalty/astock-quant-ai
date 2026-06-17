@@ -775,22 +775,27 @@ class OrderExecutor:
             total += filled_amt + remaining_amt
         return total
 
-    def _held_value(self, ts_code: str) -> Decimal:
-        """该 ts_code 现有持仓市值（评审三轮 EXEC-risk-03）：单票上限净额校验须含既有持仓。
+    def _held_value(self, ts_code: str) -> Tuple[Decimal, bool]:
+        """该 ts_code 现有持仓市值 + 查询是否成功（评审三轮 EXEC-risk-03 / 评审 doc/19 M-2）。
 
         业务意图：max_position_per_stock 原只当「单笔预算上限」、不计已有持仓，跨日对隔夜持有的同票再
         满额下单会累计突破单票上限（连板/打板龙头连续上榜正是本系统核心打法）。这里查 QMT 权威持仓取该票
         市值。口径：market_value 优先，缺则 volume×(avg_price/open_price) 兜底，再缺记 0。
-        边界：查询失败保守返回 0（不臆造、不阻塞；与既有「资产查询失败不下单」由其它闸兜底口径一致）。
+        返回 (市值, held_known)（M-2）：
+        - held_known=True → 查询成功，市值为权威值（含 0=确实无持仓）；
+        - held_known=False → 持仓查询失败，市值【不可知】（返回的 0 仅占位）。
+          原实现查询失败【静默返 0】，被单票上限净额校验当成「该票无持仓」→ 跨日复买同票时漏计隔夜持仓、
+          单票敞口可累计逼近 2×cap。改为显式回传失败标志，由单票上限消费点 fail-closed 拒单（不臆造无持仓）。
+        边界：仍不抛异常（不拖垮下单主链）；是否拒单由上层据 held_known 决定。
         """
         from ..common.identity import resolve_code
 
         target = resolve_code(ts_code)
         try:
             rows = self._trader.query_stock_positions(self._account)
-        except Exception as exc:  # noqa: BLE001 持仓查询失败不臆造市值，保守返 0
+        except Exception as exc:  # noqa: BLE001 持仓查询失败不臆造市值，回传 held_known=False 由上层 fail-closed
             self._logger.warn("order_held_value_query_failed", ts_code=ts_code, error=str(exc))
-            return Decimal("0")
+            return Decimal("0"), False
         total = Decimal("0")
         for r in rows or []:
             code = resolve_code(getattr(r, "stock_code", None) or getattr(r, "ts_code", None))
@@ -804,7 +809,7 @@ class OrderExecutor:
             px = getattr(r, "avg_price", None) or getattr(r, "open_price", None)
             if vol and px is not None:
                 total += Decimal(str(vol)) * Decimal(str(px))
-        return total
+        return total, True
 
     def _committed_for_code(self, target_trade_date: Any, ts_code: str) -> Decimal:
         """当日对该 ts_code 已承诺的活跃买入额（评审三轮 EXEC-risk-03）：单票上限须含当日在途/已成承诺。"""
@@ -852,8 +857,24 @@ class OrderExecutor:
 
         供资金分配主链（main._strength_budget_volume）与离线兜底（_plan_volume）共用，保证单票金额上限
         net 校验在两条路径口径一致、且对当日已成买入【单计不重复】（已成体现在持仓市值、未成体现在在途计划额）。
+        best-effort 口径：持仓查询失败时持仓段按 0 计（held_known 在此被丢弃）；要据查询成败 fail-closed
+        的单票上限消费点须改用 exposure_for_code_checked（评审 doc/19 M-2）。本方法保留供单测/最佳努力读数。
         """
-        return self._held_value(ts_code) + self._committed_remaining_for_code(target_trade_date, ts_code)
+        held, _held_known = self._held_value(ts_code)
+        return held + self._committed_remaining_for_code(target_trade_date, ts_code)
+
+    def exposure_for_code_checked(
+        self, target_trade_date: Any, ts_code: str
+    ) -> Tuple[Decimal, bool]:
+        """单票敞口 + 持仓是否可知（评审 doc/19 M-2）：单票金额上限净额校验须用此版。
+
+        返回 (敞口, held_known)：held_known=False 表示持仓查询失败、敞口不含可信的隔夜持仓段，
+        消费点（_plan_volume / main._strength_budget_volume）应据此 fail-closed 拒单——绝不把「查询失败」
+        当作「持仓为 0」而漏计隔夜持仓、致跨日同票超单票上限加仓。敞口口径与 exposure_for_code 完全一致
+        （持仓市值 + 未成在途计划额，对当日已成单计不重复，堵 F13 双重扣减）。
+        """
+        held, held_known = self._held_value(ts_code)
+        return held + self._committed_remaining_for_code(target_trade_date, ts_code), held_known
 
     # ------------------------------------------------------------------
     # 计划股数现算（§4.4(6) 资金口径）
@@ -895,13 +916,24 @@ class OrderExecutor:
         # effective_cap = cap - exposure；<=0 则该票已达/超上限直接返 0 不再加仓（跨日同样生效）。
         if self._settings.max_position_per_stock is not None:
             cap_stock = Decimal(str(self._settings.max_position_per_stock))
-            held = self.exposure_for_code(decision.target_trade_date, decision.ts_code)
-            effective_cap = cap_stock - held
+            exposure, held_known = self.exposure_for_code_checked(
+                decision.target_trade_date, decision.ts_code
+            )
+            # 持仓查询失败 fail-closed（评审 doc/19 M-2）：无法核验隔夜持仓时，绝不把「查询失败」当「无持仓」
+            # 而满额加仓（会使单票敞口逼近 2×cap）；本轮该票拒单 + 强告警，待下轮重试或人工排查 QMT 持仓查询。
+            if not held_known:
+                self._logger.error(
+                    "order_per_stock_cap_held_unknown_reject",
+                    ts_code=decision.ts_code, account_id=self._account_id,
+                    note="持仓查询失败无法核验单票敞口，单票上限净额校验 fail-closed 拒单(M-2)",
+                )
+                return 0
+            effective_cap = cap_stock - exposure
             if effective_cap <= 0:
                 self._logger.info(
                     "order_per_stock_cap_reached",
                     ts_code=decision.ts_code, account_id=self._account_id,
-                    cap=str(cap_stock), held=str(held),
+                    cap=str(cap_stock), held=str(exposure),
                 )
                 return 0
             if effective_cap < budget:

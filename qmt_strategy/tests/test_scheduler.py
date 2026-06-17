@@ -150,14 +150,47 @@ def test_prewarm_not_fired_when_connect_fails_before_auction():
     assert "scheduler_prewarm_conn_not_ready_will_retry" in s._logger.events()
 
 
-def test_prewarm_fired_after_9_15_even_if_conn_fails():
-    # 9:20（>= 9:15）连接失败 → 仍定稿 fired（避免无限重试错过窗口），仅告警。
+def test_prewarm_not_fired_after_9_15_when_conn_fails_then_recovers():
+    """评审 doc/19 H-4：连接未就绪时 PREWARM 【不论时间】都不定稿（原实现过 9:15 强制定稿是不可恢复单点），
+    连接恢复后才定稿（engine.prewarm 重跑补齐持仓重建/权益基线）。"""
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 20))  # 9:20 已过竞价起点
+    eng = _FakeEngine(); guard = _FlakyGuard([False, True]); stack = _FakeStack()
+    s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal())
+    s.dispatch(Action.PREWARM, TRADING_DAY)
+    # 过 9:15 但连接失败 → 仍不定稿（H-4：连接未就绪不可定稿，可恢复）。
+    assert Action.PREWARM not in s._fired.get(TRADING_DAY, set())
+    assert "scheduler_prewarm_conn_not_ready_will_retry" in s._logger.events()
+    # 第二轮连接恢复 → 定稿 fired，prewarm 重跑补齐持仓/基线。
+    s.dispatch(Action.PREWARM, TRADING_DAY)
+    assert Action.PREWARM in s._fired.get(TRADING_DAY, set())
+
+
+def test_prewarm_retry_naturally_terminates_at_close():
+    """H-4：连接持续失败致 PREWARM 始终不定稿，但 decide() 仅在 < 收盘 才返回 PREWARM——
+    过收盘点(默认 15:05)自然转 CLOSE_BATCH，证明「连接未就绪不限时重试」天然以收盘为界、不会无限。"""
     clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 20))
     eng = _FakeEngine(); guard = _FlakyGuard([False]); stack = _FakeStack()
     s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal())
     s.dispatch(Action.PREWARM, TRADING_DAY)
-    # 9:20 已过竞价起点 → PREWARM 定稿（decide 在已 prewarm 后此刻进竞价/盘中，不再 PREWARM）。
-    assert Action.PREWARM in s._fired.get(TRADING_DAY, set())
+    assert Action.PREWARM not in s._fired.get(TRADING_DAY, set())          # 连接失败 → 不定稿
+    assert s.decide(utc_at_east8(TRADING_DAY, 9, 20)) == Action.PREWARM    # 盘中仍重试
+    # 推进到收盘后：即便 PREWARM 从未定稿，decide 也转 CLOSE_BATCH（重试自然终止，非无限）。
+    assert s.decide(utc_at_east8(TRADING_DAY, 15, 6)) == Action.CLOSE_BATCH
+
+
+def test_prewarm_skips_connect_when_guard_already_ready():
+    """评审 doc/19 H-2：guard 已就绪时 PREWARM 不再调 connect_and_subscribe（不重建已连好的通道）。"""
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 0))
+
+    class _ReadyGuard:
+        def __init__(self): self.connects = 0; self.ready = True
+        def connect_and_subscribe(self): self.connects += 1; return True
+
+    eng = _FakeEngine(); guard = _ReadyGuard(); stack = _FakeStack()
+    s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal())
+    s.dispatch(Action.PREWARM, TRADING_DAY)
+    assert guard.connects == 0                                   # 已就绪 → 不重建
+    assert Action.PREWARM in s._fired.get(TRADING_DAY, set())    # 视为已连，正常定稿
 
 
 # ===========================================================================
@@ -212,6 +245,48 @@ def test_intraday_books_ok_reports_feed_true_and_sells():
     s.dispatch(Action.INTRADAY, TRADING_DAY)
     assert eng.feed_reports == [True]
     assert ("sell", "intraday") in eng.calls
+
+
+# ===========================================================================
+# 评审 doc/19 H-4：RUN_AUCTION 成功才标 fired，异常（<9:30）可重试恢复
+# ===========================================================================
+def test_run_auction_exception_not_marked_fired_and_retryable():
+    """run_auction 抛异常 → 不标 fired（异常由 run() 顶层吞；dispatch 直调则上抛）→ <9:30 decide 仍返回 RUN_AUCTION。"""
+    import pytest
+
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 16))
+
+    class _BoomEngine(_FakeEngine):
+        def run_auction(self):
+            raise RuntimeError("auction entry boom")
+
+    eng = _BoomEngine(); guard = _FakeGuard(); stack = _FakeStack()
+    s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal())
+    s._mark(TRADING_DAY, Action.PREWARM)                 # 前置：已 prewarm
+    with pytest.raises(RuntimeError):
+        s.dispatch(Action.RUN_AUCTION, TRADING_DAY)      # 异常上抛（run() 顶层会吞，这里直接断言）
+    assert Action.RUN_AUCTION not in s._fired.get(TRADING_DAY, set())   # 未定稿
+    assert s.decide(clock.now_utc()) == Action.RUN_AUCTION              # 9:16 仍在窗内，可重试
+
+
+def test_run_auction_recovers_after_transient_exception():
+    """首轮 run_auction 异常→run() 吞掉不定稿，下一轮 decide 仍 RUN_AUCTION→重试成功才定稿（整段可恢复）。"""
+    clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 16))
+
+    class _FlakyAuctionEngine(_FakeEngine):
+        def __init__(self):
+            super().__init__(); self.auction_attempts = 0
+        def run_auction(self):
+            self.auction_attempts += 1
+            if self.auction_attempts == 1:
+                raise RuntimeError("transient auction boom")
+            super().run_auction()
+
+    eng = _FlakyAuctionEngine(); guard = _FakeGuard(); stack = _FakeStack()
+    s = DailyScheduler(eng, guard, stack, clock, RecordingLogger(), calendar=_Cal())
+    s.run(sleep_fn=lambda _s: None, max_iters=3)         # iter1 PREWARM / iter2 异常 / iter3 重试成功
+    assert eng.auction_attempts == 2                     # 首轮异常后重试一次
+    assert Action.RUN_AUCTION in s._fired.get(TRADING_DAY, set())   # 成功才定稿
 
 
 def test_auction_sell_entry_runs_with_provider():

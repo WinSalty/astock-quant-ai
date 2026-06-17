@@ -24,7 +24,12 @@ from qmt_strategy.contracts.errors import TickSourceError
 from qmt_strategy.contracts.models import PlanRow, SelectedStockRow
 from qmt_strategy.contracts.xt_objects import FakeStockAccount, FakeXtAsset, FakeXtPosition
 from qmt_strategy.data_writer.repository import InMemoryQmtRepository
-from qmt_strategy.position.sell_book_builder import DQ_NO_PLAN, DQ_NO_TICK, build_order_book
+from qmt_strategy.position.sell_book_builder import (
+    DQ_CROSS_FRAME_ERR,
+    DQ_NO_PLAN,
+    DQ_NO_TICK,
+    build_order_book,
+)
 from qmt_strategy.watchlist.sources import CallableSelectedStockSource
 
 from conftest import utc_at_east8
@@ -87,6 +92,43 @@ def test_build_order_book_below_limit_up_not_sealed():
     ob = build_order_book(CODE, tick, _plan(limit_up="11.00"))
     assert ob.is_sealed is False
     assert ob.seal_amount == Decimal("0")
+
+
+# ===========================================================================
+# 评审 doc/19 C-3：跨帧字段接线扩展点（cross_frame_builder）。注：跨帧【数值保真】属 T1.2 真机依赖（已在
+# 待办登记跳过）；这里只验证离线可做的「接线框架」——不注入时保守默认、注入后生效、异常降级。
+# ===========================================================================
+def test_build_order_book_cross_frame_default_when_no_builder():
+    """C-3：不注入 cross_frame_builder（T0.1 现状）→ 六个跨帧字段全保守默认（False/0），无 CROSS_FRAME_ERR。"""
+    tick = {"lastPrice": "11.00", "lastClose": "10.00"}
+    ob = build_order_book(CODE, tick, _plan())
+    assert ob.broke_board is False and ob.below_support is False and ob.volume_surge is False
+    assert ob.near_close_weak is False and ob.price_volume_diverge is False and ob.open_times == 0
+    assert DQ_CROSS_FRAME_ERR not in ob.data_quality
+
+
+def test_build_order_book_cross_frame_builder_populates_fields():
+    """C-3：注入 cross_frame_builder → 原地填充跨帧字段（炸板/开板次数等），扩展点生效（T1.2 真机实现即可让四类硬扳机触发）。"""
+    def _builder(ts_code, tick, ob):
+        ob.broke_board = True
+        ob.open_times = 3
+
+    tick = {"lastPrice": "11.00", "lastClose": "10.00"}
+    ob = build_order_book(CODE, tick, _plan(), cross_frame_builder=_builder)
+    assert ob.broke_board is True and ob.open_times == 3
+    assert ob.last_price == Decimal("11.00")   # 单帧字段不受影响
+
+
+def test_build_order_book_cross_frame_builder_error_degrades():
+    """C-3：cross_frame_builder 抛错 → 该票跨帧字段保守默认 + 留 CROSS_FRAME_ERR，不拖垮整批构造。"""
+    def _boom(ts_code, tick, ob):
+        raise RuntimeError("cross frame calc boom")
+
+    tick = {"lastPrice": "11.00", "lastClose": "10.00"}
+    ob = build_order_book(CODE, tick, _plan(), cross_frame_builder=_boom)
+    assert ob.broke_board is False and ob.open_times == 0
+    assert DQ_CROSS_FRAME_ERR in ob.data_quality
+    assert ob.last_price == Decimal("11.00")   # 单帧字段仍正常派生
 
 
 # ===========================================================================
@@ -224,6 +266,20 @@ def test_wired_sell_pass_clears_weak_nonsealed(calendar):
     assert sold == [CODE]                    # 无续板先验 + 非封板 → 安全默认了结
     assert len(trader.order_calls) == 1
     assert trader.order_calls[0][0] == CODE  # 发出该票卖单
+
+
+def test_build_sell_books_uses_injected_cross_frame_builder(calendar):
+    """C-3 接线端到端：engine.set_sell_cross_frame_builder 注入后，build_sell_books 产出的盘口跨帧字段被填充
+    （证明 T1.2 真机计算器注入即生效，无需改 decider/下游）。"""
+    tick = {"lastPrice": "11.00", "lastClose": "10.00", "bidVol": [500000, 0, 0, 0, 0], "bidPrice": ["11.00", 0, 0, 0, 0]}
+    eng = _engine(_PosTrader([_held_position()]), FakeTickSource(fixed={CODE: tick}), calendar)
+    eng.prewarm(T_BUY)
+    eng._plan_map = {CODE: _plan()}
+    # 默认（未注入）：跨帧字段保守默认。
+    assert eng.build_sell_books(T_BUY)[CODE].broke_board is False
+    # 注入计算器（模拟 T1.2 真机帧历史 builder）：填充炸板字段。
+    eng.set_sell_cross_frame_builder(lambda ts_code, t, ob: setattr(ob, "broke_board", True))
+    assert eng.build_sell_books(T_BUY)[CODE].broke_board is True
 
 
 # ===========================================================================

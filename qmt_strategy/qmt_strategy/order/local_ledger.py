@@ -136,11 +136,25 @@ class InMemoryLocalLedger:
         部成收口（§4.7/§4.9 硬口径）：部成单撤单后 QMT 该委托终态报 CANCELLED，但若本地已有
         成交（filled_volume>0），终态应落 PART_TRADED 而非 CANCELLED——已成部分是真实建仓，
         未成部分计买不进。仅完全未成（filled_volume==0）才落 CANCELLED。对 REJECTED 同理收口。
+
+        不回退已成交态守卫（评审 doc/19 H-1）：on_stock_trade（成交，驱动 add_fill 置 TRADED）与
+        on_stock_order（委托态，驱动本方法）是 QMT 两路异步回调，可能乱序——成交回报先到把单置 TRADED 后，
+        迟到的 on_stock_order(部成/已报) 再到。成交是比委托态更强的事实（全成=plan_volume 已全部成交，
+        add_fill 行 196 亦有「!=TRADED 才推进」的同口径守卫），故一旦 TRADED，本方法不再据委托态降级：
+        否则已全成单被降级为 PART_TRADED/REPORTED → on_ttl_expired 误判在途 → 对已全成委托反复发撤单
+        （券商无活动委托、无 CANCELLED 回报 → 每宽限期重撤至收盘）+ 收盘对账台账态非 TRADED 污染勾稽。
+        边界：OrderState 无序数，无法靠枚举大小拦截降级，必须显式守卫；error_msg 仍按需记录（不改状态）。
         """
         biz = self._resolve_biz(order_id)
         if biz is None:
             return
         e = self._by_biz[biz]
+        # 已 TRADED（全成事实已确认）→ 任何迟到的委托态回报都不降级，仅按需记 error_msg（H-1）。
+        # 注：不用 OrderState.terminal() 作判据——它含 PART_TRADED，会放行「迟到部成降级已成单」，等于没修。
+        if e.state == OrderState.TRADED:
+            if msg is not None:
+                e.error_msg = msg
+            return
         # fill-aware：撤单/废单终态遇已有成交 → 收口为 PART_TRADED（不抹掉真实建仓事实）。
         if state in (OrderState.CANCELLED, OrderState.REJECTED) and e.filled_volume > 0:
             e.state = OrderState.PART_TRADED
@@ -213,6 +227,14 @@ class InMemoryLocalLedger:
         """
         e = self._by_biz.get(biz_order_no)
         if e is None:
+            return
+        # 不回退已成交态守卫（评审 doc/19 H-1 对称漏洞，与 sync_status / add_fill 同口径）：启动重建若崩溃
+        # 窗口 local_order_fill 明细未全量落盘，按明细重算出的 total_vol 可能 < plan_volume；此时绝不能把已
+        # TRADED 的整行快照降级为 PART_TRADED（否则 on_ttl_expired 误判在途→对已全成单反复发撤单 + 收盘对账态
+        # 污染，正是 H-1 的下游危害）。已 TRADED 单的 filled_volume/counted 快照已是终态全成、与其明细同事务落盘
+        # （M-1 原子写），无需也不应据（可能不全的）明细重算下修；且 add_fill 对 TRADED 不再计入新成交，counted
+        # 无需重建。故已 TRADED 直接跳过重算、保留全成快照，使台账三处状态收口口径全对齐「已成不回退」。
+        if e.state == OrderState.TRADED:
             return
         total_vol = 0
         total_amt = Decimal("0")

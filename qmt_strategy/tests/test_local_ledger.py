@@ -128,6 +128,88 @@ def test_sync_status_cancel_without_fill_is_cancelled():
     assert led.get_by_order_id(12).state == OrderState.CANCELLED
 
 
+# ---------------------------------------------------------------------------
+# 评审 doc/19 H-1：成交先到置 TRADED 后，迟到的 on_stock_order 委托态不得降级已成单
+# ---------------------------------------------------------------------------
+def test_sync_status_no_downgrade_from_traded_by_reported():
+    """乱序：add_fill 全成置 TRADED 后，迟到 on_stock_order(REPORTED) 不降级（H-1）。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 21
+    led.insert(e)
+    led.add_fill(21, "f1", 1000, Decimal("11.00"))   # 成交回报先到 → TRADED
+    assert led.get_by_order_id(21).state == OrderState.TRADED
+    led.sync_status(21, OrderState.REPORTED)          # 迟到委托态(已报)
+    assert led.get_by_order_id(21).state == OrderState.TRADED  # 不被降级
+
+
+def test_sync_status_no_downgrade_from_traded_by_part_traded():
+    """乱序：全成 TRADED 后，迟到 on_stock_order(部成) 不降级（H-1 关键：PART_TRADED 属 terminal() 仍须拦）。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 22
+    led.insert(e)
+    led.add_fill(22, "f1", 1000, Decimal("11.00"))   # → TRADED
+    led.sync_status(22, OrderState.PART_TRADED)       # 迟到部成回报
+    got = led.get_by_order_id(22)
+    assert got.state == OrderState.TRADED             # 仍 TRADED，绝不退回 PART_TRADED
+    assert got.filled_volume == 1000
+
+
+def test_sync_status_traded_records_msg_without_state_change():
+    """已 TRADED 时 sync_status 仍可记 error_msg，但不改状态（H-1 边界）。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=500)
+    e.order_id = 23
+    led.insert(e)
+    led.add_fill(23, "f1", 500, Decimal("11.00"))     # → TRADED
+    led.sync_status(23, OrderState.REPORTED, msg="late order report")
+    got = led.get_by_order_id(23)
+    assert got.state == OrderState.TRADED
+    assert got.error_msg == "late order report"
+
+
+def test_sync_status_part_traded_still_advances_before_traded():
+    """未达 TRADED 时委托态正常推进（不被 H-1 守卫误拦）：部成单可被后续委托态更新。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 24
+    led.insert(e)
+    led.add_fill(24, "f1", 600, Decimal("11.00"))     # 部成 → PART_TRADED（非 TRADED）
+    led.sync_status(24, OrderState.REPORTED)           # 仍可被委托态更新
+    assert led.get_by_order_id(24).state == OrderState.REPORTED
+
+
+def test_reconcile_fills_traded_not_downgraded_by_partial_details():
+    """评审 doc/19 H-1 对称漏洞：已 TRADED 单在启动重建按(崩溃窗口不全的)明细重算时不被降级为 PART_TRADED。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 31
+    led.insert(e)
+    led.add_fill(31, "f1", 1000, Decimal("11.00"))   # → TRADED（全成）
+    assert led.get_by_order_id(31).state == OrderState.TRADED
+    # 模拟崩溃窗口 local_order_fill 明细未全量落盘：只重算出 600（< plan 1000）。
+    led.reconcile_fills_from_detail(e.biz_order_no, [("f1", 600, Decimal("11.00"))])
+    got = led.get(e.biz_order_no)
+    assert got.state == OrderState.TRADED            # 不被降级（守卫生效）
+    assert got.filled_volume == 1000                  # 保留全成快照，不被(不全的)明细下修
+
+
+def test_reconcile_fills_still_upgrades_part_traded_to_traded():
+    """对照：未到 TRADED 的单仍按明细正常重算/收口（守卫只拦『已 TRADED 不回退』，不影响向上推进）。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000, state=OrderState.PART_TRADED)
+    e.order_id = 32
+    led.insert(e)
+    # 明细重算累计达计划量 → 收口 TRADED（验证守卫不误拦正常推进）。
+    led.reconcile_fills_from_detail(
+        e.biz_order_no, [("f1", 600, Decimal("11.00")), ("f2", 400, Decimal("11.00"))]
+    )
+    got = led.get(e.biz_order_no)
+    assert got.state == OrderState.TRADED
+    assert got.filled_volume == 1000
+
+
 def test_sync_status_by_order_id():
     led = InMemoryLocalLedger()
     e = _entry()

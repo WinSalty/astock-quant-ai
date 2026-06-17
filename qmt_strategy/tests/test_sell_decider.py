@@ -412,6 +412,47 @@ def test_auction_missing_book_holds(decider: SellDecider) -> None:
     assert "盘口缺失" in action.reason
 
 
+# ===========================================================================
+# 评审 doc/19 C-2：竞价段实时封板续持（decide_auction 读 is_sealed，修复误清正封涨停的弱先验隔夜票）
+# ===========================================================================
+def test_auction_sealed_weak_prior_holds_not_clears(decider: SellDecider) -> None:
+    """竞价正封涨停（is_sealed + 封流比强）+ 先验弱（continuation_prob 低）→ HOLD（不再误判弱开清仓）。"""
+    unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
+    prior = _prior(continuation_prob=Decimal("0.3"))   # 先验弱（< 0.6）
+    book = _book(open_pct=Decimal("0.10"), is_sealed=True, seal_to_float_ratio=Decimal("0.05"))
+    action = decider.decide_auction(unit, prior, book)
+    assert action.action is SellActionType.HOLD
+    assert action.reason == "竞价封板续持"
+
+
+def test_auction_sealed_no_prior_holds(decider: SellDecider) -> None:
+    """竞价封板（封流比强）+ 先验缺失（prior=None，原会兜底 CLEAR「弱开」）→ HOLD（实时封板一票续持）。"""
+    unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
+    book = _book(open_pct=Decimal("0.10"), is_sealed=True, seal_to_float_ratio=Decimal("0.05"))
+    action = decider.decide_auction(unit, None, book)
+    assert action.action is SellActionType.HOLD
+    assert action.reason == "竞价封板续持"
+
+
+def test_auction_not_sealed_weak_open_still_clears(decider: SellDecider) -> None:
+    """反向防过度保护：竞价未封板（is_sealed=False）+ 低开走弱 + 先验弱 → 仍 CLEAR「弱开」，不被新分支挡掉。"""
+    unit = _unit(mode=PositionMode.TECH_EXIT)
+    book = _book(open_pct=Decimal("-0.02"), is_sealed=False)
+    action = decider.decide_auction(unit, None, book)
+    assert action.action is SellActionType.CLEAR
+    assert action.reason == "弱开"
+
+
+def test_auction_sealed_but_weak_seal_strength_not_held(decider: SellDecider) -> None:
+    """竞价 is_sealed=True 但封流比未知（seal_to_float_ratio=None）+ 先验弱 → 封板质量不可信，不进续持分支，
+    落原弱开兜底 CLEAR（与 intraday『seal 不强不续持』一致，不过度保护弱质封板）。"""
+    unit = _unit(mode=PositionMode.TECH_EXIT)
+    book = _book(open_pct=Decimal("-0.01"), is_sealed=True, seal_to_float_ratio=None)
+    action = decider.decide_auction(unit, None, book)
+    assert action.action in (SellActionType.CLEAR, SellActionType.REDUCE)
+    assert action.reason == "弱开"
+
+
 def test_auction_flat_open_zero_still_exits(decider: SellDecider) -> None:
     # 平开 open_pct==0（<=0 真实弱开，非缺失：open_pct 非 None）→ 仍走 reduce_or_clear，不被误判为缺失。
     unit = _unit(mode=PositionMode.TECH_EXIT)

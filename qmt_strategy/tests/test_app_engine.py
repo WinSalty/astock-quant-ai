@@ -174,6 +174,23 @@ def _two_candidate_deps(env=None):
     return _deps(env, source_rows=rows)
 
 
+def test_strength_budget_fail_closed_when_position_query_fails():
+    """评审 doc/19 M-2（强度加权主路径）：配单票上限 + 盘中持仓查询失败 → _strength_budget_volume fail-closed 返 0
+    （与离线 _plan_volume 同口径，绝不把查询失败当无持仓而漏计隔夜持仓致跨日同票超单票上限）。"""
+    deps = _two_candidate_deps(
+        {"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_MAX_POSITION_PER_STOCK": "1000000"}
+    )
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)   # 正常 prewarm（trader 正常，日初权益/强度权重就绪）
+    # 盘中持仓查询抖动失败：实例方法被替换为抛异常（模拟 query_stock_positions 超时）。
+    def _boom(account):
+        raise RuntimeError("position query timeout")
+    deps.trader.query_stock_positions = _boom
+    v = eng._strength_budget_volume(eng._plan_map["600036.SH"], Decimal("10.50"))
+    assert v == 0        # 无法核验单票敞口 → fail-closed 拒单
+    assert "engine_sizer_per_stock_held_unknown_reject" in deps.logger.events()
+
+
 def test_strength_weighted_budget_allocation():
     """评审「按强度分」：两只候选，强度 90:30 → 预算/股数约 3:1，强的分得多。"""
     deps = _two_candidate_deps({"QMT_AUCTION_TIMING_ENABLED": "true"})

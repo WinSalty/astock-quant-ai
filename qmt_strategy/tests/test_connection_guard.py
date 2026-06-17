@@ -401,3 +401,96 @@ def test_reconnect_session_reuse_fails_closed():
     assert guard.ready is False
     assert backfill_calls["n"] == 0                       # 复用 session 绝不补采
     assert "reconnect_aborted_session_reuse" in logger.events()
+
+
+# ---------------------------------------------------------------------------
+# 9) 评审 doc/19 H-2：重连互斥（并发跳过 + 替换前停旧 trader）
+# ---------------------------------------------------------------------------
+import threading  # noqa: E402
+
+
+class _BlockingTrader(RecordingFakeTrader):
+    """可在 connect() 处阻塞（制造并发窗口）并记录 stop() 的 fake trader。"""
+
+    def __init__(self, *, in_connect=None, release=None, **kw):
+        super().__init__(**kw)
+        self._in_connect = in_connect      # connect 进入时 set（通知测试线程「A 已持锁并卡在 connect」）
+        self._release = release            # 等待该事件后才让 connect 返回
+        self.stopped = False
+
+    def connect(self) -> int:
+        if self._in_connect is not None:
+            self._in_connect.set()
+        if self._release is not None:
+            self._release.wait(timeout=5.0)
+        return super().connect()
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_concurrent_reconnect_skips_when_in_progress():
+    """H-2：一路重连进行中（持互斥锁、阻塞在 connect），另一路并发 reconnect 立即跳过返回 False，不再造 trader。"""
+    a_in_connect = threading.Event()
+    release_a = threading.Event()
+    factory_count = [0]
+    sids = iter(range(1000, 2000))
+
+    def session_id_provider():
+        return next(sids)
+
+    def trader_factory(session_id):
+        factory_count[0] += 1
+        first = factory_count[0] == 1
+        t = _BlockingTrader(in_connect=a_in_connect if first else None,
+                            release=release_a if first else None)
+        t.session_id = session_id
+        return t
+
+    logger = RecordingLogger()
+    guard = ConnectionGuard(
+        trader_factory=trader_factory, account=FakeStockAccount("acc1"), callback=object(),
+        clock=_clock(), logger=logger, session_id_provider=session_id_provider,
+    )
+    results = {}
+
+    def thread_a():
+        results["a"] = guard.reconnect()
+
+    ta = threading.Thread(target=thread_a)
+    ta.start()
+    assert a_in_connect.wait(timeout=5.0)                # A 已进入 connect（持互斥锁阻塞中）
+    rb = guard.reconnect()                                # B：并发重连 → 非阻塞抢锁失败 → 跳过
+    assert rb is False
+    assert factory_count[0] == 1                          # 只有 A 造了 trader，B 未并发再造（无句柄漂移/泄漏）
+    assert "reconnect_skip_in_progress" in logger.events()
+    release_a.set()                                       # 放行 A 完成
+    ta.join(timeout=5.0)
+    assert results["a"] is True                           # A 成功就绪
+    assert guard.ready is True
+
+
+def test_reconnect_stops_old_trader():
+    """H-2：重连换新 trader 前 best-effort 停掉旧 trader（回收其后台线程，防反复断线下泄漏）。"""
+    sids = iter([1001, 2002])
+    traders = []
+
+    def session_id_provider():
+        return next(sids)
+
+    def trader_factory(session_id):
+        t = _BlockingTrader()
+        t.session_id = session_id
+        traders.append(t)
+        return t
+
+    guard = ConnectionGuard(
+        trader_factory=trader_factory, account=FakeStockAccount("acc1"), callback=object(),
+        clock=_clock(), logger=RecordingLogger(), session_id_provider=session_id_provider,
+    )
+    assert guard.connect_and_subscribe() is True          # 建第一个 trader
+    old = traders[0]
+    assert guard.reconnect() is True                      # 重连建第二个，替换前停掉第一个
+    assert old.stopped is True                             # 旧 trader 被停（回收后台线程）
+    assert guard.current_trader is traders[1]
+    assert traders[1].stopped is False                    # 新 trader 不被停

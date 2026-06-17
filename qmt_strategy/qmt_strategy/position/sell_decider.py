@@ -126,6 +126,16 @@ class SellDecider:
         if self._is_book_missing(book):
             return self._hold(unit, reason="盘口缺失,安全默认不卖", phase="auction")
 
+        # —— 竞价封板续持（评审 doc/19 C-2）：实时已封涨停且封流比强 → 一票续持（最强实时盘口信号）——
+        # 业务意图：竞价一字 / 秒封涨停是最强的实时盘口信号；先验弱只代表「无延续预期」，不代表要在涨停高点
+        # 主动放弃一只仍在封板的强势仓（更不该以现价≈涨停价挂卖砸开自家封板）。与分时 decide_intraday 的
+        # 「秒板稳封→HOLD」(本文件 _is_seal_strong 同口径) 对齐，修复原 decide_auction 全程不读 is_sealed、
+        # 把正封涨停的隔夜【弱先验】票走兜底误判「弱开」清仓的缺陷。置于背离/弱开判定之前：实时封板一票否决。
+        # 边界：封流比未知/过低（_is_seal_strong=False，多因 plan 缺 float_mktcap）→ 封板质量不可信、不据此
+        # 续持，落到下方原有分支处理（与 intraday「seal 不强则不进续持分支」一致），不过度保护误持弱质封板。
+        if book.is_sealed and self._is_seal_strong(book):
+            return self._hold(unit, reason="竞价封板续持", phase="auction")
+
         # —— 扳机一：量价背离（盘口背离 或 命中 fail_conditions 背离类）→ 一票否决续持 ——
         # 业务意图：高开但量能虚高 / 骤缩，封板预期落空，即便先验强也转减 / 清（盘口一票否决，§5.3.1）。
         if book.price_volume_diverge or self._hit_fail(prior, _FAIL_KW_DIVERGE):

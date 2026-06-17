@@ -324,6 +324,42 @@ def test_limit_price_guard_rejects_deviation():
     assert ok is False and "偏离" in why
 
 
+def test_limit_price_guard_rejects_when_last_price_missing():
+    """评审 doc/19 复核必修2：偏离护栏已配但盘口现价缺失(last_price None) → fail-closed 拒发(不静默放行)。"""
+    from qmt_strategy.contracts.enums import AuctionPhase, EntryAction, OrderPhase
+    from qmt_strategy.contracts.models import AuctionSnapshot, EntryDecision, PlanRow
+
+    eng, _ = _engine(_CfgTrader(), env={"QMT_PRICE_DEVIATION_GUARD_PCT": "0.05"})
+    plan = PlanRow(ts_code="600000.SH", signal_trade_date=T_SIGNAL, target_trade_date=T_BUY,
+                   limit_up_price=Decimal("11.00"))
+    snap = AuctionSnapshot(ts_code="600000.SH", phase=AuctionPhase.AUCTION_CANCELABLE,
+                           ts=utc_at_east8(T_BUY, 9, 16), last_price=None)   # 盘口现价缺失
+    dec = EntryDecision(ts_code="600000.SH", signal_trade_date=T_SIGNAL, target_trade_date=T_BUY,
+                        strategy_family="打板", setup="连板", action=EntryAction.CHASE_LIMIT_UP,
+                        decided_at=utc_at_east8(T_BUY, 9, 16), reason="t",
+                        limit_price=Decimal("10.50"), order_phase=OrderPhase.OPENING)
+    ok, why = eng._limit_price_sane(dec, plan, snap)
+    assert ok is False and "盘口现价缺失" in why
+
+
+def test_limit_price_guard_unset_does_not_reject_on_missing_price():
+    """对照：未配偏离护栏(guard None)时盘口现价缺失不拦截（偏离闸本就不工作；仅 H-3 后必配场景才 fail-closed）。"""
+    from qmt_strategy.contracts.enums import AuctionPhase, EntryAction, OrderPhase
+    from qmt_strategy.contracts.models import AuctionSnapshot, EntryDecision, PlanRow
+
+    eng, _ = _engine(_CfgTrader())   # 不配 guard
+    plan = PlanRow(ts_code="600000.SH", signal_trade_date=T_SIGNAL, target_trade_date=T_BUY,
+                   limit_up_price=Decimal("11.00"))
+    snap = AuctionSnapshot(ts_code="600000.SH", phase=AuctionPhase.AUCTION_CANCELABLE,
+                           ts=utc_at_east8(T_BUY, 9, 16), last_price=None)
+    dec = EntryDecision(ts_code="600000.SH", signal_trade_date=T_SIGNAL, target_trade_date=T_BUY,
+                        strategy_family="打板", setup="连板", action=EntryAction.CHASE_LIMIT_UP,
+                        decided_at=utc_at_east8(T_BUY, 9, 16), reason="t",
+                        limit_price=Decimal("10.50"), order_phase=OrderPhase.OPENING)
+    ok, why = eng._limit_price_sane(dec, plan, snap)
+    assert ok is True   # guard 未配 → 偏离闸不工作，缺现价不拦（限价非正/超涨停价两道仍在）
+
+
 def test_open_blocked_when_drawdown_unknown():
     """#70：有日初基线但当前资产查询失败 → 禁开新仓（fail-closed，不再放行）。"""
     class _FlakyTrader(_CfgTrader):

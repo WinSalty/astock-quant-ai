@@ -165,14 +165,20 @@ class DailyScheduler:
             return
         if action == Action.PREWARM:
             # 连接就绪为盘前重建前置（评审三轮 EXEC-sched-10）：检查 connect_and_subscribe 返回值，
-            # 连接失败时窗口内不把 PREWARM 标 final fired（允许下轮重连重做），并强告警。
+            # 连接失败时不把 PREWARM 标 final fired（允许下轮重连重做），并强告警。
             connected = True
             if self._guard is not None:
-                connected = bool(self._guard.connect_and_subscribe())
+                # 已就绪则不重建（评审 doc/19 H-2）：避免 PREWARM 每个 poll 周期都强制 connect_and_subscribe
+                # 重建 trader、与 on_disconnected/supervise 的重连争用、把刚连好的通道反复推倒重建。仅未就绪才建连；
+                # 此前 reconnect/supervise 已把连接带到就绪时，本轮直接视为已连（connected=True），随后定稿。
+                if getattr(self._guard, "ready", False):
+                    connected = True
+                else:
+                    connected = bool(self._guard.connect_and_subscribe())
                 if not connected:
                     self._logger.warn(
                         "scheduler_prewarm_conn_not_ready_will_retry", trade_date=str(today),
-                        note="连接未就绪：基于未就绪 trader 的 query_* 重建/抓基线可能失败，窗口内不定稿，下轮重连重做",
+                        note="连接未就绪：基于未就绪 trader 的 query_* 重建/抓基线可能失败，不定稿，下轮重连重做",
                     )
             # 先盘前拉取当日 watchlist 落本机 SQLite（失败不抛、降级无名单，详见 WatchlistPrefetcher），
             # 再让 engine.prewarm 从本机库装载——保证 prewarm 读到的是当日最新名单。
@@ -187,16 +193,20 @@ class DailyScheduler:
                         "scheduler_watchlist_prefetch_error", trade_date=str(today), error=repr(exc)
                     )
             self._engine.prewarm(today)
-            # PREWARM 重试（评审二轮 P2#48 + 三轮 EXEC-sched-10 + F11 修正）：原实现对「watchlist 拉到 0 行」一律
-            # 重试，但 prefetch 把【真失败】与【合法空名单(空仓日/报告未就绪)】都返回 0 → 空仓日每个 poll 周期反复
-            # 重连+重抓基线打满频控、永不定稿。F11 后 prefetch 返回 -1=真失败 / 0=合法空 / >0=成功；这里只在
-            #【真失败(saved<0) 或 连接未就绪】且仍在开窗前(< 竞价 9:15) 时重试——合法空名单(saved==0)直接定稿不重试。
-            # clock 缺失（部分离线/单测注入 None）→ 不做时间窗判断，直接标 fired（向后兼容，不重试）。
+            # PREWARM 重试与定稿（评审二轮 P2#48 + 三轮 EXEC-sched-10 + F11 + 评审 doc/19 H-4）：
+            # - watchlist【真失败(saved<0)】：仅在开窗前(< 竞价 9:15)重试拉新名单；过 9:15 不再为名单延迟、用本机库
+            #   已有名单定稿。合法空名单(saved==0，空仓日/报告未就绪)不重试、直接定稿，避免空仓日反复重连打满频控。
+            #   （F11 口径：prefetch 返回 -1=真失败 / 0=合法空 / >0=成功。）
+            # - 连接未就绪(not connected)：【不论时间，持续重试到连上或收盘，不定稿】。H-4 修复要点——原实现过 9:15
+            #   一律强制定稿(`before_auction and ...`)，会把「基于未就绪 trader 重建持仓/抓日初权益基线」的残缺态
+            #   定死且当日永不重做(调度层不可恢复单点)。改为连接恢复前绝不定稿：一旦 reconnect/本分支建连成功，
+            #   engine.prewarm 重跑会把持仓重建/权益基线补齐(prewarm 幂等、_capture_day_open_equity 查询失败不缓存
+            #   坏基线、下轮自愈)。decide() 仅在 < 收盘 才返回 PREWARM，故未连上时重试天然以收盘为界、不会无限。
+            # clock 缺失（部分离线/单测注入 None）→ 不做时间窗判断（watchlist 不重试），但仍遵守「连接未就绪不定稿」。
             now_t = east8_time_of(self._clock.now_utc()) if self._clock is not None else None
             before_auction = now_t is not None and now_t < _AUCTION_START
-            should_retry = before_auction and (
-                (self._watchlist_prefetch is not None and saved < 0) or (not connected)
-            )
+            watchlist_hard_fail = self._watchlist_prefetch is not None and saved < 0
+            should_retry = (not connected) or (before_auction and watchlist_hard_fail)
             if not should_retry:
                 self._mark(today, Action.PREWARM)
                 self._logger.info(
@@ -205,17 +215,23 @@ class DailyScheduler:
             else:
                 self._logger.warn(
                     "scheduler_prewarm_will_retry", trade_date=str(today), saved=saved, connected=connected,
-                    note="watchlist 拉到 0 行 或 连接未就绪，且未到 9:15，下轮重试",
+                    note="连接未就绪(持续重试至连上/收盘) 或 (未到9:15且watchlist真失败)，下轮重试",
                 )
         elif action == Action.RUN_AUCTION:
-            self._mark(today, Action.RUN_AUCTION)  # 先登记再跑（run_auction 阻塞至 09:30，避免重入）
             self._logger.info("scheduler_run_auction", trade_date=str(today))
             # 竞价段卖出评估入口（评审三轮 EXEC-sched-05）：可卖日 9:15–9:25 集合竞价定夺卖出，原调度从无
             # session='auction' 调 run_sell_pass 的入口、decide_auction 整条卖出分支是死代码。这里在买入侧
             # run_auction（阻塞至 9:30）之前先跑一次竞价卖出评估（需实时盘口源 sell_books_provider，缺省跳过）。
             # 注：竞价段行情健康由买入侧 AuctionPoller 自管，故此处不改 _market_feed_ok（conservative=False）。
             self._run_sell_with_feed_health(today, session="auction", manage_feed=False)
-            self._engine.run_auction()
+            self._engine.run_auction()  # 阻塞至 09:30（AuctionPoller 内单轮异常不放弃整段）
+            # 成功跑完才登记 fired（评审 doc/19 H-4）：原实现「先 _mark 再跑」在 run_auction 入口/早期抛异常
+            # （被 run() 顶层 try/except 吞）时，当日竞价已被定稿、整段放弃且不重试，与 AuctionPoller 内「单轮
+            # 异常不放弃整段」的健壮性自相矛盾。改为成功返回才标记：异常则不标 → 下轮(仍 <9:30)decide 重新返回
+            # RUN_AUCTION 重试，竞价相位可恢复。run_auction 阻塞期间调度线程在其内部、loop 无法重入；正常返回
+            # (≈9:30)后标记，过 9:30 decide 不再返回本相位（自然以竞价窗口为界，不会无限重试）。
+            self._mark(today, Action.RUN_AUCTION)
+            self._logger.info("scheduler_run_auction_done", trade_date=str(today))
         elif action == Action.INTRADAY:
             # 存储健康周期体检（评审二轮 P0#2）：写线程静默死亡且当轮无 submit 触发 on_failure 时的兜底发现，
             # 不健康即 engine fail-closed 停开新仓。置于盘中动作首位，使后续 sweep/卖出在已知状态下进行。

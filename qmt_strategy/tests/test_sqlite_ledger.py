@@ -339,3 +339,107 @@ def test_purge_before_removes_expired_rows(db_path, write_queue):
         conn.close()
     assert "keep" in ledger_bizes and "expire" not in ledger_bizes
     assert "keep" in fill_bizes and "expire" not in fill_bizes   # 明细随台账一并清理
+
+
+# ===========================================================================
+# 评审 doc/19 M-1：持久化原子性（add_fill 镜像+明细 / purge 双删合并同一事务）
+# ===========================================================================
+def _spy_submit(write_queue):
+    """把 write_queue.submit 包成计数器：返回记录列表，原 submit 行为不变。"""
+    calls = []
+    orig = write_queue.submit
+
+    def _patched(task):
+        calls.append(task)
+        return orig(task)
+
+    write_queue.submit = _patched  # type: ignore[assignment]
+    return calls
+
+
+def test_add_fill_submits_single_atomic_task(db_path, write_queue):
+    """M-1：add_fill 把「整行镜像 + 成交明细 INSERT」合并为【单个】写任务（同事务原子），非两次独立 submit。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="b1", order_id=1, plan_volume=1000, state=OrderState.SUBMITTED))
+    calls = _spy_submit(write_queue)
+    led.add_fill(1, "t1", 500, Decimal("11.00"))
+    assert len(calls) == 1   # 镜像 + 明细在同一任务/事务里，绝非两次入队（原实现是 2 次）
+
+
+def test_add_fill_dedup_only_mirrors_no_detail_task(db_path, write_queue):
+    """M-1：去重命中（同 traded_id 重投）时无新明细 → 仅一个镜像任务，仍是单次 submit。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="b1", order_id=1, plan_volume=1000, state=OrderState.SUBMITTED))
+    led.add_fill(1, "t1", 500, Decimal("11.00"))
+    assert write_queue.flush(2.0)
+    calls = _spy_submit(write_queue)
+    led.add_fill(1, "t1", 500, Decimal("11.00"))   # 同 traded_id 重投 → 去重、无新明细
+    assert len(calls) == 1
+
+
+def test_add_fill_atomic_rollback_keeps_snapshot_consistent(tmp_path):
+    """M-1 核心：合并任务里成交明细 INSERT 失败 → 整行镜像一并回滚（同事务），
+    快照绝不被推进到「领先于明细」的错态（这正是原非原子实现会把正确快照纠成偏小值的根因）。"""
+    # 建库但故意 DROP local_order_fill：add_fill 的明细 INSERT 必失败 → 触发整任务回滚。
+    p = str(tmp_path / "q.db")
+    conn = sqlite3.connect(p)
+    try:
+        init_db(conn)
+        conn.execute("DROP TABLE local_order_fill")
+        conn.commit()
+    finally:
+        conn.close()
+    wq = AsyncWriteQueue(lambda: sqlite3.connect(p), RecordingLogger())
+    wq.start()
+    try:
+        led = PersistentLocalLedger(p, wq, RecordingLogger())
+        led.insert(_entry(biz="b1", order_id=1, plan_volume=1000, state=OrderState.SUBMITTED))
+        assert wq.flush(2.0)                        # SUBMITTED 行已持久（filled=0）
+        led.add_fill(1, "t1", 500, Decimal("11.00"))  # 合并任务：明细 INSERT 必失败 → 整任务回滚
+        assert wq.flush(2.0)
+        rconn = sqlite3.connect(p)
+        try:
+            row = rconn.execute(
+                "SELECT filled_volume FROM local_order_ledger WHERE biz_order_no='b1'"
+            ).fetchone()
+        finally:
+            rconn.close()
+        # 镜像随明细一并回滚：盘上 filled_volume 仍为 0（未被推进到 500），快照与（缺失的）明细自洽。
+        assert row[0] == 0
+    finally:
+        wq.stop()
+
+
+def test_purge_submits_single_atomic_task(db_path, write_queue):
+    """M-1：purge_before 把删明细 + 删台账行合并为【单个】写任务（同事务），非两次独立 submit。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="old", order_id=11, target_trade_date=date(2026, 5, 1),
+                      state=OrderState.SUBMITTED))
+    assert write_queue.flush(2.0)
+    calls = _spy_submit(write_queue)
+    led.purge_before(date(2026, 6, 1))
+    assert len(calls) == 1   # 双 DELETE 合并为一个任务，绝不留「删一半」的孤儿
+
+
+def test_load_from_db_window_skips_orphan_fills(db_path, write_queue):
+    """M-1：窗口装载只读窗口内台账行对应的明细——孤儿明细（无对应台账行）不被读回、不生成幻影条目。"""
+    led = _new_ledger(db_path, write_queue)
+    led.insert(_entry(biz="recent", order_id=1, target_trade_date=date(2026, 6, 15),
+                      state=OrderState.SUBMITTED))
+    led.add_fill(1, "t1", 500, Decimal("11.00"))
+    assert led.flush_pending(2.0)
+    # 直接插入一条孤儿明细：对应 biz 无台账行（模拟历史非原子 purge 残留的孤儿）。
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO local_order_fill(biz_order_no, order_id, traded_id, traded_volume, traded_price) "
+            "VALUES ('orphan', 999, 'o1', 300, '9.99')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    led2 = _new_ledger(db_path, write_queue)
+    led2.load_from_db(today=date(2026, 6, 16), keep_days=7)
+    assert led2.get("recent") is not None and led2.get("recent").filled_volume == 500
+    assert led2.get("orphan") is None                       # 孤儿明细不生成幻影台账条目
+    assert {e.biz_order_no for e in led2.all()} == {"recent"}

@@ -82,10 +82,20 @@ class PersistentLocalLedger:
                 ).fetchall()
             else:
                 ledger_rows = conn.execute("SELECT * FROM local_order_ledger").fetchall()
-            # 成交明细：一次性读回（明细表受 purge_before 约束、规模有界），在内存里按 biz 聚合。
-            fill_rows = conn.execute(
-                "SELECT biz_order_no, traded_id, traded_volume, traded_price FROM local_order_fill"
-            ).fetchall()
+            # 成交明细（评审 doc/19 M-1）：窗口装载时只读「台账行在窗口内」的明细——既与下方 reconcile 只对
+            # 在窗口台账行生效的口径一致，又作为防御：万一历史上残留过孤儿明细（台账行已删、明细未删），
+            # 也不会被每次启动全表读回内存而无界增长。全量装载（cutoff 为 None，向后兼容旧调用/单测）时仍读全表。
+            if cutoff_iso is not None:
+                fill_rows = conn.execute(
+                    "SELECT biz_order_no, traded_id, traded_volume, traded_price FROM local_order_fill "
+                    "WHERE biz_order_no IN "
+                    "(SELECT biz_order_no FROM local_order_ledger WHERE target_trade_date >= ?)",
+                    (cutoff_iso,),
+                ).fetchall()
+            else:
+                fill_rows = conn.execute(
+                    "SELECT biz_order_no, traded_id, traded_volume, traded_price FROM local_order_fill"
+                ).fetchall()
         finally:
             conn.close()
         # 明细按 biz 聚合为 {biz: [(dedup_key, vol, price), ...]}。
@@ -118,20 +128,22 @@ class PersistentLocalLedger:
         内存由下次重启 load_from_db 的窗口装载自然收敛。
         """
         cutoff_iso = cutoff.isoformat()
-        # 第 1 步：删将被清理台账行对应的成交明细（子查询定位 biz）。
-        self._wq.submit(
-            lambda conn: conn.execute(
+        # 原子清理（评审 doc/19 M-1）：把「删明细」与「删台账行」合并为【同一个写任务】，写线程同事务一次 commit——
+        # 杜绝原实现两次独立 submit 的非原子半成：若「删台账成功、删明细失败（或反序）」会留下孤儿明细，
+        # 而删明细的子查询 SELECT biz FROM ledger 此后再也定位不到这些孤儿（台账行已没），加之 load_from_db
+        # 读回明细 → 孤儿随运行无界增长。合并后两条 DELETE 同成同败，绝不留孤儿。
+        def _atomic_purge(conn):
+            # 先删将被清理台账行对应的成交明细（子查询定位 biz，须在台账行删除前执行），再删过期台账行本身。
+            conn.execute(
                 "DELETE FROM local_order_fill WHERE biz_order_no IN "
                 "(SELECT biz_order_no FROM local_order_ledger WHERE target_trade_date < ?)",
                 (cutoff_iso,),
             )
-        )
-        # 第 2 步：删过期台账行本身。
-        self._wq.submit(
-            lambda conn: conn.execute(
+            conn.execute(
                 "DELETE FROM local_order_ledger WHERE target_trade_date < ?", (cutoff_iso,)
             )
-        )
+
+        self._wq.submit(_atomic_purge)
         self._logger.info("ledger_purge_before", cutoff=cutoff_iso, db=self._db_path)
 
     # ------------------------------------------------------------------
@@ -244,16 +256,33 @@ class PersistentLocalLedger:
         """
         with self._lock:
             recorded = self._mem.add_fill(order_id, traded_id, traded_volume, traded_price)
-            self._mirror(self._mem.get_by_order_id(order_id))
-            if recorded is not None:
-                biz, dedup_key, vol, price = recorded
-                price_text = str(price) if price is not None else None
-                # INSERT OR IGNORE：同 (biz, dedup_key) 重投天然幂等；闭包捕获本次参数，写线程内执行。
-                self._wq.submit(
-                    lambda conn: conn.execute(
-                        "INSERT OR IGNORE INTO local_order_fill"
-                        "(biz_order_no, order_id, traded_id, traded_volume, traded_price) "
-                        "VALUES (?,?,?,?,?)",
-                        (biz, order_id, dedup_key, vol, price_text),
-                    )
+            entry = self._mem.get_by_order_id(order_id)
+            if entry is None:
+                # 未知单（手工单/非本系统单）：内存已忽略，无需落盘（与 _mirror 对 None 跳过同口径）。
+                return
+            # 原子镜像（评审 doc/19 M-1）：把「整行台账 replace（含累计 filled_volume）」与「成交明细 INSERT」
+            # 合并为【同一个写任务】，由写线程在同一事务内 conn.commit（write_queue 每任务一次 commit）——杜绝
+            # 原实现两次独立 submit 的非原子半成：若「整行镜像成功、明细 INSERT 丢失（队列溢出/写异常被吞）」，
+            # 重启 load_from_db 以明细为权威重算会把【正确的快照 filled_volume 反向纠成偏小值】（漏卖/对账不平）。
+            # 合并后一旦丢失即两者一起丢（快照回退到上一笔、明细也无本笔）→ 重启重算后二者自洽，不再被纠错。
+            row = mappers.ledger_to_row(entry)
+            params = [row[c] for c in self._replace_cols]
+            replace_sql = self._replace_sql
+            if recorded is None:
+                # 去重/忽略（同 traded_id 重投等）：无新明细，仅整行镜像去重后的权威态（与 _mirror 等价）。
+                self._wq.submit(lambda conn: conn.execute(replace_sql, params))
+                return
+            biz, dedup_key, vol, price = recorded
+            price_text = str(price) if price is not None else None
+
+            def _atomic_fill(conn):
+                # 同一事务：先整行 replace 最新累计态，再 append-only 写本笔明细（INSERT OR IGNORE 幂等）。
+                conn.execute(replace_sql, params)
+                conn.execute(
+                    "INSERT OR IGNORE INTO local_order_fill"
+                    "(biz_order_no, order_id, traded_id, traded_volume, traded_price) "
+                    "VALUES (?,?,?,?,?)",
+                    (biz, order_id, dedup_key, vol, price_text),
                 )
+
+            self._wq.submit(_atomic_fill)

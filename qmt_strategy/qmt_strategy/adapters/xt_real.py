@@ -65,6 +65,12 @@ class RealXtTrader:
     def run_forever(self) -> None:
         self._t.run_forever()
 
+    def stop(self) -> None:
+        # 停掉 trader 及其后台线程（评审 doc/19 H-2）：ConnectionGuard 重连换新 trader 前调本方法回收旧实例，
+        # 防反复断线下后台线程/句柄泄漏。TODO(实测)：核对目标机 xtquant 版本 XtQuantTrader.stop() 的真实语义
+        # （是否幂等、对已断线实例是否安全）；ConnectionGuard._stop_trader_quietly 已对异常做 best-effort 吞错。
+        self._t.stop()
+
     def order_stock(
         self, account: Any, stock_code: str, order_type: int, order_volume: int,
         price_type: int, price: float, strategy_name: str = "", order_remark: str = "",

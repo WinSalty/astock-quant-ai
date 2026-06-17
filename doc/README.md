@@ -84,7 +84,7 @@
 | 部分 | 状态 |
 |---|---|
 | 执行引擎（连接/竞价/建仓/持仓/风控/回流/对账） | ✅ 已落地；**2026-06 正式评审发现并修复多处致命断裂**（路由全 SKIP 不开仓 / 持仓不回写不卖出 / 买入绕过风控 / go-no-go 闸门缺失等），见 [评审与修复状态概要](评审与修复状态概要.md) |
-| 盘中卖出（止损/炸板/破位/连板了结/T+1 常规卖出） | 🟡 **接线代码已落地（2026-06 阶段0-C）+ 生产门控默认关**：`sell_book_builder` + `Engine.build_sell_books`（实时盘口→`OrderBook`）+ `prior_provider` 续板先验 + `DailyScheduler` 注入均已落地并有 fake 单测；但**生产卖出由 `QMT_SELL_PASS_LIVE` 默认关门控**（=provider=None、盘中不自动卖，回退接线前安全行为）——最小版破位/炸板跨帧字段未保真、不在今日 watchlist 的真封板隔夜票会被误判误清（B1）。**待阶段1 T1.2 跨帧保真 + 隔夜持仓补数 + 真机实测后才开 `QMT_SELL_PASS_LIVE`**（开时强制配单票浮亏止损）。详见 [待办 §0/§A](待办与上线验证清单.md)、[状态概要](评审与修复状态概要.md)、[开发计划 doc/16](16-卖出链接线与上线前代码缺口开发计划.md) |
+| 盘中卖出（止损/炸板/破位/连板了结/T+1 常规卖出） | 🟡 **接线代码已落地（2026-06 阶段0-C）+ 生产门控默认关**：`sell_book_builder` + `Engine.build_sell_books`（实时盘口→`OrderBook`）+ `prior_provider` 续板先验 + `DailyScheduler` 注入均已落地并有 fake 单测；**评审 doc/19 已补 C-2（`decide_auction` 竞价段读 `is_sealed`、正封涨停弱先验票不再被误判弱开清仓）+ C-3（`build_order_book` 跨帧字段 `cross_frame_builder` 接线扩展点 + `set_sell_cross_frame_builder` 注入点）**。但**生产卖出仍由 `QMT_SELL_PASS_LIVE` 默认关门控**（=provider=None、盘中不自动卖，回退接线前安全行为）——剩余=跨帧字段**数值保真**未做、不在今日 watchlist 的真封板隔夜票仍会被误判（B1）。**待阶段1 T1.2 跨帧数值保真 + 隔夜持仓补数 + 真机实测后才开 `QMT_SELL_PASS_LIVE`**（开时强制配单票浮亏止损）。详见 [待办 §0/§A](待办与上线验证清单.md)、[状态概要](评审与修复状态概要.md)、[开发计划 doc/16](16-卖出链接线与上线前代码缺口开发计划.md)、[修复台账 doc/20](20-预上线致命问题修复台账.md) |
 | 执行侧本地化（单进程+SQLite 异步持久化） | ✅ 已落地；评审修复发单前同步落盘等幂等缺口（见状态概要） |
 | 调度器 + xtquant 适配器模板 + 真实入口骨架 | ✅ 已落地（待目标机填 `TODO(实测)`）；交易日历已改 fail-closed（部署须知见 [待办 §B](待办与上线验证清单.md)） |
 | 信号侧 HTTP 双接口 + `qmt_*` 表/迁移 + 客户端 | ✅ 已落地；评审补回流信封一致校验、watchlist 竞价两因子供数（见状态概要） |
@@ -119,7 +119,7 @@
 
 ### 8.1 执行侧 `qmt_strategy`（Windows，全部 `QMT_*`）
 
-唯一解析点：`qmt_strategy/config/settings.py` 的 `Settings.from_env(os.environ)`（`app/run.py` 启动时调用）——下表即权威清单，未列出的 `QMT_*` 不被消费。**装配期 `assert_safe_to_trade()` 会对安全门控做 fail-closed 校验**（见 8.1.F）。
+唯一解析点：`qmt_strategy/config/settings.py` 的 `Settings.from_env(os.environ)`（`app/run.py` 启动时调用）——下表即权威清单，未列出的 `QMT_*` 不被消费。**装配期 `assert_safe_to_trade()` 会对安全门控做 fail-closed 校验**（见 8.1.F：竞价择时未实测放行 / 卖出链开启未配单票浮亏止损；**评审 doc/19 H-3 新增**：账户回撤闸 `QMT_ACCOUNT_DRAWDOWN_LIMIT` + 限价偏离闸 `QMT_PRICE_DEVIATION_GUARD_PCT` 缺配即拒启，见 8.1.D）。
 
 **A. 账户与连接（敏感，必配才能真实交易）**
 
@@ -162,8 +162,8 @@
 | `QMT_PER_ORDER_MAX_AMOUNT` | 单笔金额上限 | 无 |
 | `QMT_MAX_POSITION_PER_STOCK` | 单票持仓金额上限 | 无 |
 | `QMT_MAX_TOTAL_EXPOSURE` | 绝对总敞口上限（与 ratio 取小） | 无 |
-| `QMT_PRICE_DEVIATION_GUARD_PCT` | 限价相对参考价偏离护栏 | 无 |
-| `QMT_ACCOUNT_DRAWDOWN_LIMIT` | 账户级当日回撤阈值（§5.4.1）；**配了即生效**：盘前日初权益基线抓取失败时 fail-closed 禁开新仓（不冻结卖出） | 无 |
+| `QMT_PRICE_DEVIATION_GUARD_PCT` | 限价相对参考价偏离护栏（限价偏离盘口现价超此比例即拒发；缺盘口现价时 fail-closed 拒发） | 无；**装配期 fail-closed 必配（评审 doc/19 H-3）**，缺配拒启动；显式关停配大值如 `0.99`（勿用 0=零容忍） |
+| `QMT_ACCOUNT_DRAWDOWN_LIMIT` | 账户级当日回撤阈值（§5.4.1）；配了即生效：盘前日初权益基线抓取失败时 fail-closed 禁开新仓（不冻结卖出） | 无；**装配期 fail-closed 必配（评审 doc/19 H-3）**，缺配拒启动；显式关停配大值如 `0.99`（勿用 0=任何亏损即熔断） |
 | `QMT_ACCOUNT_LOSS_LIMIT` | 账户级当日已实现亏损阈值 | 无；⚠️**当前未独立接线**——已由 `QMT_ACCOUNT_DRAWDOWN_LIMIT` 的 total_asset 回撤综合承载，单配本项不会独立触发熔断（启动期会强告警提示） |
 | `QMT_STOCK_FLOAT_LOSS_LIMIT` | 单票浮亏止损阈值（**比例**口径，如 `0.05`） | 无；**开 `QMT_SELL_PASS_LIVE` 时强制必配** |
 | `QMT_MARKET_STATE_BLOCK` | 禁开仓的 `market_state` 集合（逗号分隔） | `空仓,谨慎参与,退潮,冰点`（仅「参与」开新仓） |
@@ -264,6 +264,7 @@
 | 文档 | 内容 |
 |---|---|
 | [`16-卖出链接线与上线前代码缺口开发计划`](16-卖出链接线与上线前代码缺口开发计划.md) | 国金 QMT 对接专项核对确认的**代码层待落地任务**分阶段开发计划（阶段0 纯离线：卖出链最小接线 + `prior_provider` + fail-closed + 健壮性加固；阶段1 真机实测固化；阶段2 灰度上线）。承接 [`待办 §0/§A/§D`](待办与上线验证清单.md) |
+| [`19-预上线致命问题独立评审报告`](19-预上线致命问题独立评审报告.md) + [`20-预上线致命问题修复台账`](20-预上线致命问题修复台账.md) | 执行侧预上线独立评审（3 致命+4 严重+2 中等）与逐条修复台账：C-2 竞价封板续持 / H-1 乱序回报不回退已成单 / H-2 重连互斥 / H-3 风控两闸 fail-closed / H-4 调度相位可恢复 / M-1 持久化原子性 / M-2 单票上限 fail-closed 已离线修复并测（702 passed）；C-1 开卖出门 / C-3 跨帧数值保真待 T1.2 真机（仍有真机后续项，暂留 `doc/` 根未归档）。高层状态见 ③ 第五轮段 |
 | [`10-信号侧打板报告与watchlist生成逻辑分析与优化建议`](10-信号侧打板报告与watchlist生成逻辑分析与优化建议.md) | 信号侧 LLM 打板报告/watchlist 链路分析：资金流向数据缺口、提示词细化、步骤逻辑与打分契约优化（27 条对抗式核验建议 + P0/P1/P2 与落地纪律）。§11 已落地大部，**moneyflow 资金主线 / §6.4 权重回归等依赖外部前置（积分档放行验证、实盘 `qmt_*` 回流标签）的项仍挂着，故未归档**；高层落地状态见 ③ |
 
 > 第一轮（doc/08 报告 + doc/09 台账）、第二轮（doc/11 报告 + doc/12 台账）、第三轮（doc/13 报告 + doc/14 台账）评审与修复**均已处理完并归档** → 见 [`已归档-完成不再维护/`](已归档-完成不再维护/)；高层状态与去向见 [`评审与修复状态概要.md`](评审与修复状态概要.md)。**注**：各轮「全清零」指**当轮登记的 P0/P1/P2 条目**已修，**不含**上表「盘中卖出」接线缺口——该项被历轮当作待落地 TODO 延后、未计入清零口径。

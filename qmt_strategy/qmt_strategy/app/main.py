@@ -207,6 +207,10 @@ class Engine:
         # 运行期状态：当日 watchlist 上下文 + 计划行映射（盘中只读）。
         self._context: Optional[WatchlistContext] = None
         self._plan_map: Dict[str, PlanRow] = {}
+        # 卖出盘口跨帧字段计算器（评审 doc/19 C-3 接线扩展点）：默认 None → build_sell_books 的跨帧字段
+        # （炸板/破位/放量/量价背离/开板次数/尾盘走弱）保守默认、四类硬扳机不触发（由单帧浮亏止损兜底）。
+        # T1.2 真机固化 tick 键名/量纲后，经 set_sell_cross_frame_builder 注入有状态逐 code 帧历史计算器即生效。
+        self._sell_cross_frame_builder: Optional[Callable[[str, dict, OrderBook], None]] = None
         # 当日情绪周期（供 risk.gate 空仓判定，盘前装载时记录）。
         self._market_state: Optional[str] = None
         # 行情 / 下单通道健康标志（断线时置 False，恢复后置 True；供 risk.gate 安全默认）。
@@ -745,7 +749,18 @@ class Engine:
         # <=0 则该票已达上限不再加仓。
         if self._settings.max_position_per_stock is not None:
             cap_stock = Decimal(str(self._settings.max_position_per_stock))
-            exposure = self._order.exposure_for_code(self._today_provider(), plan.ts_code)
+            exposure, held_known = self._order.exposure_for_code_checked(
+                self._today_provider(), plan.ts_code
+            )
+            # 持仓查询失败 fail-closed（评审 doc/19 M-2）：与离线 _plan_volume 同口径——无法核验隔夜持仓时
+            # 拒单(返 0)，绝不把查询失败当无持仓而漏计、致跨日复买同一连板龙头累计突破单票上限(逼近 2×cap)。
+            if not held_known:
+                self._logger.error(
+                    "engine_sizer_per_stock_held_unknown_reject",
+                    ts_code=plan.ts_code, cap=str(cap_stock),
+                    note="持仓查询失败无法核验单票敞口，单票上限净额校验 fail-closed 拒单(M-2)",
+                )
+                return 0
             effective_cap = cap_stock - exposure
             if effective_cap <= 0:
                 self._logger.info(
@@ -942,7 +957,13 @@ class Engine:
             return False, f"限价{lp}超法定涨停价{cap}"
         guard = self._settings.price_deviation_guard_pct
         ref = getattr(snap, "last_price", None)
-        if guard is not None and ref is not None and ref > 0:
+        if guard is not None:
+            # 偏离护栏缺数据 fail-closed（评审 doc/19 复核必修2）：H-3 后偏离护栏为生产必配，若盘口现价缺失/
+            # 非正（snap.last_price 在 tick 降级/无 tick 帧时可能为 None）→ 无法核验偏离，应拒发而非静默放行——
+            # 与账户回撤闸「配了闸却算不出观测值→禁开」(_open_blocked_by_risk 的 F15 兜底) 同取向，堵住「配了
+            # 护栏却因缺数据让追高/参考价口径错位的废单漏过」的运时 fail-open。
+            if ref is None or ref <= 0:
+                return False, "限价偏离护栏已配但盘口现价缺失,无法核验偏离,fail-closed 拒发"
             dev = abs(lp - ref) / ref
             if dev > guard:
                 return False, f"限价{lp}偏离盘口现价{ref}超{guard}"
@@ -962,6 +983,17 @@ class Engine:
     # ------------------------------------------------------------------
     # 卖出链路（§5：守 T+1 + 风控闸门 + 竞价/分时定夺）
     # ------------------------------------------------------------------
+    def set_sell_cross_frame_builder(
+        self, builder: Optional[Callable[[str, dict, OrderBook], None]]
+    ) -> None:
+        """注入卖出盘口跨帧字段计算器（评审 doc/19 C-3 接线扩展点；T1.2 真机固化 tick 键名后调用）。
+
+        业务意图：把「炸板/破位/放量/量价背离/开板次数/尾盘走弱」六个跨帧状态量的计算从「恒默认」升级为
+        「由注入的逐 code 帧历史计算器填充」，使 decide_intraday 的四类硬扳机真正触发。未注入（默认 None）时
+        跨帧字段保守默认、仅单帧浮亏止损兜底（T0.1 现状）。本 setter 不改 decider 与下游，仅切换数据来源。
+        """
+        self._sell_cross_frame_builder = builder
+
     def build_sell_books(self, today: date) -> Dict[str, OrderBook]:
         """构造当前可卖持仓的实时盘口 {ts_code: OrderBook}（阶段0-C T0.1 卖出链接线）。
 
@@ -975,7 +1007,9 @@ class Engine:
           捕获置 report_market_feed(False)（行情不可信→盘中保守不卖），绝不在此吞掉。
         - 单票无 tick / 现价无效 / 构造异常 → **不纳入 books**（跳过），使 run_sell_pass 对该票走「book is None
           安全默认不卖」，单票坏数据不拖垮整批。
-        - 跨帧字段（炸板/破位等）本版保守默认，破位/炸板细粒度止损待阶段1 T1.2 真机实现；单帧浮亏止损已生效。
+        - 跨帧字段（炸板/破位等）经 build_order_book 的 cross_frame_builder 扩展点填充（评审 doc/19 C-3）：
+          未注入（_sell_cross_frame_builder=None，T0.1 现状）→ 保守默认、破位/炸板细粒度止损缺失（由单帧浮亏止损
+          兜底）；T1.2 真机固化 tick 键名后经 set_sell_cross_frame_builder 注入即生效。
         ⚠️ 已知限制（国金对接核对 B1，故生产由 QMT_SELL_PASS_LIVE 门控、默认关）：is_sealed 依赖 _plan_map
         （今日 watchlist）提供今日涨停价；不在今日名单的真封板隔夜票 plan 缺失 → is_sealed=False，若又无强先验
         会被 decider 兜底误清仓；watchlist 取数失败时更会批量误清。隔夜持仓 is_sealed/封流比补数与跨帧保真同属
@@ -994,7 +1028,8 @@ class Engine:
                 continue  # 无该票实时盘口 → 不纳入,run_sell_pass 走 book is None 安全默认不卖
             plan = self._plan_map.get(code)
             try:
-                ob = build_order_book(code, tick, plan)
+                # cross_frame_builder（评审 doc/19 C-3）：T0.1 为 None → 跨帧字段保守默认；T1.2 注入后四类硬扳机生效。
+                ob = build_order_book(code, tick, plan, cross_frame_builder=self._sell_cross_frame_builder)
             except Exception as exc:  # noqa: BLE001 单票构造异常不拖垮整批卖出盘口
                 self._logger.warn("sell_book_build_failed", ts_code=code, error=str(exc))
                 continue

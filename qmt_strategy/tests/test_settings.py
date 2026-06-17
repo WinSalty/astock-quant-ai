@@ -120,15 +120,53 @@ def test_assert_safe_to_trade_blocks_unverified_auction_timing():
         s.assert_safe_to_trade()
 
 
+# H-3：风控两闸（账户回撤 / 限价偏离）须显式配置，否则 assert_safe_to_trade 拒启动；
+# 故下列「放行」用例统一带上这两项的安全配置（_RISK_GATES）。
+_RISK_GATES = {"QMT_ACCOUNT_DRAWDOWN_LIMIT": "0.05", "QMT_PRICE_DEVIATION_GUARD_PCT": "0.10"}
+
+
 def test_assert_safe_to_trade_allows_verified_or_disabled():
-    # 已实测放行：开 + verified → 放行（不抛）
+    # 已实测放行：开 + verified（+ 两道风控闸已配）→ 放行（不抛）
     s1 = Settings.from_env(
-        {"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_AUCTION_TIMING_VERIFIED": "true"}
+        {"QMT_AUCTION_TIMING_ENABLED": "true", "QMT_AUCTION_TIMING_VERIFIED": "true", **_RISK_GATES}
     )
     s1.assert_safe_to_trade()
-    # 默认关：不抛
-    s2 = Settings.from_env({})
+    # 竞价择时默认关 + 两道风控闸已配：不抛
+    s2 = Settings.from_env(dict(_RISK_GATES))
     s2.assert_safe_to_trade()
+
+
+# ---------------------------------------------------------------------------
+# 评审 doc/19 H-3：账户回撤闸 / 限价偏离闸装配期 fail-closed 强校验
+# ---------------------------------------------------------------------------
+def test_assert_safe_to_trade_blocks_missing_account_drawdown_limit():
+    import pytest
+
+    # 只配偏离闸、漏配回撤闸 → 拒启动（fail-closed）。
+    s = Settings.from_env({"QMT_PRICE_DEVIATION_GUARD_PCT": "0.10"})
+    assert s.account_drawdown_limit is None
+    with pytest.raises(RuntimeError, match="QMT_ACCOUNT_DRAWDOWN_LIMIT"):
+        s.assert_safe_to_trade()
+
+
+def test_assert_safe_to_trade_blocks_missing_price_deviation_guard():
+    import pytest
+
+    # 只配回撤闸、漏配偏离闸 → 拒启动（fail-closed）。
+    s = Settings.from_env({"QMT_ACCOUNT_DRAWDOWN_LIMIT": "0.05"})
+    assert s.price_deviation_guard_pct is None
+    with pytest.raises(RuntimeError, match="QMT_PRICE_DEVIATION_GUARD_PCT"):
+        s.assert_safe_to_trade()
+
+
+def test_assert_safe_to_trade_allows_when_both_risk_gates_configured():
+    # 两道风控闸均显式配置（含「配大值实际关停」的合法用法）→ 放行（不抛）。
+    s = Settings.from_env(_RISK_GATES)
+    s.assert_safe_to_trade()
+    s_disabled = Settings.from_env(
+        {"QMT_ACCOUNT_DRAWDOWN_LIMIT": "0.99", "QMT_PRICE_DEVIATION_GUARD_PCT": "0.99"}
+    )
+    s_disabled.assert_safe_to_trade()  # 显式配大值=有痕关停，仍属「已显式决策」，不拒启
 
 
 # ---------------------------------------------------------------------------
@@ -151,8 +189,10 @@ def test_assert_safe_to_trade_blocks_sell_pass_live_without_stop_loss():
 
 
 def test_assert_safe_to_trade_allows_sell_pass_live_with_stop_loss():
-    # 开卖出链 + 配了单票浮亏止损 → 放行（不抛）。
-    s = Settings.from_env({"QMT_SELL_PASS_LIVE": "true", "QMT_STOCK_FLOAT_LOSS_LIMIT": "0.05"})
+    # 开卖出链 + 配了单票浮亏止损（+ 两道风控闸已配）→ 放行（不抛）。
+    s = Settings.from_env(
+        {"QMT_SELL_PASS_LIVE": "true", "QMT_STOCK_FLOAT_LOSS_LIMIT": "0.05", **_RISK_GATES}
+    )
     s.assert_safe_to_trade()
 
 

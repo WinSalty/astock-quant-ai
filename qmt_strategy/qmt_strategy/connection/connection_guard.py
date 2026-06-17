@@ -81,6 +81,12 @@ class ConnectionGuard:
         # 绝不在持锁时调 run_forever（阻塞）。锁仅包短临界区，I/O（connect/subscribe）在锁外执行，
         # 故不会与递归的 reconnect→connect_and_subscribe 自锁死（用普通 Lock 即可，不跨调用持锁）。
         self._lock = threading.Lock()
+        # 重连/建连互斥锁（评审 doc/19 H-2）：序列化整个「建连/重连窗口」（trader_factory→start→connect→
+        # subscribe 全序，含 I/O），杜绝断线回调线程 / 主循环 supervise / 调度 PREWARM 三路并发各造一个 trader、
+        # 各 start() 起后台线程致【句柄漂移 + 旧 trader 后台线程泄漏】。用 RLock：reconnect 内调 connect_and_subscribe
+        # 同线程重入放行；对其它线程则非阻塞 try-acquire 抢不到即跳过（那一路会把连接带到就绪，不并发再建 trader）。
+        # 与短临界锁 _lock 解耦：_lock 只护 (ready/session/trader) 状态读写与一致快照，绝不持 _conn_lock 时阻塞快照。
+        self._conn_lock = threading.RLock()
         self._ready: bool = False
         self._current_session_id: Optional[int] = None
         self._current_trader: Optional[XtTraderLike] = None
@@ -136,53 +142,89 @@ class ConnectionGuard:
         - sub_rc = subscribe(account)，sub_rc != 0：ready=False + 返回 False。
         - 两步均 0：ready=True + 返回 True。
         无论成败都保存 current_session_id / current_trader，便于断线重建对比新旧 session。
+
+        重连/建连互斥（评审 doc/19 H-2）：全程持 _conn_lock（含下面的 I/O），非阻塞 try-acquire——抢不到即
+        说明已有一路建连/重连在进行，立即跳过返回 False（不并发再造一个 trader）。reconnect 内调本方法靠
+        RLock 同线程重入放行。
         """
-        # 0) 进入连接/重连窗口即先置未就绪（评审三轮 EXEC-sched-03）：避免重连窗口内 _ready 维持旧 True
-        #    而 _current_trader 已切到尚未 start/connect 的新实例，主循环据此对半就绪句柄 run_forever。
-        with self._lock:
-            self._ready = False
-
-        # 1) 现取新 session_id（外部未指定时）并按其造 trader（重连复用本方法，保证每次都是新 session）。
-        if session_id is None:
-            session_id = self._session_id_provider()
-        trader = self._trader_factory(session_id)
-        with self._lock:
-            self._current_session_id = session_id
-            self._current_trader = trader
-
-        # 2) 固定时序：注册回调 → 启动交易线程 → connect。顺序不可调换。（I/O 在锁外执行）
-        trader.register_callback(self._callback)
-        trader.start()
-        rc = trader.connect()
-
-        # 3) connect 判返 0：非 0 即连接失败，直接收口为未就绪，绝不继续 subscribe。
-        if rc != 0:
+        # 非阻塞抢互斥锁：抢不到 = 已有建连/重连在进行（另一线程持锁）→ 跳过本次，绝不并发再造 trader（H-2）。
+        if not self._conn_lock.acquire(blocking=False):
             self._logger.warn(
-                "connect_failed",
-                session_id=session_id,
-                rc=rc,
-                # 断线/连接事件时间统一按东八区展示（盘口口径），落库时刻另由各写端走 time_utils。
-                at_east8=str(east8_now_from_utc(self._clock.now_utc())),
+                "connect_skip_in_progress",
+                note="已有建连/重连在进行，跳过本次并发建连（H-2 重连互斥，防多 trader/后台线程泄漏）",
             )
-            self._set_ready(False)  # 未就绪并通知冻结下单闸（连接失败 = 通道不可用）
             return False
+        try:
+            # 0) 进入连接/重连窗口即先置未就绪（评审三轮 EXEC-sched-03）：避免重连窗口内 _ready 维持旧 True
+            #    而 _current_trader 已切到尚未 start/connect 的新实例，主循环据此对半就绪句柄 run_forever。
+            with self._lock:
+                self._ready = False
 
-        # 4) 订阅账户推送：sub_rc != 0 视为未就绪（订阅失败盘中收不到回报，不能进开新仓态）。
-        sub_rc = trader.subscribe(self._account)
-        if sub_rc != 0:
-            self._logger.warn(
-                "subscribe_failed",
-                session_id=session_id,
-                sub_rc=sub_rc,
-                at_east8=str(east8_now_from_utc(self._clock.now_utc())),
-            )
-            self._set_ready(False)
-            return False
+            # 1) 现取新 session_id（外部未指定时）并按其造 trader（重连复用本方法，保证每次都是新 session）。
+            #    替换前先 best-effort 停旧 trader（H-2）：回收上一个 trader 的 start() 后台线程，防反复断线下泄漏。
+            if session_id is None:
+                session_id = self._session_id_provider()
+            old_trader = self._current_trader
+            trader = self._trader_factory(session_id)
+            self._stop_trader_quietly(old_trader)
+            with self._lock:
+                self._current_session_id = session_id
+                self._current_trader = trader
 
-        # 5) connect + subscribe 均成功 → 就绪。盘中推送开始进回调。
-        self._logger.info("connect_ready", session_id=session_id)
-        self._set_ready(True)  # 就绪并通知解冻下单闸（连接确实可用）
-        return True
+            # 2) 固定时序：注册回调 → 启动交易线程 → connect。顺序不可调换。（I/O 在互斥锁内、短临界锁外执行）
+            trader.register_callback(self._callback)
+            trader.start()
+            rc = trader.connect()
+
+            # 3) connect 判返 0：非 0 即连接失败，直接收口为未就绪，绝不继续 subscribe。
+            if rc != 0:
+                self._logger.warn(
+                    "connect_failed",
+                    session_id=session_id,
+                    rc=rc,
+                    # 断线/连接事件时间统一按东八区展示（盘口口径），落库时刻另由各写端走 time_utils。
+                    at_east8=str(east8_now_from_utc(self._clock.now_utc())),
+                )
+                self._set_ready(False)  # 未就绪并通知冻结下单闸（连接失败 = 通道不可用）
+                return False
+
+            # 4) 订阅账户推送：sub_rc != 0 视为未就绪（订阅失败盘中收不到回报，不能进开新仓态）。
+            sub_rc = trader.subscribe(self._account)
+            if sub_rc != 0:
+                self._logger.warn(
+                    "subscribe_failed",
+                    session_id=session_id,
+                    sub_rc=sub_rc,
+                    at_east8=str(east8_now_from_utc(self._clock.now_utc())),
+                )
+                self._set_ready(False)
+                return False
+
+            # 5) connect + subscribe 均成功 → 就绪。盘中推送开始进回调。
+            self._logger.info("connect_ready", session_id=session_id)
+            self._set_ready(True)  # 就绪并通知解冻下单闸（连接确实可用）
+            return True
+        finally:
+            self._conn_lock.release()
+
+    def _stop_trader_quietly(self, trader: Optional[XtTraderLike]) -> None:
+        """best-effort 停掉被替换的旧 trader，回收其 start() 起的后台线程（评审 doc/19 H-2）。
+
+        业务意图：重连换新 trader 时，旧 trader（多为已断线）的后台线程若无人 stop 会持续泄漏，反复断线下
+        线程/句柄无界增长。这里在替换前调旧 trader 的 stop()（若该实现暴露了）。
+        边界：trader 为 None（首次建连无旧实例）跳过；stop 不存在或抛错一律吞掉——不同 xtquant 版本的 stop
+        语义差异属 TODO(实测)，绝不让「停旧失败」拖垮「建新连」。
+        """
+        if trader is None:
+            return
+        stop = getattr(trader, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            stop()
+            self._logger.info("old_trader_stopped", note="重连替换前已停旧 trader 回收后台线程(H-2)")
+        except Exception:  # noqa: BLE001 停旧 trader 失败不影响新建连（best-effort）
+            self._logger.warn("old_trader_stop_failed", note="停旧 trader 失败(best-effort，不影响新建连)")
 
     # ------------------------------------------------------------------
     # 断线兜底
@@ -214,44 +256,58 @@ class ConnectionGuard:
         - 重连成功（ready=True 且 session 确为新值）后**恰调用一次** on_reconnect_backfill()；
           重连失败不补采（连接都没就绪，补采也取不到权威数据）。
         返回是否重连就绪。
+
+        重连互斥（评审 doc/19 H-2）：非阻塞抢 _conn_lock——抢不到即说明已有建连/重连在进行，立即跳过返回
+        False（不并发再起一路重连）；内部 connect_and_subscribe 靠 RLock 同线程重入放行，故 session 复用退避 +
+        建连全序在同一把锁内串行，断线回调线程 / 主循环 supervise / 调度 PREWARM 三路触发也只有一路真正执行。
         """
-        prev_session_id = self._current_session_id
-
-        # session 复用退避（评审三轮 EXEC-sched-08 / P1-2）：先【廉价地】从 provider 取一个与旧值不同的
-        # session_id（不重建 trader），最多 max_session_retry 次；拿不到不同值即 fail-closed 拒绝重连。
-        new_session_id = self._session_id_provider()
-        retries = 0
-        while new_session_id == prev_session_id and retries < self._max_session_retry:
-            self._logger.error(
-                "reconnect_session_id_reused_retry",
-                prev_session_id=prev_session_id, new_session_id=new_session_id, retry=retries + 1,
-            )
-            self._set_ready(False)  # 复用即未就绪，绝不进就绪态
-            retries += 1
-            new_session_id = self._session_id_provider()
-
-        if new_session_id == prev_session_id:
-            # 超上限仍复用 → 拒绝本次重连（保持未就绪 + 强告警），绝不带复用 session 进就绪态/补采。
-            self._set_ready(False)
-            self._logger.error(
-                "reconnect_aborted_session_reuse",
-                prev_session_id=prev_session_id, new_session_id=new_session_id,
-                note="provider 持续吐相同 session，旧 session 订阅可能失效无回报，拒绝带复用 session 进就绪态",
+        # 非阻塞抢互斥锁：抢不到 = 已有建连/重连在进行 → 跳过本次并发重连（H-2，防多 trader/后台线程泄漏）。
+        if not self._conn_lock.acquire(blocking=False):
+            self._logger.warn(
+                "reconnect_skip_in_progress",
+                note="已有建连/重连在进行，跳过本次并发重连（H-2 重连互斥）",
             )
             return False
+        try:
+            prev_session_id = self._current_session_id
 
-        # 拿到不同的新 session_id → 用其【只建一次】trader 走全序（避免退避期重复重建+线程泄漏）。
-        ok = self.connect_and_subscribe(session_id=new_session_id)
+            # session 复用退避（评审三轮 EXEC-sched-08 / P1-2）：先【廉价地】从 provider 取一个与旧值不同的
+            # session_id（不重建 trader），最多 max_session_retry 次；拿不到不同值即 fail-closed 拒绝重连。
+            new_session_id = self._session_id_provider()
+            retries = 0
+            while new_session_id == prev_session_id and retries < self._max_session_retry:
+                self._logger.error(
+                    "reconnect_session_id_reused_retry",
+                    prev_session_id=prev_session_id, new_session_id=new_session_id, retry=retries + 1,
+                )
+                self._set_ready(False)  # 复用即未就绪，绝不进就绪态
+                retries += 1
+                new_session_id = self._session_id_provider()
 
-        if ok:
-            # 重连就绪（且 session 确为新值）：触发一次当日补采入口（写表细节归回流模块，本处只负责触发串联）。
-            self._logger.info(
-                "reconnected",
-                new_session_id=self._current_session_id,
-                prev_session_id=prev_session_id,
-            )
-            self._on_reconnect_backfill()
-        return ok
+            if new_session_id == prev_session_id:
+                # 超上限仍复用 → 拒绝本次重连（保持未就绪 + 强告警），绝不带复用 session 进就绪态/补采。
+                self._set_ready(False)
+                self._logger.error(
+                    "reconnect_aborted_session_reuse",
+                    prev_session_id=prev_session_id, new_session_id=new_session_id,
+                    note="provider 持续吐相同 session，旧 session 订阅可能失效无回报，拒绝带复用 session 进就绪态",
+                )
+                return False
+
+            # 拿到不同的新 session_id → 用其【只建一次】trader 走全序（避免退避期重复重建+线程泄漏）。
+            ok = self.connect_and_subscribe(session_id=new_session_id)
+
+            if ok:
+                # 重连就绪（且 session 确为新值）：触发一次当日补采入口（写表细节归回流模块，本处只负责触发串联）。
+                self._logger.info(
+                    "reconnected",
+                    new_session_id=self._current_session_id,
+                    prev_session_id=prev_session_id,
+                )
+                self._on_reconnect_backfill()
+            return ok
+        finally:
+            self._conn_lock.release()
 
     # ------------------------------------------------------------------
     # 常驻入口
