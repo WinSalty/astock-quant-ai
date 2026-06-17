@@ -253,10 +253,9 @@ class WatchlistLoader:
         # 价位预算（先算好，无论进哪个名单都透传，便于观察名单复盘对照）。
         price = self._budget_prices(row)
 
-        # 2) universe 前缀白名单兜底（冗余防线，防信号侧规则漂移）。
-        #    说明：loader 阶段只做「前缀白名单」兜底；ST / 停牌 / 退市属 live 实时行名称判定，
-        #    loader 无名称数据（SelectedStockRow 不含证券名称），故名称类判定留待盘中 live 路径，
-        #    此处仅以代码前缀过滤科创/北交/B股等非目标段（§2.3 第 3 步 / universe_filter）。
+        # 2) universe 前缀白名单兜底（冗余防线，防信号侧规则漂移）：仅以代码前缀过滤科创/北交/B股等非目标段
+        #    （§2.3 第 3 步 / universe_filter）。注：SelectedStockRow 现已含 name/is_st（契约补齐），ST/退市判定
+        #    在紧随其后的 2.1 步用 is_st_stock 统一处理；停牌/退市等其余 live 名称判定仍可后续在盘中路径补强。
         if not self._apply_universe_filter(norm):
             self._logger.info(
                 "watchlist_universe_reject",
@@ -266,12 +265,10 @@ class WatchlistLoader:
             watch_only.append(self._to_entry(row, norm_code=norm, price=price, today=today))
             return
 
-        # 2.1) ST / 退市整理 live 过滤（评审二轮 P1#10/#18 + 三轮 F3）：优先采用信号侧显式 is_st 布尔，缺则回退
-        #      证券名称含 ST/退 判定 → 转观察名单（不下单）。ST 票（仍是 600/000 前缀）若不拦截会照常进下单路径，
-        #      打板战法对 ST 高风险标的取保守"只观察不下单"。is_st 显式标志补齐后不再单点押在 name 上。
-        _is_st_explicit = getattr(row, "is_st", None)
-        _is_st = bool(_is_st_explicit) if _is_st_explicit is not None else universe_filter.is_st_name(row.name)
-        if _is_st:
+        # 2.1) ST / 退市整理 live 过滤（评审二轮 P1#10/#18 + 三轮 F3 + 禁买 ST 硬规则第 1 层）：统一走
+        #      is_st_stock——显式 is_st=True 或证券名含 ST/退 即判 ST → 剔出可交易名单、转观察（不下单）。
+        #      「绝不买入 ST」由本层(universe) + entry_router(_should_skip) + order_executor(place) 三层叠加兜底。
+        if universe_filter.is_st_stock(getattr(row, "is_st", None), row.name):
             self._logger.info(
                 "watchlist_st_reject", norm_code=norm, name=row.name, trade_date=str(today)
             )
@@ -378,4 +375,8 @@ class WatchlistLoader:
             setup=row.setup,
             first_board_vol=row.first_board_vol,
             float_mktcap=row.float_mktcap,
+            # ST 识别透传（禁买 ST 硬规则）：name/is_st 一路带到 PlanRow/EntryDecision，供 entry_router 与
+            # order_executor 的禁买 ST 闸复核——即便本票漏过 universe 层（如 DB 直读源未走本拆名单），下游仍拦得住。
+            name=row.name,
+            is_st=row.is_st,
         )

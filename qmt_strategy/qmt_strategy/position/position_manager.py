@@ -233,6 +233,24 @@ class PositionManager:
             if unit.state in (PositionState.SOLD, PositionState.FROZEN):
                 continue
 
+            # —— 跨日清算残留在途卖量（评审 F02/F16）——
+            # A 股「日内单」隔夜全部失效/被撤，故任何【非 SELLING】单元在新交易日开盘前的 on_road_sell_volume
+            # 必是昨日已死委托的残留（典型：昨日 REDUCE 部成后剩余委托被撤、但 filled>0 不触发零成交复位钩子，
+            # 且撤单回执断线丢失，on_road 永挂 → sellable_remaining=can_use-on_road 把可卖量无依据下调=永久漏卖）。
+            # 这里在跨日推进前统一清零，杜绝漏卖；SELLING 单元交由 reconcile_stuck_selling 按券商终态裁决，不在此动。
+            if unit.state != PositionState.SELLING:
+                if getattr(unit, "on_road_sell_volume", 0):
+                    stale = unit.on_road_sell_volume
+                    unit.on_road_sell_volume = 0
+                    self._logger.info(
+                        "position_stale_on_road_cleared",
+                        account_id=unit.account_id, ts_code=unit.ts_code,
+                        cleared=stale, today=str(today),
+                    )
+                # 重置卖单回扣去重集（review 幂等）：隔夜旧卖单 order_id 失效，清空防 order_id 跨日复用被误判「已回扣」。
+                if getattr(unit, "released_sell_order_ids", None):
+                    unit.released_sell_order_ids = set()
+
             crossed_buy_date = today >= unit.earliest_sellable_date
 
             if crossed_buy_date:
@@ -449,6 +467,45 @@ class PositionManager:
             if unit is None:
                 return
             self.revert_selling(unit, reason=reason)
+
+    def release_on_road_by_code(
+        self, account_id: str, ts_code: str, released_qty: int, *, order_id: Optional[int] = None, reason: str = ""
+    ) -> None:
+        """卖单终态失败时，精确按本单未成量回扣在途冻结量（评审 F02/F16 + review 幂等）。
+
+        业务意图：原实现仅在「整单零成交且单元 SELLING」时经 revert_selling 把 on_road 清零；部成单
+        （filled>0，单元已被 apply_sell_fill 推进为 PART_SOLD）剩余委托被撤/废时，其未成在途量永不回扣 →
+        sellable_remaining = can_use_volume - on_road_sell_volume 把可卖上限永久下调 = 漏卖、止损卖不出。
+        本方法按【本单未成量 released_qty】精确回扣（不动其它在途单的冻结量，多单在途也不误清），
+        是卖单终态失败的唯一在途量释放入口。
+        幂等（review）：回扣是非幂等减法，同一卖单终态回调若重复触发（拒单经 on_order_error+on_stock_order 双面
+        回报 / 同帧重投）会重复扣减、误清兄弟在途单冻结量。按 order_id 去重——同单第二次进入直接 return，保证每单只
+        回扣一次。order_id 为 None（旧装配/无单号兜底）时不去重、保守回扣一次（退化为旧行为，仍优于不回扣）。
+        边界：
+        - released_qty<=0 / 无该单元 / order_id 已回扣 → no-op；on_road 钳到 0 不为负；
+        - 回扣后若 on_road 归零且单元仍卡 SELLING → 复位可卖态供重挂（PART_SOLD 单元保持 PART_SOLD 不误复位）。
+        """
+        if released_qty is None or released_qty <= 0:
+            return
+        with self._lock:
+            unit = self._units.get((account_id, ts_code))
+            if unit is None:
+                return
+            # 幂等去重：同一卖单只回扣一次，防双面回报/重投重复扣减误清兄弟在途单（review）。
+            if order_id is not None:
+                if order_id in unit.released_sell_order_ids:
+                    return
+                unit.released_sell_order_ids.add(order_id)
+            before = getattr(unit, "on_road_sell_volume", 0)
+            unit.on_road_sell_volume = max(0, before - int(released_qty))
+            # 兜底：回扣后无在途且仍卡 SELLING → 复位（部成单一般为 PART_SOLD，不会进此分支；防御冗余）。
+            if unit.on_road_sell_volume == 0 and unit.state == PositionState.SELLING:
+                unit.state = PositionState.HOLDING if unit.volume > 0 else PositionState.SOLD
+            self._logger.info(
+                "position_on_road_released",
+                account_id=account_id, ts_code=ts_code, released=int(released_qty),
+                before=before, after=unit.on_road_sell_volume, state=str(unit.state), reason=reason,
+            )
 
     def reconcile_stuck_selling(
         self, today: date, broker_order_state_query: Callable[[str, str], Optional[str]]

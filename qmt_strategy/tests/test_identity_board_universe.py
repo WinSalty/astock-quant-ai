@@ -158,17 +158,23 @@ def test_resolve_code_embedded_literal_not_hijacked():
 
 
 # ===========================================================================
-# 评审三轮 F3：board_rules 优先采用显式 is_st（不再单点押在 name）
+# 评审三轮 F3 + 禁买 ST 硬规则：board_rules 统一走 is_st_stock（显式 is_st=True 或 name 含 ST 即 ST）
 # ===========================================================================
 def test_budget_prices_prefers_explicit_is_st():
     from qmt_strategy.common.board_rules import budget_prices
-    # 主板票、name 不含 ST，但显式 is_st=True → 按 5% 现算（10.00→10.50），不再被 name 误判为非 ST。
+    # 主板票、name 不含 ST，但显式 is_st=True → 按 5% 现算（10.00→10.50），不被 name 误判为非 ST。
     row = make_selected_row(ts_code="600036.SH", signal_close=Decimal("10.00"))
     row.name = "招商银行"
     row.is_st = True
     assert budget_prices(row).limit_up_price == Decimal("10.50")  # ST 5%
-    # 反之显式 is_st=False 即便 name 含 ST 字样也按 10%。
+    # 禁买 ST 硬规则口径更新：name 含 ST/退即视为 ST，即便显式 is_st=False（视为信号侧漂移/滞后）也按 5%——
+    # name 是 point-in-time 实时事实，宁可对疑似 ST 偏保守（5%），绝不放真 ST 进买入路径。
     row2 = make_selected_row(ts_code="600036.SH", signal_close=Decimal("10.00"))
     row2.name = "ST华微"
     row2.is_st = False
-    assert budget_prices(row2).limit_up_price == Decimal("11.00")  # 非 ST 10%
+    assert budget_prices(row2).limit_up_price == Decimal("10.50")  # name 含 ST → ST 5%
+    # 非 ST 名称 + is_st 缺失/False → 主板 10%（不把缺失/非 ST 当 ST，避免对非 ST 票按 5% 漏买）。
+    row3 = make_selected_row(ts_code="600036.SH", signal_close=Decimal("10.00"))
+    row3.name = "招商银行"
+    row3.is_st = False
+    assert budget_prices(row3).limit_up_price == Decimal("11.00")  # 非 ST 10%

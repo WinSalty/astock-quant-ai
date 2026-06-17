@@ -38,6 +38,9 @@ class LocalStorage:
         logger: StructLogger,
         account_id: str,
         remote_repo: Optional[QmtRepository] = None,
+        *,
+        write_queue_max: int = 50000,
+        write_queue_stuck_seconds: float = 30.0,
     ):
         self._db_path = db_path
         self._logger = logger
@@ -52,7 +55,12 @@ class LocalStorage:
             apply_pragmas(conn)
             return conn
 
-        self._wq = AsyncWriteQueue(_writer_conn, logger, name="qmt-sqlite-writer")
+        # 武装写队列健壮性参数（评审 F07/F09）：max_queue 防写线程挂死无界堆积 OOM；stuck_seconds 看门狗识别
+        # 写线程卡死(commit 不抛错的 hang)使 is_healthy 转 False → 上层 fail-closed 停开新仓。生产由 run.py 从配置注入。
+        self._wq = AsyncWriteQueue(
+            _writer_conn, logger, name="qmt-sqlite-writer",
+            max_queue=write_queue_max, stuck_seconds=write_queue_stuck_seconds,
+        )
         # 三个协议实现（被 Engine 以既有协议注入消费）。
         self.repository: QmtRepository = SqliteQmtRepository(db_path, self._wq, logger)
         self.ledger = PersistentLocalLedger(db_path, self._wq, logger)

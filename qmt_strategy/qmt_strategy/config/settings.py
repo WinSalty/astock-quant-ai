@@ -148,6 +148,13 @@ class Settings:
     account_loss_limit: Optional[Decimal] = None      # 账户级当日已实现亏损阈值
     stock_float_loss_limit: Optional[Decimal] = None  # 单票浮亏阈值
 
+    # —— 收盘资产对账容差（评审 F01）——
+    # 原实现把「成交净额(Σtraded_amount，不含佣金/印花税/过户费)」与「可用现金变动(含全部费用+冻结)」硬比、
+    # 阈值硬编码 1000 元不可配不随规模缩放 → 高换手/大账户日因费用噪声误报 asset_discrepancy。改为费用一致的
+    # 相对容差：tolerance = max(abs_floor, 当日成交额 × rel_rate)；偏差超容差才记偏差（且已降为告警不阻断开仓）。
+    reconcile_asset_abs_floor: Decimal = Decimal("1000")   # QMT_RECONCILE_ASSET_ABS_FLOOR：绝对容差下限(元)
+    reconcile_asset_rel_rate: Decimal = Decimal("0.003")   # QMT_RECONCILE_ASSET_REL_RATE：相对容差(×成交额，覆盖费用)
+
     # —— 7.1.6 竞价择时总开关（实测前必须关，§7.1.6 强约束）——
     auction_timing_enabled: bool = False      # QMT_AUCTION_TIMING_ENABLED：默认 False
     # 竞价择时实测放行标记（fail-closed）：仅当在国金真机完成竞价数据能力实测（§A4）后显式置 True，才允许
@@ -172,6 +179,12 @@ class Settings:
 
     # —— 本地化数据栈（doc/05 单进程+SQLite）——
     local_db_path: str = "qmt_local.db"       # QMT_LOCAL_DB_PATH：本机 SQLite 库路径（回流/台账/名单）
+    # 写队列长度硬上限（评审 F07）：>0 启用溢出熔断——写线程永久挂死(如 fsync/NFS 卡死)时防无界堆积 OOM，
+    # 超限即丢弃任务 + on_failure 告警(→停开新仓)。原生产装配未传(默认0=不启用)，该保护形同虚设；这里默认武装 5万。
+    write_queue_max: int = 50000              # QMT_WRITE_QUEUE_MAX
+    # 写线程「卡死」看门狗阈值秒（评审 F09）：有积压(pending>0)但连续该秒数无任何任务推进 → is_healthy 转 False
+    # (→fail-closed 停开新仓)。覆盖「写线程卡在永不返回的 I/O、commit 不抛错、_last_write_ok 误停在 True」盲区。
+    write_queue_stuck_seconds: float = 30.0   # QMT_WRITE_QUEUE_STUCK_SECONDS
 
     # —— 决策链路采集（复盘用、best-effort、与交易热路径物理隔离，不影响真实交易）——
     # 默认开：在各决策点非阻塞采集「信号达标→下单/未买→卖出」决策事件，盘后回流信号侧 qmt_decision_log。
@@ -258,6 +271,13 @@ class Settings:
             account_drawdown_limit=_as_decimal(g("QMT_ACCOUNT_DRAWDOWN_LIMIT")),
             account_loss_limit=_as_decimal(g("QMT_ACCOUNT_LOSS_LIMIT")),
             stock_float_loss_limit=_as_decimal(g("QMT_STOCK_FLOAT_LOSS_LIMIT")),
+            # 资产对账容差（评审 F01）：未配走默认（绝对下限 1000 元、相对 0.3% 成交额）。
+            reconcile_asset_abs_floor=(
+                _v if (_v := _as_decimal(g("QMT_RECONCILE_ASSET_ABS_FLOOR"))) is not None else Decimal("1000")
+            ),
+            reconcile_asset_rel_rate=(
+                _v if (_v := _as_decimal(g("QMT_RECONCILE_ASSET_REL_RATE"))) is not None else Decimal("0.003")
+            ),
             decision_log_enabled=_as_bool(g("QMT_DECISION_LOG_ENABLED") or "true"),
             decision_log_queue_size=_as_int(g("QMT_DECISION_LOG_QUEUE_SIZE")) or 2000,
             decision_log_batch_size=_as_int(g("QMT_DECISION_LOG_BATCH_SIZE")) or 50,
@@ -274,6 +294,15 @@ class Settings:
                 g("QMT_UNIQUE_WITH_TRADE_DATE") or "true"
             ),
             local_db_path=g("QMT_LOCAL_DB_PATH") or "qmt_local.db",
+            # 写队列健壮性（评审 F07/F09）：默认武装 max_queue=5万、看门狗 30s；显式配 0 关闭上限/0 关看门狗。
+            write_queue_max=(
+                _v if (_v := _as_int(g("QMT_WRITE_QUEUE_MAX"))) is not None else 50000
+            ),
+            # is-not-None 守卫（与 write_queue_max/seal_ratio_min 同口径）：显式配 0 是「关看门狗」，绝不能被
+            # `or 30.0` 把 0.0(falsy) 吞成默认 30——否则文档承诺的「配 0 关看门狗」逃生口不可达（review 修正）。
+            write_queue_stuck_seconds=(
+                _v if (_v := _as_float(g("QMT_WRITE_QUEUE_STUCK_SECONDS"))) is not None else 30.0
+            ),
         )
 
     def resolve_signal_token(self) -> Optional[str]:

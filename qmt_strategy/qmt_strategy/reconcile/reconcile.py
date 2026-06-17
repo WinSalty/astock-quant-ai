@@ -185,12 +185,18 @@ class Reconcile:
         calendar: TradeCalendar,
         *,
         account_id: str,
+        asset_abs_floor: Decimal = _ASSET_DEVIATION_THRESHOLD,
+        asset_rel_rate: Decimal = Decimal("0"),
     ):
         self._ledger = ledger
         self._repo = repository
         self._logger = logger
         self._calendar = calendar
         self._account_id = account_id
+        # 资产对账容差（评审 F01）：绝对下限 + 相对速率(×当日成交额)。默认 rel_rate=0 退化为原绝对阈值口径
+        # （向后兼容直接构造 Reconcile 的单测）；生产由 Engine 注入正的 rel_rate(覆盖费用噪声)。
+        self._asset_abs_floor = asset_abs_floor
+        self._asset_rel_rate = asset_rel_rate
 
     # —— 关联键工具 ——
     @staticmethod
@@ -263,6 +269,10 @@ class Reconcile:
         - 回报有、台账无 → 手工单（非本系统下单）单独标记。
         """
         matched_order_ids: set = set()
+        # 当日本系统台账的 order_id 集合（评审 F21）：反向勾稽「回报有台账无→手工单」时的二次确认须按
+        # 【当日】台账判定，不能用 get_by_order_id(跨日复用 order_id 时它取最近交易日那条、会把历史系统单
+        # 误当今日系统单 → 真实手工单/串账户单漏标）。这里直接用本轮当日台账行的 order_id 集合精确判定。
+        ledger_order_ids_today: set = {e.order_id for e in ledger_entries if e.order_id is not None}
 
         # 台账→回报：逐条计划单找对应回报（matched_order_ids 同时作为"已消费回报"集合，保证一对一）。
         for e in ledger_entries:
@@ -314,8 +324,9 @@ class Reconcile:
             if o.order_status == OrderStatus.ERROR:
                 # 下单失败骨架行：已在台账侧（若有）按 order_failed 处理，这里不重复标手工单。
                 continue
-            # 二次确认台账确实无该 order_id（防 matched_order_ids 漏统计）。
-            if o.order_id is not None and self._ledger.get_by_order_id(o.order_id) is not None:
+            # 二次确认【当日】台账确实无该 order_id（评审 F21：按当日台账 order_id 集合判定，不用 get_by_order_id
+            # 的跨日「最近交易日」反查——否则今日手工单 order_id 恰与历史系统单复用时会被误判为本系统单而漏标）。
+            if o.order_id is not None and o.order_id in ledger_order_ids_today:
                 continue
             disc = OrderDiscrepancy(
                 kind="manual_order",
@@ -461,14 +472,16 @@ class Reconcile:
         账户资产变动：从 qmt_account_daily 取 CLOSE 快照的 daily_pnl / (total_asset - prev_total_asset)；
         仓储未提供账户只读接口（QmtRepository 仅暴露 get_orders/get_trades）→ 跳过并在 notes 说明。
         """
-        # 计算成交净现金流（买为负、卖为正）。
+        # 计算成交净现金流（买为负、卖为正）+ 累计成交额(turnover，用于费用一致的相对容差，评审 F01)。
         net_flow = Decimal("0")
+        turnover = Decimal("0")        # Σ|成交额|：当日双边换手，相对容差以此为基数覆盖佣金/印花税噪声
         unknown_side_count = 0
         for t in trades:
             amt = t.traded_amount
             if amt is None:
                 # 缺 traded_amount 时用价 * 量兜底（Decimal 口径）。
                 amt = (t.traded_price or Decimal("0")) * Decimal(int(t.traded_volume or 0))
+            turnover += abs(amt)
             if t.trade_side == TradeSide.BUY:
                 net_flow -= amt        # 买入：现金流出
             elif t.trade_side == TradeSide.SELL:
@@ -511,12 +524,18 @@ class Reconcile:
         # 就告警（阈值已滤掉费用/浮盈浮亏等小额噪声）；方向是否冲突仅作诊断信息附在 detail。
         deviation = abs(net_flow - account_change)
         direction_conflict = (net_flow > 0 and account_change < 0) or (net_flow < 0 and account_change > 0)
-        if deviation > _ASSET_DEVIATION_THRESHOLD:
+        # 费用一致的相对容差（评审 F01）：原口径把「成交净额(不含佣金/印花税/过户费)」与「可用现金变动(含全部
+        # 费用+冻结)」硬比、阈值硬编码 1000 元——高换手/大账户日费用本身就过千，必误报。改为
+        # tolerance = max(abs_floor, turnover×rel_rate)：相对部分按当日成交额缩放，足以覆盖双边佣金(~0.025%×2)
+        # + 卖出印花税(0.05%)等费用噪声；只有真正异常(漏采成交/资金外划)才超容差。
+        tolerance = max(self._asset_abs_floor, turnover * self._asset_rel_rate)
+        if deviation > tolerance:
             disc = AssetDiscrepancy(
                 expected_net_flow=net_flow,
                 account_asset_change=account_change,
                 detail=(
-                    "成交净额与账户现金变动偏差超阈值：疑似漏采成交 / 资金流水异常"
+                    f"成交净额与账户现金变动偏差超容差(dev={deviation} > tol={tolerance})："
+                    "疑似漏采成交 / 资金流水异常"
                     + ("（方向亦相反）" if direction_conflict else "（同向超额偏差）")
                 ),
             )
@@ -527,6 +546,8 @@ class Reconcile:
                 expected_net_flow=str(net_flow),
                 account_asset_change=str(account_change),
                 deviation=str(deviation),
+                tolerance=str(tolerance),
+                turnover=str(turnover),
                 direction_conflict=direction_conflict,
             )
 

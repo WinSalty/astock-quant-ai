@@ -319,6 +319,25 @@ class OrderExecutor:
             )
             return None
 
+        # —— 禁买 ST 硬规则第 3 层（唯一下单点最终硬保证）：决策被标记为 ST → 一律拒发买单 ——
+        # 所有买入（含 try_next_best 转次优）都汇聚到本方法，是「绝不买入 ST」的最后一道、也是最强一道闸；
+        # 即便 loader/entry_router 两层被绕过或漏判，只要 decision.is_st 为真，这里也绝不下单（仅留痕）。
+        if getattr(decision, "is_st", False):
+            self._logger.error(
+                "order_st_forbidden_block",
+                ts_code=decision.ts_code,
+                account_id=self._account_id,
+                note="ST/退市整理标的，禁止买入（禁买 ST 硬规则），拒发买单",
+            )
+            self._emit_decision(
+                decision_type="SKIP_ORDER", decision_stage="ORDER", action="SKIP",
+                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                order_phase=decision.order_phase, reason="ST标的禁止买入(禁买ST硬规则)",
+                reason_code="st_forbidden", factors=decision.factors_snapshot,
+            )
+            return None
+
         # —— kill_switch 全局熔断：只采集不下单（§7.1.5）——
         if self._settings.kill_switch:
             self._logger.warn(
@@ -791,6 +810,38 @@ class OrderExecutor:
             total += (e.avg_filled_price or e.plan_price) * Decimal(filled) + e.plan_price * Decimal(remaining)
         return total
 
+    def _committed_remaining_for_code(self, target_trade_date: Any, ts_code: str) -> Decimal:
+        """当日对该 ts_code 活跃买单的【未成在途】计划额（评审 F03/F13）：仅计 remaining，**不含已成 filled**。
+
+        业务意图：单票【敞口】口径 = 该票现有持仓市值(_held_value，券商权威，已含当日已成买入) + 当日未成在途买单
+        计划额。原 _committed_for_code 同时计入 filled+remaining，与 _held_value 的 filled 部分【重复计入】
+        （F13：已成买单被券商持仓与台账承诺双重扣减、单票后续加仓被系统性少买）。本方法只取未成 remaining 段，
+        与 _held_value 拼成「持仓 + 未成在途」的单计敞口口径，供单票金额上限净额校验单计无重复。
+        """
+        from ..common.identity import resolve_code
+
+        target = resolve_code(ts_code)
+        active = OrderState.active()
+        total = Decimal("0")
+        for e in self._ledger.all_for_date(target_trade_date):
+            if not (e.side == TradeSide.BUY and e.state in active and e.plan_price is not None and e.plan_volume):
+                continue
+            if resolve_code(e.ts_code) != target:
+                continue
+            filled = min(e.filled_volume or 0, e.plan_volume)
+            remaining = e.plan_volume - filled
+            # 只计未成在途段（已成 filled 已体现在 _held_value 的持仓市值里，不再重复计入，堵 F13 双重扣减）。
+            total += e.plan_price * Decimal(remaining)
+        return total
+
+    def exposure_for_code(self, target_trade_date: Any, ts_code: str) -> Decimal:
+        """该 ts_code 的单票【敞口】单计口径（评审 F03/F13）：现有持仓市值 + 当日未成在途买单计划额。
+
+        供资金分配主链（main._strength_budget_volume）与离线兜底（_plan_volume）共用，保证单票金额上限
+        net 校验在两条路径口径一致、且对当日已成买入【单计不重复】（已成体现在持仓市值、未成体现在在途计划额）。
+        """
+        return self._held_value(ts_code) + self._committed_remaining_for_code(target_trade_date, ts_code)
+
     # ------------------------------------------------------------------
     # 计划股数现算（§4.4(6) 资金口径）
     # ------------------------------------------------------------------
@@ -825,13 +876,13 @@ class OrderExecutor:
             cap_order = Decimal(str(self._settings.per_order_max_amount))
             if cap_order < budget:
                 budget = cap_order
-        # 单票金额上限（评审三轮 EXEC-risk-03）：净额校验须含「该票现有持仓市值 + 当日已承诺该票额」，
-        # effective_cap = cap - held - committed_for_code；<=0 则该票已达/超上限直接返 0 不再加仓（跨日同样生效）。
+        # 单票金额上限（评审三轮 EXEC-risk-03 + F13 单计修正）：净额校验须含「该票现有持仓市值 + 当日未成在途
+        # 该票计划额」，单计不重复——exposure_for_code = _held_value(已含当日已成买入) + 未成在途计划额；原实现用
+        # _committed_for_code(filled+remaining) 与 _held_value 的 filled 段重复扣减(F13)，使同票后续加仓被系统性少买。
+        # effective_cap = cap - exposure；<=0 则该票已达/超上限直接返 0 不再加仓（跨日同样生效）。
         if self._settings.max_position_per_stock is not None:
             cap_stock = Decimal(str(self._settings.max_position_per_stock))
-            held = self._held_value(decision.ts_code) + self._committed_for_code(
-                decision.target_trade_date, decision.ts_code
-            )
+            held = self.exposure_for_code(decision.target_trade_date, decision.ts_code)
             effective_cap = cap_stock - held
             if effective_cap <= 0:
                 self._logger.info(

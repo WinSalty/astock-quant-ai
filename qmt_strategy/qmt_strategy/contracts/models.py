@@ -114,6 +114,11 @@ class TradableEntry:
     setup: Optional[str] = None
     first_board_vol: Optional[int] = None
     float_mktcap: Optional[Decimal] = None
+    # ST 识别透传（禁买 ST 硬规则 + F08）：证券名称与显式 ST 标志一路透传到 PlanRow/EntryDecision，
+    # 使「绝不买入 ST」的三层闸（loader universe / entry_router / order_executor）都拿得到可靠 ST 信号，
+    # 不再只在 loader 单点判定后丢失。name=证券名（live ST 兜底），is_st=信号侧显式布尔（None=未下发回退 name）。
+    name: Optional[str] = None
+    is_st: Optional[bool] = None
 
     def to_plan_row(self) -> "PlanRow":
         """转为 auction/entry 消费的计划行（窄视图）。"""
@@ -136,6 +141,9 @@ class TradableEntry:
             continuation_prob=self.continuation_prob,
             next_day_premium_prob=self.next_day_premium_prob,
             leader_strength_score=self.leader_strength_score,
+            # ST 信号透传给路由/下单层做禁买 ST 闸（禁买 ST 硬规则）。
+            name=self.name,
+            is_st=self.is_st,
         )
 
 
@@ -179,6 +187,10 @@ class PlanRow:
     continuation_prob: Optional[Decimal] = None
     next_day_premium_prob: Optional[Decimal] = None
     leader_strength_score: Optional[Decimal] = None
+    # ST 识别透传（禁买 ST 硬规则）：name=证券名（live ST 兜底），is_st=信号侧显式 ST 布尔；
+    # entry_router._should_skip 据此对 ST 标的一律 SKIP，绝不产 BUY 决策。
+    name: Optional[str] = None
+    is_st: Optional[bool] = None
 
 
 @dataclass
@@ -235,6 +247,9 @@ class EntryDecision:
     factors_snapshot: Dict[str, Any] = field(default_factory=dict)
     # 次优候选序列（§4.4(7) 转次优）：主标的买不进时按序尝试。
     next_best: tuple = ()                   # tuple[EntryDecision, ...]（用 tuple 保 frozen 可哈希）
+    # 禁买 ST 最终闸标志（禁买 ST 硬规则第 3 层）：_build_decision 据统一口径 is_st_stock 算定；
+    # order_executor.place 见此为真即拒单——所有买入（含转次优）必过唯一下单点，是绝不买入 ST 的最终硬保证。
+    is_st: bool = False
 
 
 @dataclass
@@ -309,6 +324,10 @@ class PositionUnit:
     # 量权威标记（评审三轮 EXEC-position-07）：True 表示 volume 来自券商快照/重建权威量，迟到/重复买入
     # 回调只登记 traded_id 去重、不再二次累加 volume（避免在权威量上重复加仓多报持仓）；下次快照重新校准。
     volume_authoritative: bool = False
+    # 已回扣在途量的卖单 order_id 去重集（review 幂等）：on_road 的终态回扣是非幂等减法，同一卖单终态回调若
+    # 重复触发（miniQMT 拒单常经 on_order_error + on_stock_order 双面回报，或同帧重投）会重复回扣、误清兄弟在途单
+    # 冻结量并损坏状态。按 order_id 去重保证每单只回扣一次；refresh_state 跨日重置（隔夜旧单失效、防 order_id 跨日复用误判）。
+    released_sell_order_ids: set = field(default_factory=set)
 
 
 @dataclass

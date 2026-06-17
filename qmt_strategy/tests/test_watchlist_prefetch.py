@@ -130,7 +130,8 @@ def test_prefetch_http_failure_degrades_no_save():
     pf = WatchlistPrefetcher(
         _FakeClient(fail=True), _FakeCalendar(prev=date(2026, 6, 12)), save_fn, _FakeLogger()
     )
-    assert pf.prefetch(date(2026, 6, 13)) == 0
+    # 评审 F11：HTTP 真失败返回 -1（区别于合法空名单 0），供调度层据此重试，不与空仓日混淆。
+    assert pf.prefetch(date(2026, 6, 13)) == -1
     assert calls["n"] == 0  # 失败不落库 → loader 降级无名单
 
 

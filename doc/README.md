@@ -2,7 +2,7 @@
 
 > A 股打板/涨停量化交易闭环。**信号侧负责「看得准」，执行侧负责「买得到、守得住、可复盘」**，
 > 两侧物理隔离、通过 HTTP 解耦，回流数据闭合成可归因的环。
-> 本文是整个项目（信号侧 + 执行侧）的单一入口，只记**现状口径**（交易逻辑 / 架构 / 部署设计 / 资金口径）；
+> 本文是整个项目（信号侧 + 执行侧）的单一入口，只记**现状口径**（交易逻辑 / 架构 / 部署设计 / 资金口径 / 环境变量与配置）；
 > 还要做什么见 [`待办与上线验证清单.md`](待办与上线验证清单.md)，评审与修复状态见 [`评审与修复状态概要.md`](评审与修复状态概要.md)，
 > 生产部署/运维见本机运维手册 `/Users/salty/codeProject/ai/doc/Qmt生产服务器.txt`；历史开发设计/计划已移入 [`已归档-完成不再维护/`](已归档-完成不再维护/)（不再看）。
 
@@ -45,9 +45,10 @@
 - **本地化（doc/05）**：**单进程 + 本机 SQLite，异步持久化（write-behind 绝不阻塞交易）**；盘前名单入库、盘中内存权威、盘后幂等同步回远端。
 - **调度（`DailyScheduler`）**：东八区钟点触发 盘前装载 → 竞价 → 盘中 sweep/卖出 → 收盘对账 → 盘后同步。
 - **适配器（`adapters/xt_real.py`）**：把 xtquant 翻译成 `Protocol`（**唯一 import xtquant 处**，仅 Windows 运行）；非 Windows 用 fake 跑全部单测。
-- **下单时段**：竞价段（强开追/竞价卖）+ 开盘后连续交易（打板跟买/低吸/龙回头/止盈止损/炸板/尾盘）；竞价择时实测前默认**关**，实际下单全在开盘后。
+- **建仓时点口径**：建仓决策由**集合竞价 + 定盘窗（9:15–9:30）的因子轮询**驱动（`AuctionPoller`，9:30 退出）；竞价段（强开追/竞价卖）默认只采集（竞价择时实测前关），**定盘窗（9:25–9:30）对竞价封板/强开票产出 `OPENING` 限价单挂出、待开盘成交**（TTL 顺延至开盘起算）。**当前不做开盘后连续交易段（9:30+）的盘中买入轮询**——即只打「竞价/一字封板」一类，盘中(如 10:30)才封板的票不追（有意设计：竞价定夺 + 挂 OPENING 单待成交）；卖出（止盈止损/炸板/尾盘）则覆盖盘中（由 `QMT_SELL_PASS_LIVE` 门控）。
+- **绝不买入 ST**：ST/*ST/退市整理标的**一律不买入**（硬规则），三层闸叠加——盘前 universe 剔出可交易名单 + 建仓路由 SKIP + 唯一下单点最终拒单；判定口径 = 信号侧显式 `is_st` 为真 **或** 当日证券名含 `ST/退`（`is_st` 经 HTTP→SQLite→PlanRow 可靠透传，不再单点押在 name 上）。
 
-**贯穿全局的硬口径**：守 T+1 双保险 · 三层幂等（业务单号+DB唯一键+traded_id）· 时间口径无 ±8h（东八区↔UTC naive）· 安全默认「契约残缺/中断→只守仓不开新仓」· `KILL_SWITCH` 一键熔断 · 竞价择时实测前关。
+**贯穿全局的硬口径**：守 T+1 双保险 · 三层幂等（业务单号+DB唯一键+traded_id）· 时间口径无 ±8h（东八区↔UTC naive）· 安全默认「契约残缺/中断→只守仓不开新仓」· **绝不买入 ST（三层闸）** · `KILL_SWITCH` 一键熔断 · 竞价择时实测前关。
 
 ---
 
@@ -110,7 +111,138 @@
 
 ---
 
-## 8. 文档导航
+## 8. 环境变量与配置（运行前必须确认）
+
+> **安全口径（两侧一致，沿用 `AGENTS.md`）**：账号 / token / key / DSN 等敏感项**不硬编码、不入库、不进日志**，一律从外部环境变量或本机 `_FILE` 落盘文件注入；凡有 `_FILE` 变体的，**生产优先用 `_FILE`**（指向本机文件），避免明文落 `.env`。两侧均提供脱敏快照（执行侧 `Settings.redacted()`、信号侧同口径），敏感字段打印即打码。生产实际值（服务器/账号/token）见本机运维手册 `/Users/salty/codeProject/ai/doc/Qmt生产服务器.txt`（**严禁 commit 进任一仓库**）。
+
+### 8.1 执行侧 `qmt_strategy`（Windows，全部 `QMT_*`）
+
+唯一解析点：`qmt_strategy/config/settings.py` 的 `Settings.from_env(os.environ)`（`app/run.py` 启动时调用）——下表即权威清单，未列出的 `QMT_*` 不被消费。**装配期 `assert_safe_to_trade()` 会对安全门控做 fail-closed 校验**（见 8.1.F）。
+
+**A. 账户与连接（敏感，必配才能真实交易）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `QMT_ACCOUNT_ID` | QMT 资金账号（落 `qmt_*.account_id`） | 无（真实交易必配） |
+| `QMT_MINI_PATH` | miniQMT `userdata_mini` 路径 | 无（真实交易必配） |
+| `QMT_SESSION_ID` | 交易 session id（重连须换新） | 无 |
+| `QMT_ACCOUNT_TYPE` | 账号类型（**保留·当前未接入** `StockAccount` 构造）；现货单参即可，两融启用前须先改字符串映射（见 doc/16 T0.5） | 无 |
+
+**B. 交易日历（评审 P0-E1，生产 fail-closed）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `QMT_TRADE_CALENDAR_FILE` | 真实交易日清单文件路径（每行一个 `YYYY-MM-DD`，从信号侧 `a_trade_calendar` 导出）；T+1/名单键/对账都依赖它 | 无（**生产必配**） |
+| `QMT_ALLOW_WEEKDAY_CALENDAR` | 未提供日历文件时是否退化为「仅排周末」 | `false`（**fail-closed，拒绝启动**；仅离线/测试可显式置 `true`） |
+
+**C. 信号侧 HTTP 对接（盘前拉 watchlist + 盘后推 `qmt_*` 回流，见 §4）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `QMT_SIGNAL_BASE_URL` | 信号侧服务根，如 `http://1.2.3.4:8000` | 无（不配则盘前无名单、盘后不回流） |
+| `QMT_SIGNAL_INTERNAL_TOKEN` / `…_FILE` | `X-Internal-Token` 统一回落值 | 无 |
+| `QMT_SIGNAL_WATCHLIST_TOKEN` / `…_FILE` | 盘前 `GET /internal/watchlist` 专用 token | 缺省回落统一 token |
+| `QMT_SIGNAL_INGEST_TOKEN` / `…_FILE` | 盘后 `POST /internal/qmt/ingest` 专用 token | 缺省回落统一 token |
+| `QMT_WATCHLIST_SOURCE` | 名单来源 `DB`（直读表）/ `HTTP` | `DB` |
+| `QMT_WATCHLIST_API_URL` | `HTTP` 方案的只读接口地址 | 无 |
+| `QMT_HTTP_TIMEOUT_SECONDS` | 单次接口超时秒数 | `10.0` |
+| `QMT_MYSQL_DSN` | 旧方案 A 直连 MySQL 回流（**通道未落地**） | 无；**配了即装配期拒启**，生产应改用 HTTP 回流 |
+| `QMT_WRITEBACK_BASE_URL` / `QMT_WRITEBACK_TOKEN` / `QMT_INGEST_TOKEN` | 旧 B 方案写回接口（保留） | 默认空 |
+
+**D. 资金与风控（下单前硬约束；分配语义详见 §7）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `QMT_TARGET_POSITION_RATIO` | 总预算上限 = 日初权益 × 本比例 | `1.0`（满仓上限；调小留现金，`0`=空跑不开新仓） |
+| `QMT_MAX_POSITIONS_PER_DAY` | 单日建仓**只数**上限（不同标的数） | `5`（设 0/负/极大值放宽不限） |
+| `QMT_MAX_ORDERS_PER_DAY` | 单日下单**次数**上限（含转次优/卖出，区别于只数） | 无 |
+| `QMT_PER_ORDER_MAX_AMOUNT` | 单笔金额上限 | 无 |
+| `QMT_MAX_POSITION_PER_STOCK` | 单票持仓金额上限 | 无 |
+| `QMT_MAX_TOTAL_EXPOSURE` | 绝对总敞口上限（与 ratio 取小） | 无 |
+| `QMT_PRICE_DEVIATION_GUARD_PCT` | 限价相对参考价偏离护栏 | 无 |
+| `QMT_ACCOUNT_DRAWDOWN_LIMIT` | 账户级当日回撤阈值（§5.4.1）；**配了即生效**：盘前日初权益基线抓取失败时 fail-closed 禁开新仓（不冻结卖出） | 无 |
+| `QMT_ACCOUNT_LOSS_LIMIT` | 账户级当日已实现亏损阈值 | 无；⚠️**当前未独立接线**——已由 `QMT_ACCOUNT_DRAWDOWN_LIMIT` 的 total_asset 回撤综合承载，单配本项不会独立触发熔断（启动期会强告警提示） |
+| `QMT_STOCK_FLOAT_LOSS_LIMIT` | 单票浮亏止损阈值（**比例**口径，如 `0.05`） | 无；**开 `QMT_SELL_PASS_LIVE` 时强制必配** |
+| `QMT_MARKET_STATE_BLOCK` | 禁开仓的 `market_state` 集合（逗号分隔） | `空仓,谨慎参与,退潮,冰点`（仅「参与」开新仓） |
+| `QMT_ALLOW_PLAN_VOLUME_FALLBACK` | 缺 `plan_volume` 时是否回退现算（绕过强度/名额约束） | `false`（**对真实 BUY fail-closed**；仅离线置 `true`） |
+
+**E. 战法阈值与采集节奏（对齐竞价观察清单口径）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `QMT_AUCTION_ABANDON_PCT` / `QMT_AUCTION_OVERHEAT_PCT` | 竞价弱于该幅度放弃 / 超该幅度警惕 | 无 |
+| `QMT_AUCTION_LOWBUY_PCT_LOW` / `…_HIGH` | 低吸触发区间（**平开/微跌回踩**区间，如 `-0.02` / `0.01`） | 无；⚠️**未配则低吸族 fail-closed 不开仓**——绝不再回退用「合理高开区间」臆造低吸档（否则低吸买卖方向相反），低吸战法须显式配此区间 |
+| `QMT_LEADER_STRENGTH_MIN` | 龙头强度分下限 | 无 |
+| `QMT_SEAL_RATIO_MIN` | 打板跟买封流比下限（低于视为封单不稳→弃） | `0`（**关闭**；目标机实测 `bidVol` 量纲后再配正阈值如 `0.005`） |
+| `QMT_STRATEGY_<NAME>_ENABLED` | 各战法独立开关（`<NAME>` 小写汇总进 `strategy_enabled`） | 未配即不在集合内 |
+| `QMT_AUCTION_POLL_INTERVAL_SEC` | 竞价轮询间隔秒 | `3.0` |
+| `QMT_CLOSE_SNAPSHOT_TIME` | 收盘快照时点 | `15:05` |
+
+**F. 安全门控开关（核心红线，默认全部保守；装配期强制校验）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `QMT_KILL_SWITCH` | 全局熔断 | `false`；置 `true` 则**只采集不下单**（一键熔断） |
+| `QMT_AUCTION_TIMING_ENABLED` | 竞价择时总开关 | `false`（**实测前必须关**） |
+| `QMT_AUCTION_TIMING_VERIFIED` | 竞价数据能力实测放行标记 | `false`；`ENABLED=true` 但本项非真 → **启动期 `RuntimeError` 拒启** |
+| `QMT_SELL_PASS_LIVE` | 盘中卖出链生产放行门控 | `false`（**当前必须保持关**，见 §6「盘中卖出」行）；开启时**强制要求**已配 `QMT_STOCK_FLOAT_LOSS_LIMIT` 否则拒启 |
+
+**G. 下单/台账与本地化数据栈（doc/05 单进程 + SQLite）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `QMT_ORDER_TTL_SECONDS` | 开盘单最长存活秒（竞价单到 9:25 定盘） | `60` |
+| `QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD` | 下单通道心跳连续失败几次才置 FREEZE | `3` |
+| `QMT_CANCEL_GRACE_SECONDS` | `CANCELLING` 单撤单回执宽限秒 | `30` |
+| `QMT_UNIQUE_WITH_TRADE_DATE` | 明细唯一键是否纳入 `trade_date`（§6.5 加固） | `true` |
+| `QMT_LOCAL_DB_PATH` | 本机 SQLite 库路径（回流/台账/名单） | `qmt_local.db` |
+| `QMT_DECISION_LOG_ENABLED` | 决策链路采集（复盘用，与交易热路径物理隔离） | `true`；置 `false` 一键降级 no-op |
+| `QMT_DECISION_LOG_QUEUE_SIZE` / `QMT_DECISION_LOG_BATCH_SIZE` | 采集有界队列容量 / 回流攒批大小 | `2000` / `50` |
+| `QMT_WRITE_QUEUE_MAX` | 写队列长度硬上限（>0 启用溢出熔断，防写线程挂死无界堆积 OOM；评审 F07） | `50000`（已默认武装；配 `0` 关闭上限） |
+| `QMT_WRITE_QUEUE_STUCK_SECONDS` | 写线程「卡死」看门狗阈值秒：有积压却连续该秒数无任务推进 → `is_healthy` 转 False → fail-closed 停开新仓（评审 F09） | `30`（配 `0` 关看门狗） |
+| `QMT_RECONCILE_ASSET_ABS_FLOOR` | 收盘资产对账偏差绝对容差下限（元；评审 F01） | `1000` |
+| `QMT_RECONCILE_ASSET_REL_RATE` | 资产对账偏差相对容差（× 当日成交额，覆盖佣金/印花税费用噪声；评审 F01） | `0.003` |
+
+### 8.2 信号侧 `stock-ah-premium-ai`（Linux）
+
+权威清单：`backend/app/core/config.py`（Pydantic Settings）+ 模板 `backend/.env.example`；从 `backend/.env` 或系统环境注入。下表只列**打板交易闭环相关**的必配/核心项；信号侧还有问答引擎、配图、雪球发布、PushPlus 等平台能力的大量调参（`AGENT_*` / `IMAGE_GEN_*` / `QWEN_*` / `XUEQIU_*` / `PUSHPLUS_*` / `PY_SANDBOX_*` 等），**与本交易闭环无关、均有默认或缺省降级，完整清单以 `backend/.env.example` 为准**，按需启用。
+
+**核心必配 / 强约束**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `STOCK_AH_DB_URL` | MySQL `stock_ah_ai` 连接串（SQLAlchemy/Alembic） | `mysql+pymysql://root@127.0.0.1:3306/stock_ah_ai?charset=utf8mb4`（**生产必配真实库**） |
+| `WATCHLIST_EXPORT_INTERNAL_TOKEN` / `…_FILE` | 盘前 `GET /api/internal/watchlist` 的 `X-Internal-Token` | 无；**未配即接口恒 503 关闭** |
+| `QMT_INGEST_INTERNAL_TOKEN` / `…_FILE` | 盘后 `POST /api/internal/qmt/ingest` 的 `X-Internal-Token` | 无；**绝不回落读 token（评审三轮 SIG-QMT-06），必须单独配**，否则 `/ingest` 恒 503、回流静默断流 |
+| `WATCHLIST_EXPORT_IP_WHITELIST` / `QMT_INGEST_IP_WHITELIST` | 两接口来源 IP 白名单（逗号分隔，与 token 叠加） | 空=不启用（**生产建议配置或反代层加白名单**） |
+
+> ⚠️ `backend/.env.example` 中「QMT 回流 token 未单独配置则回落到 watchlist 导出 token」的注释**已过期**——代码（`resolve_qmt_ingest_internal_token`，SIG-QMT-06）已改为**绝不回落**：读/写 token 必须分别配置，否则写接口 503。
+
+**行情 / LLM（选股 pipeline 依赖）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `TUSHARE_TOKEN` / `…_FILE` | Tushare 行情 token | `_FILE` 默认指向 `…/doc/tushare-token.txt` |
+| `TUSHARE_API_URL` | Tushare 代理地址 | `https://tt.xiaodefa.cn` |
+| `LLM_API_KEY` / `…_FILE` | DeepSeek LLM key | `_FILE` 默认指向 `…/doc/deepseek-apikey.txt` |
+| `LLM_BASE_URL` / `LLM_MODEL` | LLM 端点 / 默认模型 | `https://api.deepseek.com` / `deepseek-v4-flash` |
+
+**调度与时区（东八区定时口径）**
+
+| 变量 | 用途 | 默认 / 口径 |
+|---|---|---|
+| `SYNC_SCHEDULER_TIMEZONE` | APScheduler 时区（全局定时口径） | `Asia/Shanghai` |
+| `SYNC_SCHEDULER_ENABLED` / `ALERT_SCHEDULER_ENABLED` / `LIMIT_UP_PUSH_SCHEDULER_ENABLED` | 增量同步 / 预警扫描 / 打板推送调度总开关 | 各 `true` |
+
+**打板 pipeline / 闸门 / 龙头 / 回测调参（影响 watchlist 产出口径）**
+
+> 这些是选股链路的可调阈值，均有默认、不配也能跑；需要调口径时按 `backend/.env.example` 配置。代表项：`LIMIT_UP_PUSH_MODEL`（默认 `deepseek-v4-pro`）、`LIMIT_UP_LEADER_SCORING_ENABLED`（默认 `true`，龙头六维打分卡，对应 §2「龙头增强 M2」）、`LIMIT_UP_GATE_*`（空仓闸门否决阈值，对应 go/no-go）、`LIMIT_UP_BACKTEST_DEFAULT_LOOKBACK_DAYS`/`LIMIT_UP_BACKTEST_CONTROL_SOURCE`/`LIMIT_UP_BACKTEST_BUY_AT`（回测口径，默认 `60` / `CACHE_POOL` / `T1_OPEN`）。完整项与默认值见 `backend/.env.example`。
+
+**前端（React/Vite）**：`VITE_API_BASE_URL`（默认空=走 `/api` 代理）、`FRONTEND_PORT`（`5173`）、`BACKEND_PORT`（`8000`）；见 `frontend/vite.config.ts` 与 `scripts/start-frontend.sh`。
+
+---
+
+## 9. 文档导航
 
 文档分五类（规则见仓库 `CLAUDE.md`）：① 本 README（现状口径）；② 待办清单（还要做什么）；③ 评审与修复状态概要（持久状态记录）；④ 评审/修复处理文档（处理中，处理完归档）；⑤ 已归档（完成存档、不再看）。
 
@@ -118,7 +250,7 @@
 
 | 文档 | 内容 |
 |---|---|
-| `README.md`（本文） | 项目现状口径：交易逻辑 + 架构 + 部署设计 + 资金分配口径 |
+| `README.md`（本文） | 项目现状口径：交易逻辑 + 架构 + 部署设计 + 资金分配口径 + 环境变量与配置 |
 | [`待办与上线验证清单.md`](待办与上线验证清单.md) | 还需处理 + 只能上生产/目标机实测验证的事项（活文档） |
 | [`评审与修复状态概要.md`](评审与修复状态概要.md) | 评审做了什么、修了什么、当前状态（持久概要，指向已归档的 08/09/11–14 详情） |
 | 运维手册（本机 workspace）`/Users/salty/codeProject/ai/doc/Qmt生产服务器.txt` | 两台生产机部署/重启/token/计划任务/连通性自检 + 执行侧 Windows bring-up（非本仓库，含密码勿外泄） |

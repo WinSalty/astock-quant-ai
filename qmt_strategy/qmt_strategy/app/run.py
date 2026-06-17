@@ -277,11 +277,27 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
         )
     # 竞价择时未实测放行 fail-closed（§7.1.6）：auction_timing_enabled=True 但未 verified 即拒启动。
     settings.assert_safe_to_trade()
+    # account_loss_limit 接线缺口显式告警（评审 F06）：QMT_ACCOUNT_LOSS_LIMIT(当日已实现亏损闸)配置项存在、
+    # gate 内有对应击穿分支，但生产买入/卖出路径均喂 account_realized_loss=None → 该闸配了也永不触发，运维易误以为
+    # 已有「当日已实现亏损」独立熔断。当前设计由 total_asset 日内回撤闸(QMT_ACCOUNT_DRAWDOWN_LIMIT)综合承载
+    # 已实现+浮动亏损，故已实现亏损不单列接线。这里在配了该项时启动期强告警，避免误信双闸而把回撤闸配松。
+    if settings.account_loss_limit is not None:
+        logger.warn(
+            "account_loss_limit_not_independently_wired",
+            value=str(settings.account_loss_limit),
+            note="QMT_ACCOUNT_LOSS_LIMIT 当前未独立接线(已由 total_asset 回撤闸 QMT_ACCOUNT_DRAWDOWN_LIMIT 综合承载)，"
+                 "单配本项不会独立触发已实现亏损熔断；如需账户级日内止损请配置 QMT_ACCOUNT_DRAWDOWN_LIMIT。",
+        )
     account_id = settings.account_id
 
     # —— 本地 SQLite 数据栈：建表 + 起写线程 + 重建台账（重启幂等）——
     remote = _build_remote_repo(settings, logger)
-    stack = LocalStorage(settings.local_db_path, logger, account_id, remote_repo=remote)
+    # 武装写队列健壮性（评审 F07/F09）：从配置注入 max_queue/看门狗，使溢出熔断与 hang 检测在生产真正生效。
+    stack = LocalStorage(
+        settings.local_db_path, logger, account_id, remote_repo=remote,
+        write_queue_max=settings.write_queue_max,
+        write_queue_stuck_seconds=settings.write_queue_stuck_seconds,
+    )
     # 传 east8 当日启用台账窗口装载（评审三轮 EXEC-storage-05）：只重建近 N 日活跃单，防跨日只增不减。
     stack.start(today=east8_trade_date(clock.now_utc()))
 

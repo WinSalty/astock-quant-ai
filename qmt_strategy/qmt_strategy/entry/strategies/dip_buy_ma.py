@@ -31,6 +31,16 @@ class DipBuyMaStrategy(EntryStrategy):
         thr = resolve_thresholds(plan, snap, settings)
         op = snap.open_pct
 
+        # —— 弃条件 0：低吸档阈值未显式配置 → fail-closed 不开仓（评审 F18）。——
+        # 低吸档 [lowbuy_low, lowbuy_high] 语义是「平开/微跌回踩区间」，与信号侧「合理高开区间」相反、绝不可
+        # 互相套用；缺显式配置时 resolve_thresholds 留 None（不再臆造成高开区间）。此处宁可不开仓，也绝不在
+        # 缺低吸档时用错区间把真低吸点弃掉、反在高开位追买（方向反）。需用 QMT_AUCTION_LOWBUY_PCT_LOW/HIGH 显式配。
+        if thr.lowbuy_low is None or thr.lowbuy_high is None:
+            return StrategyOutcome(
+                action=EntryAction.SKIP,
+                reason="DIP_BUY_MA弃:低吸档阈值未配置(QMT_AUCTION_LOWBUY_PCT_LOW/HIGH)，fail-closed 不臆造",
+            )
+
         # —— 弃条件 1：open_pct 不可得 → 无法判低吸档位置，放弃（不臆造）。——
         if op is None:
             return StrategyOutcome(

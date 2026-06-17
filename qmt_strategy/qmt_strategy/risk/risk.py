@@ -108,6 +108,11 @@ class Risk:
             return self._freeze(reason, account_realized_loss=str(account_realized_loss))
 
         # —— 第 3 层：单票级浮亏击穿 → 该票 FREEZE ——
+        # 口径固化（评审 F05）：unit_float_loss 与 stock_float_loss_limit 必须同为【比例】口径（浮亏占成本比，
+        # 如 0.05=5%），与活体止损 main._unit_stop_loss_breached(用 (成本-现价)/成本 比例) 一致——切勿喂【绝对金额】。
+        # 注：当前两个唯一调用方(开仓 _open_blocked_by_risk、卖出 run_sell_pass)均显式喂 unit_float_loss=None，
+        # 故本层为预留(不参与运行时裁决)；单票浮亏止损由 main._unit_stop_loss_breached 直接触发卖出承载。未来若
+        # 接线本层，务必按比例口径喂数，勿因 stock_float_loss_limit 名字含 loss 误当金额。
         if self._breached(unit_float_loss, self._settings.stock_float_loss_limit):
             reason = "单票浮亏击穿：float_loss={} >= limit={}（§5.4.1）".format(
                 unit_float_loss, self._settings.stock_float_loss_limit

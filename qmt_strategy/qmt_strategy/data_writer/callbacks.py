@@ -78,6 +78,7 @@ class ExecCallback:
         status_resolver: StatusResolver = normalize.default_status_resolver,
         position_sink: Optional[Callable[[Any], None]] = None,
         sell_revert_sink: Optional[Callable[[str], None]] = None,
+        sell_on_road_release_sink: Optional[Callable[[str, int, Optional[int]], None]] = None,
     ):
         self._dw = data_writer
         self._ledger = ledger
@@ -94,6 +95,10 @@ class ExecCallback:
         # 卖单终态失败复位钩子（评审二轮 P1#31）：卖单被拒/全撤且零成交时，把持仓单元从 SELLING 复位回
         # HOLDING（供下一轮重挂），否则止损/破位清仓永久失效。由 Engine 注入 (ts_code)->None；缺省不复位。
         self._sell_revert_sink = sell_revert_sink
+        # 卖单【部成后剩余委托】终态失败的在途量精确回扣钩子（评审 F02/F16）：部成单 filled>0 时不走零成交复位，
+        # 但其未成在途量须按本单未成量回扣，否则 sellable_remaining 被永久下调=漏卖。由 Engine 注入
+        # (ts_code, unfilled_qty)->None；缺省不回扣（向后兼容旧装配/单测）。
+        self._sell_on_road_release_sink = sell_on_road_release_sink
 
     def set_on_disconnected_hook(self, hook: Callable[[], None]) -> None:
         """运行期回填断线钩子（评审三轮 EXEC-sched-01）。
@@ -105,22 +110,38 @@ class ExecCallback:
         """
         self._on_disconnected_hook = hook
 
-    def _maybe_revert_sell_unit(self, order_id: Optional[int]) -> None:
-        """卖单终态失败 → 复位持仓 SELLING 态（评审二轮 P1#31）。
+    def _maybe_revert_sell_unit(self, order_id: Optional[int], terminal_status: Any) -> None:
+        """卖单终态失败 → 按本单未成量精确回扣在途冻结量 / 复位持仓 SELLING 态（评审二轮 P1#31 + F02/F16 + review）。
 
-        判据：台账据 order_id 反查到的单元是 SELL 方向、已落终态失败（CANCELLED/REJECTED/ERROR）、
-        且零成交（filled_volume==0）→ 该卖单确未卖出任何量，持仓须从 SELLING 复位回 HOLDING 重挂。
-        部成（filled_volume>0）由 sync_status 收口为 PART_TRADED、持仓由卖出成交回报推进，不在此复位。
+        判据修正（review F02 死路）：**用回报的原始终态状态 terminal_status 判定撤/废/拒，绝不读台账 state**——
+        on_stock_order 先调 ledger.sync_status，对【CANCELLED/REJECTED 且 filled>0】的部成撤单已 fill-aware 收口为
+        PART_TRADED（local_ledger.sync_status），若仍按 entry.state∈终态集合判定，部成单永远进不来、on_road 当日不
+        回扣 = 漏卖（F02 本要堵的窗口）。故改以回报原始状态判定。
+
+        统一精确回扣（review #2）：零成交与部成【统一】按本单未成量 unfilled=plan_volume-filled 经
+        sell_on_road_release_sink 精确回扣 on_road（绝不整体清零误清同单元其它在途单的冻结量）；release 内在 on_road
+        归零且单元仍 SELLING 时复位 HOLDING。仅当未接 release sink（旧装配/单测只配 revert sink）时，零成交回退旧
+        revert 复位路径（向后兼容）。
+        边界：台账无该 order_id / 非 SELL / 非撤废拒终态 / 无未成量 → 不动。
         """
-        if order_id is None or self._sell_revert_sink is None:
+        if order_id is None:
             return
         entry = self._ledger.get_by_order_id(order_id)
-        if entry is None:
+        if entry is None or entry.side != TradeSide.SELL:
             return
-        terminal_fail = entry.state in (
-            OrderState.CANCELLED, OrderState.REJECTED, OrderState.ERROR
-        )
-        if entry.side == TradeSide.SELL and terminal_fail and (entry.filled_volume or 0) == 0:
+        # 撤/废/拒终态判定取【回报原始状态】，不取台账 state（sync_status 已对部成撤单收口为 PART_TRADED）。
+        if terminal_status not in (OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.ERROR):
+            return
+        filled = entry.filled_volume or 0
+        unfilled = max(0, (entry.plan_volume or 0) - filled)
+        if unfilled <= 0:
+            return  # 本单全成（不该来撤/废）或无未成量，无需回扣
+        if self._sell_on_road_release_sink is not None:
+            # 精确按本单未成量回扣 on_road（多单在途不误清），传 order_id 供 release 按单去重（防双面回报/重投
+            # 重复回扣误清兄弟在途单，review 幂等）；on_road 归零时由 release 内复位 SELLING→HOLDING。
+            self._sell_on_road_release_sink(entry.ts_code, unfilled, entry.order_id)
+        elif filled == 0 and self._sell_revert_sink is not None:
+            # 向后兼容：仅配 revert sink 时，零成交单走旧复位路径（整体清零 on_road + 复位 HOLDING）。
             self._sell_revert_sink(entry.ts_code)
 
     # ------------------------------------------------------------------
@@ -196,8 +217,9 @@ class ExecCallback:
         if rec.order_id is not None:
             state = _STATUS_TO_STATE.get(rec.order_status, OrderState.REPORTED)
             self._ledger.sync_status(rec.order_id, state, rec.status_msg)
-            # 卖单终态失败 → 复位持仓 SELLING 态（评审二轮 P1#31）：拒单/全撤且零成交时让持仓回 HOLDING 重挂。
-            self._maybe_revert_sell_unit(rec.order_id)
+            # 卖单终态失败 → 回扣在途量 / 复位 SELLING（评审二轮 P1#31 + F02/F16 + review）：传【回报原始状态】
+            # rec.order_status，而非已被 sync_status 收口的台账 state，否则部成撤单进不来 release 分支=漏卖。
+            self._maybe_revert_sell_unit(rec.order_id, rec.order_status)
 
     # ------------------------------------------------------------------
     # 下单失败：废单 / 拒单（回调独有，§6.2.1 on_order_error）
@@ -252,8 +274,8 @@ class ExecCallback:
         # 同步台账：把对应计划单推进 ERROR 终态（台账无该 order_id 则 sync_status 自身忽略）。
         if order_id is not None:
             self._ledger.sync_status(order_id, OrderState.ERROR, getattr(e, "error_msg", None))
-            # 卖单废单/拒单 → 复位持仓 SELLING 态（评审二轮 P1#31）。
-            self._maybe_revert_sell_unit(order_id)
+            # 卖单废单/拒单 → 回扣在途量 / 复位 SELLING（评审二轮 P1#31 + F02/F16）：on_order_error 即 ERROR 终态。
+            self._maybe_revert_sell_unit(order_id, OrderStatus.ERROR)
 
     # ------------------------------------------------------------------
     # 撤单失败：留痕（回调独有，§6.2.1 on_cancel_error）

@@ -34,6 +34,7 @@ class AsyncWriteQueue:
         on_failure: Optional[Callable[[str], None]] = None,
         fail_after: int = 5,
         max_queue: int = 0,
+        stuck_seconds: float = 0.0,
     ):
         # conn_factory：返回写线程独占的 DB-API 连接（如 sqlite3.connect(...)）。
         self._conn_factory = conn_factory
@@ -47,6 +48,12 @@ class AsyncWriteQueue:
         self._consecutive_fail = 0       # 仅写线程读写
         # 队列长度硬上限（>0 启用）：写线程阻塞挂起(如 fsync 永久卡死)时防无界堆积内存熔断，超限触发 on_failure。
         self._max_queue = max_queue
+        # 卡死看门狗阈值秒（评审 F09，>0 启用）：写线程卡在永不返回的 I/O(fsync/NFS hang)时，commit 既不成功也不
+        # 抛错，_last_write_ok 永停在卡死前的 True、_failed 不 set、线程 is_alive 仍真 → is_healthy 恒误报健康、
+        # fail-closed 永不触发。这里记「最近一次任务推进时刻」，若有积压(pending>0)却连续该秒数无推进即判 hang。
+        self._stuck_seconds = stuck_seconds
+        # 最近一次任务处理完成(成功/失败均算推进)的单调时刻；仅写线程写、健康检查线程读(float 读写原子，不引锁)。
+        self._last_progress_monotonic = time.monotonic()
         # 最近一次写是否成功（仅写线程写、健康检查线程读；CPython bool 读写原子，不引锁以免污染热路径）。
         # 让 is_healthy 纳入「最近写成功」而非只看线程存活，否则磁盘满下写线程存活但持续丢数据仍误报健康。
         self._last_write_ok = True
@@ -138,7 +145,17 @@ class AsyncWriteQueue:
             and self._thread is not None
             and self._thread.is_alive()
             and self._last_write_ok
+            and not self._is_stuck()
         )
+
+    def _is_stuck(self) -> bool:
+        """写线程卡死判定（评审 F09）：启用看门狗(stuck_seconds>0) 且有积压(pending>0) 且连续 stuck_seconds
+        无任务推进 → 视为卡死。idle(无积压)时不判卡死(空闲无推进属正常)。"""
+        if self._stuck_seconds <= 0:
+            return False
+        if self._pending() <= 0:
+            return False
+        return (time.monotonic() - self._last_progress_monotonic) > self._stuck_seconds
 
     def set_on_failure(self, on_failure: Optional[Callable[[str], None]]) -> None:
         """装配后补设存储故障告警钩子（评审二轮 P0#2）。
@@ -157,8 +174,9 @@ class AsyncWriteQueue:
             self._failed.set()
             self._ready.set()
             return
-        # 建连成功：解除 start() 等待。
+        # 建连成功：解除 start() 等待；看门狗基线置为「刚就绪」时刻（避免建连耗时被算成无进展）。
         self._ready.set()
+        self._last_progress_monotonic = time.monotonic()
         while True:
             # 退出条件：收到 stop 且队列已清空（保证 drain，不丢未写任务）。
             if self._stop.is_set() and self._q.empty():
@@ -195,6 +213,9 @@ class AsyncWriteQueue:
                     self._invoke_on_failure("write_persist_failed")
             finally:
                 self._q.task_done()
+                # 看门狗推进时刻（评审 F09）：每处理完一个任务(无论成功/失败)即刷新，使 is_healthy 能据
+                # 「有积压却长时间无推进」识别写线程卡死；卡在 task()/commit() 内则到不了这里、时刻停滞→判 hang。
+                self._last_progress_monotonic = time.monotonic()
         try:
             if self._conn is not None:
                 self._conn.close()

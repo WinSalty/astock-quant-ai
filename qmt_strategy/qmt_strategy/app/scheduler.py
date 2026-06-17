@@ -187,14 +187,15 @@ class DailyScheduler:
                         "scheduler_watchlist_prefetch_error", trade_date=str(today), error=repr(exc)
                     )
             self._engine.prewarm(today)
-            # PREWARM 重试（评审二轮 P2#48 + 三轮 EXEC-sched-10）：原实现 prefetch 失败/空也一次性标 fired。
-            # 这里重试条件取「watchlist 拉到 0 行」或「连接未就绪」，且仍在开窗前(< 竞价 9:15)→【不标 fired】，
-            # 下轮重试再拉/再连；拉到 ≥1 行且连接就绪、或已到 9:15（避免无限重试错过窗口）才标 fired 定稿。
+            # PREWARM 重试（评审二轮 P2#48 + 三轮 EXEC-sched-10 + F11 修正）：原实现对「watchlist 拉到 0 行」一律
+            # 重试，但 prefetch 把【真失败】与【合法空名单(空仓日/报告未就绪)】都返回 0 → 空仓日每个 poll 周期反复
+            # 重连+重抓基线打满频控、永不定稿。F11 后 prefetch 返回 -1=真失败 / 0=合法空 / >0=成功；这里只在
+            #【真失败(saved<0) 或 连接未就绪】且仍在开窗前(< 竞价 9:15) 时重试——合法空名单(saved==0)直接定稿不重试。
             # clock 缺失（部分离线/单测注入 None）→ 不做时间窗判断，直接标 fired（向后兼容，不重试）。
             now_t = east8_time_of(self._clock.now_utc()) if self._clock is not None else None
             before_auction = now_t is not None and now_t < _AUCTION_START
             should_retry = before_auction and (
-                (self._watchlist_prefetch is not None and saved == 0) or (not connected)
+                (self._watchlist_prefetch is not None and saved < 0) or (not connected)
             )
             if not should_retry:
                 self._mark(today, Action.PREWARM)

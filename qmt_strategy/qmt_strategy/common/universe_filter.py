@@ -52,6 +52,22 @@ def is_st_name(name: Optional[str]) -> bool:
     return any(tok in str(name) for tok in ("退",))
 
 
+def is_st_stock(is_st_flag: Optional[bool], name: Optional[str]) -> bool:
+    """统一 ST 判定口径（禁买 ST 硬规则单一来源）：显式 is_st 为真 **或** 证券名含 ST/*ST/退 即判 ST。
+
+    业务意图：「本量化操作绝不允许买入任何 ST 股票」是硬规则，判定取**最严格**口径——
+    - 信号侧显式 is_st=True → ST（权威）；
+    - 即便 is_st 缺失(None)或显式 False，只要当日证券名命中 ST/退市标识，仍判 ST（name 是 point-in-time
+      实时事实，防信号侧 is_st 漂移/滞后漏判）。
+    供 loader universe / entry_router / order_executor 三层共用，保证三处口径一致、绝不互相矛盾。
+    边界：is_st_flag 仅在显式 True 时贡献正判定（False/None 不否决 name 判定），避免「信号说不是 ST」反而
+    覆盖掉真实 ST 名称——宁可多挡疑似 ST，绝不漏放真 ST 进买入路径。
+    """
+    if is_st_flag is True:
+        return True
+    return is_st_name(name)
+
+
 def is_tradable_universe(
     ts_code: Optional[str],
     name: Optional[str] = None,

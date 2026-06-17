@@ -73,6 +73,22 @@ def _to_date(v: Any) -> Optional[date]:
         return None
 
 
+def _to_bool(v: Any) -> Optional[bool]:
+    """JSON 布尔/数值/字符串 → Optional[bool]（禁买 ST 硬规则透传 is_st 用）。
+
+    口径：None/空串 → None（未下发，保留三态由下游回退 name 判定）；'true'/'1'/'yes' 系真，其余假。
+    保留 None 与 False 的区分：信号侧未给 is_st 时回退证券名识别 ST，不可把缺失当作显式 False。
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s == "":
+        return None
+    return s in {"1", "true", "yes", "y", "t", "on"}
+
+
 def _first_role(role_tags: Any) -> Optional[str]:
     """role_tags 列表 → 单一 role（取首个非空标签；空/非列表 → None）。
 
@@ -102,6 +118,9 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
         target_trade_date=target_trade_date,
         # 证券名称（评审二轮 P1#18/#63）：契约已含 name，透传供执行侧识别 ST/退市（主板 ST 涨停 5%）与 live 过滤。
         name=item.get("name"),
+        # 显式 ST 标志（禁买 ST 硬规则 + F08）：信号侧契约若下发 is_st 布尔则透传（保留 None 三态），
+        # 使执行侧「绝不买入 ST」三层闸拿到可靠显式信号，不再单点押在 name 文本上（name 偶发缺失会漏判）。
+        is_st=_to_bool(item.get("is_st")),
         leader_strength_score=_to_decimal(item.get("leader_strength_score")),
         role=_first_role(item.get("role_tags")),
         # 信号侧只给 strategy_family/setup（无单值 strategy），strategy 留空，路由按 family+setup。
@@ -143,15 +162,21 @@ class WatchlistPrefetcher:
         self._logger = logger
 
     def prefetch(self, today: date) -> int:
-        """拉取「今天买入」的当日清单并落本机库，返回写入行数。失败不抛、记 warn 返回 0（降级兜底）。
+        """拉取「今天买入」的当日清单并落本机库。
 
+        返回口径（评审 F11，区分真失败与合法空名单，供调度层决定是否重试）：
+        - **>0**：成功写入 N 行；
+        - **0**：合法空名单（信号侧 2xx 但当日无候选/报告未就绪）——**不重试**，避免空仓日 PREWARM 每个 poll
+          周期反复重连+重抓基线打满频控；
+        - **-1**：真失败（日历异常 / HTTP 非 2xx / 信封非对象 / 落库失败）——调度层据此重试。
+        失败一律不抛、不崩溃（loader 读空本机库自动降级「只守仓」）。
         流程：prev_open(today)=signal_T → GET ?date=signal_T → map items → save_watchlist。
         """
         try:
             signal_t = self._calendar.prev_open(today)
         except Exception as exc:  # noqa: BLE001 日历异常不致命，降级为「无名单」由 loader 兜底
             self._logger.warn("watchlist_prefetch_calendar_failed", today=str(today), reason=repr(exc))
-            return 0
+            return -1  # 真失败：调度层应重试（评审 F11）
 
         try:
             resp = self._client.get_json(WATCHLIST_PATH, {"date": signal_t.isoformat()})
@@ -162,7 +187,16 @@ class WatchlistPrefetcher:
                 today=str(today), signal_date=str(signal_t),
                 status=exc.status, reason=str(exc),
             )
-            return 0
+            return -1  # 真失败：调度层应重试（评审 F11）
+
+        # 信封类型校验（评审 F12）：2xx 但 body 非 JSON 对象（list/标量/None）时，下方 (resp).get(...) 会抛
+        # AttributeError 逸出。这里显式判失败留痕（非对象信封属契约异常，按真失败重试，不当合法空名单静默吞）。
+        if resp is not None and not isinstance(resp, dict):
+            self._logger.warn(
+                "watchlist_prefetch_bad_envelope",
+                today=str(today), signal_date=str(signal_t), resp_type=type(resp).__name__,
+            )
+            return -1
 
         # 供数降级感知（评审二轮 P2#58）：信号侧导出若有坏行被跳过(skipped_count>0)，可能漏掉可交易标的，
         # 这里强告警，使盘前装载不在"无声漏标的"下进行（运维可据此排查脏数据）。
@@ -205,7 +239,7 @@ class WatchlistPrefetcher:
             written = self._save_fn(rows)
         except Exception as exc:  # noqa: BLE001 落库失败 → 降级无名单，不抛
             self._logger.warn("watchlist_prefetch_save_failed", today=str(today), reason=repr(exc))
-            return 0
+            return -1  # 真失败：调度层应重试（评审 F11）
 
         self._logger.info(
             "watchlist_prefetch_done",

@@ -299,6 +299,8 @@ def selected_to_row(r: SelectedStockRow) -> Dict[str, Any]:
         "first_board_vol": r.first_board_vol, "float_mktcap": dec_text(r.float_mktcap),
         "strategy_family": r.strategy_family, "setup": r.setup,
         "name": r.name,  # 评审二轮 P1#18/#63：透传证券名称供执行侧 ST 识别/过滤
+        # 禁买 ST 硬规则 + F08：显式 ST 标志落 0/1，None(未下发)落 NULL，bool_int 保三态。
+        "is_st": bool_int(r.is_st),
     }
 
 
@@ -319,4 +321,6 @@ def row_to_selected(row: Any) -> SelectedStockRow:
         first_board_vol=_g(row, "first_board_vol"), float_mktcap=text_dec(_g(row, "float_mktcap")),
         strategy_family=_g(row, "strategy_family"), setup=_g(row, "setup"),
         name=_g(row, "name"),  # 评审二轮 P1#18/#63
+        # 禁买 ST 硬规则 + F08：NULL→None(回退 name 判定)，0/1→False/True，保三态无损 round-trip。
+        is_st=(None if (_st := _g(row, "is_st")) is None else int_bool(_st)),
     )

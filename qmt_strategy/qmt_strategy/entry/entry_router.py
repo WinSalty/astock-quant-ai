@@ -16,6 +16,7 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from ..common.universe_filter import is_st_stock
 from ..config.settings import Settings
 from ..contracts.enums import EntryAction, OrderPhase, TradeSide
 from ..contracts.models import AuctionSnapshot, EntryDecision, PlanRow
@@ -191,6 +192,12 @@ class EntryRouter:
           - tradable_flag 明确为 False（不可参与）→ skip。
         说明：「因子全面走弱」不在此全局闸门，已下放到 route() 中仅对强势追买族生效（评审 medium#5）。
         """
+        # —— 闸门 0：绝不买入 ST（禁买 ST 硬规则第 2 层，优先级最高）——
+        # 统一口径 is_st_stock：显式 is_st=True 或证券名含 ST/退即判 ST → 一律 SKIP，绝不产 BUY 决策。
+        # 与 loader universe（第 1 层）、order_executor.place（第 3 层）叠加，确保 ST 标的零买单。
+        if is_st_stock(plan.is_st, plan.name):
+            return True, f"SKIP闸门:ST/退市整理标的禁止买入(name={plan.name} is_st={plan.is_st})"
+
         # —— 闸门 1：情绪周期禁开仓（对接信号侧「退潮 / 冰点不得激进接力」）；缺失按空仓保守禁开。——
         block = set(self._settings.market_state_block or [])
         if plan.market_state is None:
@@ -300,6 +307,9 @@ class EntryRouter:
             plan_volume=plan_volume,
             order_phase=order_phase,
             factors_snapshot=self._snapshot_factors(snap),
+            # 禁买 ST 硬规则第 3 层供数：把统一口径 ST 判定算定并锚到决策上，供唯一下单点 place 做最终拒单兜底
+            # （即便决策因某路径未经本 _should_skip 而携 BUY，order_executor 仍据此拒发买单）。
+            is_st=is_st_stock(plan.is_st, plan.name),
         )
 
     def _snapshot_factors(self, snap: AuctionSnapshot) -> Dict[str, object]:

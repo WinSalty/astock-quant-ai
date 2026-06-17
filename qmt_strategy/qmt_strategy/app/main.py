@@ -179,6 +179,9 @@ class Engine:
             position_sink=self._apply_trade_to_position,
             # 卖单终态失败复位钩子（评审二轮 P1#31）：拒单/全撤零成交 → 持仓从 SELLING 复位回 HOLDING 重挂。
             sell_revert_sink=self._revert_sell_unit,
+            # 卖单部成后剩余委托终态失败的在途量精确回扣钩子（评审 F02/F16）：按本单未成量回扣 on_road，
+            # 否则可卖上限被永久下调 = 漏卖（部成单 filled>0 不走零成交复位路径）。
+            sell_on_road_release_sink=self._release_sell_on_road,
         )
 
         # —— 收盘 / 补采 + 对账 ——
@@ -187,7 +190,11 @@ class Engine:
             account_id=deps.account_id, trade_date_provider=self._today_provider,
         )
         self._reconcile = Reconcile(
-            self._ledger, deps.repository, deps.logger, deps.calendar, account_id=deps.account_id
+            self._ledger, deps.repository, deps.logger, deps.calendar, account_id=deps.account_id,
+            # 资产对账容差（评审 F01）：费用一致的相对容差 tolerance=max(abs_floor, 成交额×rel_rate)，
+            # 避免高换手/大账户日因费用噪声误报 asset_discrepancy。
+            asset_abs_floor=s.reconcile_asset_abs_floor,
+            asset_rel_rate=s.reconcile_asset_rel_rate,
         )
 
         # —— 竞价轮询（plan_provider 取当日可交易名单的计划行；router_sink 接决策 + 下单 gating）——
@@ -571,6 +578,15 @@ class Engine:
         if self._reconcile_blocked:
             self._logger.error("engine_open_blocked_reconcile_unconfirmed", ts_code=ts_code)
             return True
+        # —— 账户回撤闸缺基线 fail-closed（评审 F15）：运维显式启用回撤保护(account_drawdown_limit 非 None)，
+        # 但盘前日初权益基线抓取失败(_day_open_equity 为 None) → 整日算不出回撤、回撤熔断形同虚设(fail-open)。
+        # 与下方「有基线但当前查询失败 → fail-closed」取向对齐：配了回撤闸却无基线时同样禁开新仓(不冻结卖出)，
+        # 杜绝「一次盘前抖动让配置好的账户级止损整日静默失效」。未配回撤闸则不因缺基线误禁(该闸本就不工作)。
+        if self._settings.account_drawdown_limit is not None and (
+            self._day_open_equity is None or self._day_open_equity <= 0
+        ):
+            self._logger.error("engine_open_blocked_drawdown_no_baseline", ts_code=ts_code)
+            return True
         # —— 账户回撤 fail-closed（评审二轮 P2#70）：有日初基线但当前资产查询失败 → 无法核验回撤 →
         # 禁开新仓（不冻结卖出）。原实现 _account_drawdown() 失败返 None → gate 当"无回撤"放行 = 账户级
         # 止损闸 fail-open。这里在有基线时把"算不出回撤"显式当作"不可放行开仓"。
@@ -621,16 +637,23 @@ class Engine:
             self._strength_weights = {}
             return
         present = [p.leader_strength_score for p in plans if p.leader_strength_score is not None]
-        floor_score = min(present) if present else Decimal("0")
+        # 负分防御（评审 F19）：floor 钳到 ≥0，避免负分混入时把「缺强度票份额基数」拖成负值。
+        floor_score = max(Decimal("0"), min(present)) if present else Decimal("0")
 
         def _rank_key(p: PlanRow) -> Decimal:
             """排序键：真实强度用本身；缺强度置极低（-1，低于所有真实强度）→ 不挤占 top-N 名额优选。"""
             return p.leader_strength_score if p.leader_strength_score is not None else Decimal("-1")
 
         def _share_basis(p: PlanRow) -> Decimal:
-            """份额基数：真实强度用本身；缺强度用 floor×保守系数（远低于最弱真实票，不等权稀释强票）。"""
+            """份额基数：真实强度用本身；缺强度用 floor×保守系数（远低于最弱真实票，不等权稀释强票）。
+
+            负分防御（评审 F19）：leader_strength_score 契约为 0-100，但执行侧对透传值不做范围校验；若信号侧
+            打分回归/数据漂移产出负分混入 top-N 且与正分和仍>0，则 w=s/total 会对正分票得 >1 权重（绕过 ceiling×w
+            份额上限、单票吃光 ceiling）、对负分票得负权重，破坏 Σw=1 与份额隔离。这里把份额基数钳到 ≥0
+            （负分等价 0 份额=不分配），是对契约外异常输入的廉价兜底，保证 basis 非负、单票 w∈[0,1]。
+            """
             if p.leader_strength_score is not None:
-                return p.leader_strength_score
+                return p.leader_strength_score if p.leader_strength_score > 0 else Decimal("0")
             return floor_score * _MISSING_STRENGTH_FACTOR
 
         ranked = sorted(plans, key=_rank_key, reverse=True)
@@ -638,15 +661,26 @@ class Engine:
         top = ranked[:cap] if (cap is not None and cap > 0) else ranked
         basis: Dict[str, Decimal] = {p.ts_code: _share_basis(p) for p in top}
         total = sum(basis.values(), Decimal("0"))
+        # top 内是否存在【真实强度分】（区分两种 total<=0 语义，review F19 修正）。
+        top_has_real_strength = any(p.leader_strength_score is not None for p in top)
         weights: Dict[str, Decimal] = {}
         if total > 0:
             for code, s in basis.items():
                 weights[code] = s / total
-        else:
-            # 全部缺强度且 floor=0 → 退化等权 1/N（与既有口径一致）。
+        elif not top_has_real_strength:
+            # top【全部缺强度】(分数皆 None) → 无可比强度，合法退化等权 1/N（与既有口径一致）。
             eq = Decimal("1") / Decimal(len(basis))
             for code in basis:
                 weights[code] = eq
+        else:
+            # top 存在真实分但份额基数总和<=0（即真实分全为非正、被 F19 钳为 0）→【不分配】：weights 留空，
+            # sizer 据 w is None 返 0、不买这些弱/坏票（修 review：原退化等权会把被钳 0 份额的非正分票又买回来，
+            # 与 F19「负分=0份额=不分配」相悖）。强票全判弱→名额空置是正确的（策略对这些票收手）。
+            self._logger.warn(
+                "engine_strength_all_non_positive_no_alloc",
+                count=len(basis),
+                note="top-N 候选真实强度分全为非正(契约外异常输入)，按 F19 不分配、不开新仓",
+            )
         # 注意（复审 EXEC-entry-01）：beyond-N 票【刻意不进 weights】——见上方 top-N 优先制说明，避免弱票按触发
         # 先后抢占强龙头名额造成优先级反转。名额收口仍在 order_executor.place 的 committed 计数闸（动态）。
         self._strength_weights = weights
@@ -678,10 +712,15 @@ class Engine:
             return 0
         cash = Decimal(str(cash))
 
-        # 可分配总预算上限：日初权益×目标仓位比（无基线退化为当前现金），再与 max_total_exposure 取小。
-        ceiling = cash
+        # 可分配总预算上限：日初权益×目标仓位比，再与 max_total_exposure 取小。
+        # 基线缺失退化口径修正（评审 F14）：原实现 _day_open_equity 缺失(盘前资产查询失败/无 OPEN 快照)时
+        # ceiling 退化为【全额现金】，target_position_ratio 被静默忽略——配 ratio=0.8 留现金时实际可满仓部署，
+        # 留现金/降仓的风控意图失效。这里基线缺失时 ceiling 退化为 cash×ratio（让 ratio 始终生效），与上方
+        # ratio<=0 的空跑保护口径一致；有基线则用 日初权益×ratio。
         if self._day_open_equity is not None and self._day_open_equity > 0:
             ceiling = self._day_open_equity * self._settings.target_position_ratio
+        else:
+            ceiling = cash * self._settings.target_position_ratio
         if self._settings.max_total_exposure is not None:
             ceiling = min(ceiling, Decimal(str(self._settings.max_total_exposure)))
 
@@ -695,10 +734,27 @@ class Engine:
         if w is None:
             return 0
         budget = min(budget, ceiling * w)
-        # 单笔 / 单票金额上限收紧。
-        for cap in (self._settings.per_order_max_amount, self._settings.max_position_per_stock):
-            if cap is not None and Decimal(str(cap)) < budget:
-                budget = Decimal(str(cap))
+        # 单笔金额上限收紧（单笔预算硬上限，不减持仓）。
+        if self._settings.per_order_max_amount is not None:
+            cap_order = Decimal(str(self._settings.per_order_max_amount))
+            if cap_order < budget:
+                budget = cap_order
+        # 单票金额上限【净额】收紧（评审 F03）：原主链只对 max_position_per_stock 做裸值钳制、不减已有持仓/在途，
+        # 跨日复买同一连板龙头会累计突破单票上限（如昨持 25万 + 今再买近 30万 ≈ 55万 ≈ 2×cap，风控净额闸失效）。
+        # 这里与离线 _plan_volume 同走 exposure_for_code 单计敞口：effective_cap = cap − (持仓市值 + 未成在途计划额)，
+        # <=0 则该票已达上限不再加仓。
+        if self._settings.max_position_per_stock is not None:
+            cap_stock = Decimal(str(self._settings.max_position_per_stock))
+            exposure = self._order.exposure_for_code(self._today_provider(), plan.ts_code)
+            effective_cap = cap_stock - exposure
+            if effective_cap <= 0:
+                self._logger.info(
+                    "engine_sizer_per_stock_cap_reached",
+                    ts_code=plan.ts_code, cap=str(cap_stock), exposure=str(exposure),
+                )
+                return 0
+            if effective_cap < budget:
+                budget = effective_cap
         if budget <= 0:
             return 0
         raw_shares = (budget / limit_price).to_integral_value(rounding=ROUND_DOWN)
@@ -767,6 +823,19 @@ class Engine:
         # 原子复位（评审三轮 EXEC-position-01）：不再 get_unit 拿 live 引用在锁外改，改走 revert_selling_by_code。
         self._position.revert_selling_by_code(
             self._account_id, ts_code, reason="sell_order_terminal_failed"
+        )
+
+    def _release_sell_on_road(self, ts_code: str, unfilled_qty: int, order_id: Optional[int] = None) -> None:
+        """卖单终态失败 → 按本单未成量精确回扣持仓在途冻结量（评审 F02/F16 + review 幂等，由 callbacks 调用）。
+
+        业务意图：卖单 filled>0 部成或零成交终态失败时，其未成在途量若不回扣，sellable_remaining =
+        can_use_volume - on_road_sell_volume 会被永久下调，导致该单元剩余可卖量挂不出卖单（漏卖、止损失效）。
+        这里把本单未成量从 on_road 精确回扣（不动其它在途单冻结量），并传 order_id 让 release 按单去重——
+        同一卖单终态回调重复触发（双面回报/重投）也只回扣一次，绝不误清兄弟在途单。无该单元则忽略。
+        """
+        self._position.release_on_road_by_code(
+            self._account_id, ts_code, int(unfilled_qty),
+            order_id=order_id, reason="sell_terminal_failed",
         )
 
     # ------------------------------------------------------------------
@@ -1163,14 +1232,22 @@ class Engine:
             except Exception as exc:  # noqa: BLE001 补采失败不拖垮收盘流程，但强告警；保留补采前 report
                 self._logger.error("engine_reconcile_backfill_failed", trade_date=str(td), error=str(exc))
         # 2) （补采后仍残留的）真异常 → 置持久"对账未通过"标记，阻断次日开仓直至人工清除。
-        #    只对【需人工介入的真异常】阻断（评审复审 P1-1）：漏单 missing_report、手工单/串账户 manual_order、
-        #    补采后仍残留的成交量不勾稽 trade_discrepancies、资产偏差 asset_discrepancy；而 order_failed（台账已
-        #    ERROR、本就无回报）是良性已知态，不触发阻断，避免高频误禁开。
+        #    只对【需人工介入的真异常】阻断（评审复审 P1-1 + F01 修正）：漏单 missing_report、手工单/串账户
+        #    manual_order、补采后仍残留的成交量不勾稽 trade_discrepancies。order_failed（台账已 ERROR、本就无回报）
+        #    是良性已知态不阻断。
+        #    资产偏差 asset_discrepancy【降为仅告警、不计入 blocking】（评审 F01）：资产现金对账有费用/分红/利息/
+        #    冻结时点等大量良性噪声，即便已改相对容差仍不宜据其自动封死核心「开新仓」动作；改为强告警留待人工复核，
+        #    避免一次资产对账偏差误把打板策略次日整日封盘。漏单/手工单/成交量不勾稽这三类才是串账户/漏采的硬信号。
         blocking = (
             any(d.kind in ("missing_report", "manual_order") for d in report.order_discrepancies)
             or bool(report.trade_discrepancies)
-            or report.asset_discrepancy is not None
         )
+        if report.asset_discrepancy is not None:
+            self._logger.error(
+                "engine_reconcile_asset_discrepancy_warn_only",
+                trade_date=str(td), detail=report.asset_discrepancy.detail,
+                note="资产对账偏差仅告警不阻断开仓(评审 F01)，请人工复核资金流水/费用/分红，必要时手动置对账阻断标志",
+            )
         if blocking:
             self._set_reconcile_block(
                 td, len(report.order_discrepancies), len(report.trade_discrepancies)

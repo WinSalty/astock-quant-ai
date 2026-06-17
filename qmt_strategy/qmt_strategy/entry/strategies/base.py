@@ -107,9 +107,12 @@ def resolve_thresholds(plan: PlanRow, snap: AuctionSnapshot, settings: Settings)
     """统一解析竞价三档阈值（§4.2 阈值对接，不在执行侧臆造）。
 
     优先级：settings 显式配置 > plan.reasonable_open_low/high 折算回退 > None（未知，下游按缺失处理）。
-    - lowbuy_low/high 缺省回退：reasonable_open_low/high 折算的百分比（信号侧合理高开区间即低吸档）。
-    - overheat_pct 缺省回退：reasonable_open_high 折算的百分比（高开超出合理上沿即追高警惕）。
-    - abandon_pct 缺省回退：reasonable_open_low 折算的百分比（弱于合理下沿即弱开放弃）。
+    - abandon_pct 缺省回退：reasonable_open_low 折算的百分比（弱于合理下沿即弱开放弃；供强势追买族用）。
+    - overheat_pct 缺省回退：reasonable_open_high 折算的百分比（高开超出合理上沿即追高警惕；供强势追买族用）。
+    - lowbuy_low/high：**缺省不回退**（评审 F18）。原实现把信号侧「合理高开区间」(reasonable_open_low/high，
+      均高于昨收) 折算成低吸档 → 低吸档被抬成 [+2%,+8%] 高开区间：真低吸点(平开/微跌 open_pct≤0)被判「跌破支撑」
+      弃、反在 +2%~+8% 高开位才买，低吸族买卖方向相反。低吸档与高开区间语义相反、绝不可互相套用——缺显式配置时
+      留 None，由 dip_buy_ma fail-closed（不臆造低吸档、宁可不开仓）。
     """
     pre_close = _pre_close_of(plan, snap)
     low_pct = _abs_price_to_pct(plan.reasonable_open_low, pre_close)
@@ -117,10 +120,9 @@ def resolve_thresholds(plan: PlanRow, snap: AuctionSnapshot, settings: Settings)
     return AuctionThresholds(
         # 弱开放弃线：配置优先，否则回退合理下沿折算（弱于合理下沿即弱开）。
         abandon_pct=settings.auction_abandon_pct if settings.auction_abandon_pct is not None else low_pct,
-        # 低吸档下沿。
-        lowbuy_low=settings.auction_lowbuy_pct_low if settings.auction_lowbuy_pct_low is not None else low_pct,
-        # 低吸档上沿。
-        lowbuy_high=settings.auction_lowbuy_pct_high if settings.auction_lowbuy_pct_high is not None else high_pct,
+        # 低吸档下沿/上沿：仅取显式配置，缺省 None（绝不回退高开区间，见上方 F18 说明）。
+        lowbuy_low=settings.auction_lowbuy_pct_low,
+        lowbuy_high=settings.auction_lowbuy_pct_high,
         # 高开超线：配置优先，否则回退合理上沿折算。
         overheat_pct=settings.auction_overheat_pct if settings.auction_overheat_pct is not None else high_pct,
     )

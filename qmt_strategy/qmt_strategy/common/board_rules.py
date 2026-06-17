@@ -13,7 +13,7 @@ from typing import Optional, Tuple
 from ..contracts.enums import Board, PriceSource
 from ..contracts.models import PriceBudget, SelectedStockRow
 from .identity import board_of
-from .universe_filter import is_st_name
+from .universe_filter import is_st_stock
 
 _CENT = Decimal("0.01")
 
@@ -65,12 +65,11 @@ def budget_prices(row: SelectedStockRow) -> PriceBudget:
     # universe_filter 剔除。eff_board 仅用于「信号侧已给权威价位」时的 board 记录，绝不再用它对
     # 这类标的兜底现算涨停价（评审 P0-F1：默认主板 10% 会对 20%/30% 板算错、对 ST 算错）。
     eff_board = board if board is not None else Board.MAIN
-    # ST/退市整理判定（评审二轮 P1#18 + 三轮 F3）：优先采用信号侧显式 is_st 布尔，缺该标志时回退证券名称识别。
-    # 主板 ST 涨停 5%，避免按 10% 算出超法定涨停价的废单 / 对真实 5% 顶板漏买。契约补 is_st 后不再单点押在 name。
-    # 注：不把「name 缺失」默认当 ST——主板打板若对非 ST 票按 5% 算限价会挂在 +5% 远低于真实 +10% 涨停板而漏买，
-    # 比对真实 ST 偶发 10% 废单危害更大；故 name 缺失时沿用 is_st_name(None)=False(非 ST/10%)，靠显式 is_st 收口。
-    is_st_explicit = getattr(row, "is_st", None)
-    is_st = bool(is_st_explicit) if is_st_explicit is not None else is_st_name(row.name)
+    # ST/退市整理判定（评审二轮 P1#18 + 三轮 F3 + 禁买 ST 硬规则）：统一走 is_st_stock——显式 is_st=True 或
+    # 证券名命中 ST/退即判 ST。主板 ST 涨停 5%，避免按 10% 算出超法定涨停价的废单 / 对真实 5% 顶板漏买。
+    # 注：name 缺失且 is_st 非 True 时 is_st_stock 返 False（非 ST/10%）——主板非 ST 票若误按 5% 算限价会挂在
+    # +5% 远低于真实 +10% 涨停板而漏买，故不把缺失当 ST；真 ST 由显式 is_st 或当日 name 收口（二者均接线后可靠）。
+    is_st = is_st_stock(getattr(row, "is_st", None), row.name)
 
     has_signal_limit = row.limit_up_price is not None
     has_signal_range = (
