@@ -88,12 +88,12 @@
 | 执行侧本地化（单进程+SQLite 异步持久化） | ✅ 已落地；评审修复发单前同步落盘等幂等缺口（见状态概要） |
 | 调度器 + xtquant 适配器模板 + 真实入口骨架 | ✅ 已落地（待目标机填 `TODO(实测)`）；交易日历已改 fail-closed（部署须知见 [待办 §B](待办与上线验证清单.md)） |
 | 信号侧 HTTP 双接口 + `qmt_*` 表/迁移 + 客户端 | ✅ 已落地；评审补回流信封一致校验、watchlist 竞价两因子供数（见状态概要） |
-| 信号侧生产部署 + 内网 token + 复盘看板 | ✅ 已上线（2026-06-14）；执行侧 Windows 代码/依赖/配置已 bring-up，仅差 miniQMT（见 [待办 §G](待办与上线验证清单.md)） |
+| 信号侧生产部署 + 内网 token + 复盘看板 | ✅ 已上线（2026-06-14 首部署；2026-06-18 增量同步：信号侧代码/迁移=最新(0057)、**ingest 写 token 已补配（两接口全开）**；执行侧 Windows 已 ff 到 main 最新 `21efdcb`+**风控两闸已配**，仍仅差 miniQMT，见 [待办 §G](待办与上线验证清单.md)） |
 | 实盘对接（miniQMT/xtquant + 调度任务计划 + 实测） | ⬜ 待 QMT 客户端到位 |
 
 代码仓库：执行侧 [github.com/WinSalty/astock-quant-ai](https://github.com/WinSalty/astock-quant-ai)。
 
-> ⚠️ **上线前唯一代码硬阻塞：盘中卖出链未接线（见上表「盘中卖出」行）——接线前买入即裸奔、无止损出口，严禁接实盘。** 部署侧务必先看 [`待办 §B 上线部署步骤`](待办与上线验证清单.md)——含信号侧跑迁移、执行侧提供交易日清单文件、以及信号侧必须**单独**配 `QMT_INGEST_INTERNAL_TOKEN`（否则 `/api/internal/qmt/ingest` 恒 503、盘后回流静默断流）；评审与修复全貌见 [评审与修复状态概要](评审与修复状态概要.md)。
+> ⚠️ **上线前红线（已从「代码缺失」收口为「生产门控」）：盘中卖出链接线代码已落地（阶段0-C，见上表「盘中卖出」行），但生产门控 `QMT_SELL_PASS_LIVE` 默认关、盘中不自动卖；开门控前（须 T1.2 跨帧数值保真 + 真机实测 + 配单票浮亏止损 `QMT_STOCK_FLOAT_LOSS_LIMIT`）买入即裸奔无止损出口，严禁放量实盘。** 部署侧务必先看 [`待办 §B 上线部署步骤`](待办与上线验证清单.md)——含信号侧跑迁移、执行侧提供交易日清单文件、以及信号侧必须**单独**配 `QMT_INGEST_INTERNAL_TOKEN`（**绝不回落** watchlist token；否则 `/api/internal/qmt/ingest` 恒 503、盘后回流静默断流；**2026-06-18 生产已配**）；评审与修复全貌见 [评审与修复状态概要](评审与修复状态概要.md)。
 
 ---
 
@@ -219,7 +219,7 @@
 | `QMT_INGEST_INTERNAL_TOKEN` / `…_FILE` | 盘后 `POST /api/internal/qmt/ingest` 的 `X-Internal-Token` | 无；**绝不回落读 token（评审三轮 SIG-QMT-06），必须单独配**，否则 `/ingest` 恒 503、回流静默断流 |
 | `WATCHLIST_EXPORT_IP_WHITELIST` / `QMT_INGEST_IP_WHITELIST` | 两接口来源 IP 白名单（逗号分隔，与 token 叠加） | 空=不启用（**生产建议配置或反代层加白名单**） |
 
-> ⚠️ `backend/.env.example` 中「QMT 回流 token 未单独配置则回落到 watchlist 导出 token」的注释**已过期**——代码（`resolve_qmt_ingest_internal_token`，SIG-QMT-06）已改为**绝不回落**：读/写 token 必须分别配置，否则写接口 503。
+> ⚠️ `QMT_INGEST_INTERNAL_TOKEN(_FILE)` **绝不回落** watchlist 导出 token（`resolve_qmt_ingest_internal_token`，SIG-QMT-06）：读/写 token 必须**分别配置**，否则写接口 503。`backend/.env.example` 注释已同步纠正（2026-06-18）；生产已配（指向与 watchlist 同一 token 文件复用同值，仍是独立配置项）。
 
 **行情 / LLM（选股 pipeline 依赖）**
 
