@@ -504,3 +504,20 @@ def test_missing_strength_not_preempt_top_n():
     # top-1 满额给真实票（w=1.0）；缺强度票排序键极低落入 beyond-N → 不进权重表 → 返 0（不抢占强票名额）。
     assert v_real > 0
     assert v_missing == 0
+
+
+def test_on_reconnect_backfill_reconciles_stuck_selling_after_rebuild():
+    """评审 doc/21 P1：重连补采后在 rebuild 之后补调 _reconcile_stuck_selling，复位断线期卡死的 SELLING 单元(防整日漏卖)。
+
+    原实现仅 prewarm 调用该对账、重连路径不调 → 断线期挂出的卖单被券商撤/废且回执丢失时,单元跨重连仍卡
+    SELLING、sellable_remaining=0,止损/破位/炸板全部失效,要等次日盘前才解。本用例验证重连路径已补该调用且在 rebuild 之后。
+    """
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    order = []
+    eng._rebuild_positions_from_broker = lambda today: order.append(("rebuild", today))
+    eng._reconcile_stuck_selling = lambda today: order.append(("reconcile", today))
+    eng.on_reconnect_backfill()
+    assert [x[0] for x in order] == ["rebuild", "reconcile"]   # 补调了卡死 SELLING 对账，且在 rebuild 之后
+    assert order[0][1] == order[1][1]                          # 同一交易日

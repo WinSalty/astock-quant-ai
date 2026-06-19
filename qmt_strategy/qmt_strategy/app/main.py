@@ -1284,10 +1284,19 @@ class Engine:
           永久冻结（连接已就绪、卖出能力须保留，持仓由下次 prewarm/收盘快照重新校准）。
         """
         try:
+            today = self._today_provider()
             self._snapshot.run_backfill()
             # 补采后用 QMT 权威持仓重建持仓状态机（评审二轮 P1#30）：断线期间发生的买入成交只被 query_*
             # 补采落库、不回写持仓状态机 → 会漏卖；这里据 QMT 当前持仓重建/校准单元，使其进入卖出决策。
-            self._rebuild_positions_from_broker(self._today_provider())
+            self._rebuild_positions_from_broker(today)
+            # 重连后补对账卡死 SELLING 单元（评审 doc/21 P1）：断线期间挂出的卖单若被券商撤/废、而撤单回执在
+            # 断线期丢失（run_backfill 仅落库不走 sell_revert_sink），则该单元跨重连仍卡 SELLING；rebuild 只
+            # 校准 volume/can_use、不复位 SELLING/不清 on_road → sellable_remaining=can_use-on_road 可为 0 →
+            # _evaluate_and_sell_unit 对 SELLING 一律跳过 → 该票当日永久漏卖、止损/破位/炸板失效。这里复用
+            # 盘前同口径主动 query 券商委托终态：零成交终态(CANCELLED/REJECTED/EXPIRED) → revert_selling 复位
+            # HOLDING + 清 on_road 重挂；已成/部成/仍在途不动（交回报推进）。原实现仅 prewarm 调用此对账、重连
+            # 路径不调 → 卡死要等次日盘前才解，是 P1 漏卖根因。
+            self._reconcile_stuck_selling(today)
         except Exception as exc:  # noqa: BLE001 补采失败仅告警：连接已就绪，不再据此永久冻结卖出
             self._logger.error("engine_reconnect_backfill_failed", error=str(exc))
 
