@@ -33,3 +33,17 @@ def test_weekday_calendar_skips_weekend():
     cal = WeekdayTradeCalendar()
     assert cal.next_open(date(2026, 6, 12)) == date(2026, 6, 15)
     assert cal.is_open(date(2026, 6, 13)) is False
+
+
+def test_static_trading_days_left():
+    """评审 doc/21 C1：trading_days_left 返回严格晚于 d 的交易日数，供盘前覆盖度预警。"""
+    cal = StaticTradeCalendar([date(2026, 6, 11), date(2026, 6, 12), date(2026, 6, 15)])
+    assert cal.trading_days_left(date(2026, 6, 11)) == 2   # 12、15
+    assert cal.trading_days_left(date(2026, 6, 12)) == 1   # 仅 15
+    assert cal.trading_days_left(date(2026, 6, 15)) == 0   # 末日，此后 next_open 越界
+    assert cal.trading_days_left(date(2026, 6, 16)) == 0
+
+
+def test_weekday_trading_days_left_is_large():
+    """周末近似日历无末日边界 → trading_days_left 返回大数（覆盖度充足，不触发预警）。"""
+    assert WeekdayTradeCalendar().trading_days_left(date(2026, 6, 12)) >= 1000

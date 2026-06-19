@@ -377,6 +377,21 @@ class Engine:
         # - AuctionPoller._history：清累积帧，否则跨日无界增长 + tick_seq 失真（E3）。
         self._entry.reset_day()
         self._poller.reset_history()
+        # 交易日历覆盖度预警（评审 doc/21 C1）：日历末日距 today 不足若干交易日 → 强告警，提示运维立即外延
+        # a_trade_calendar 导出文件。耗尽后 next_open 走 _safe_next_open 的 fail-closed 占位（不丢仓不崩溃，但
+        # 占位可卖日不精确）。duck-typing：fake 日历无 trading_days_left 则跳过（不影响离线/单测）。
+        _days_left_fn = getattr(self._calendar, "trading_days_left", None)
+        if callable(_days_left_fn):
+            try:
+                _days_left = _days_left_fn(today)
+                if _days_left < 5:  # 少于 5 个交易日运行余量即告警（约一周）
+                    self._logger.error(
+                        "engine_calendar_coverage_low",
+                        today=str(today), trading_days_left=_days_left,
+                        note="交易日历剩余交易日不足,请立即外延 a_trade_calendar 导出文件,避免末日越界走占位",
+                    )
+            except Exception:  # noqa: BLE001 覆盖度预警不得阻断盘前装载
+                pass
         # 对账阻断标记（评审二轮 P1#9）：上一交易日对账未通过且未人工清除 → 今日只守仓不开新仓。
         self._reconcile_blocked = self._read_reconcile_block()
         if self._reconcile_blocked:

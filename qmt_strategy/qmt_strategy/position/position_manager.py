@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import copy
 import threading
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -68,6 +68,52 @@ class PositionManager:
         self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
+    # 交易日历越界 fail-closed 兜底（评审 doc/21 C1）
+    # ------------------------------------------------------------------
+    def _fallback_weekday(self, base: date, *, forward: bool) -> date:
+        """日历越界时的保守占位：base 的下/上一个【非周末自然日】（仅占位、非权威交易日）。"""
+        step = 1 if forward else -1
+        d = base + timedelta(days=step)
+        while d.weekday() >= 5:  # 跳过周六(5)/周日(6)
+            d += timedelta(days=step)
+        return d
+
+    def _safe_next_open(self, day: date) -> date:
+        """取下一交易日，日历末日越界时 fail-closed 兜底（评审 doc/21 C1）。
+
+        背景：StaticTradeCalendar.next_open 在 day>=已知最后一个交易日时抛 ValueError（运维未及时外延日历）。
+        若让它冒泡：买入回写(mark_position_on_fill)被上层宽 except 吞掉 → 已成交持仓被【静默丢出状态机】、隔夜
+        裸奔无止损；券商持仓重建(rebuild)循环无 per-item 兜底 → 整批重建失败穿透 prewarm → 当日 RUN_AUCTION/
+        INTRADAY 被门控掐断、全仓卖出管理瘫痪。这里把"日历耗尽"从 fail-open(丢仓/崩溃)改为 fail-closed：强告警
+        提示立即外延 a_trade_calendar，并退化为"下一非周末自然日"占位 earliest_sellable_date，【保证持仓仍进
+        状态机被管理】。真实 T+1 量闸由券商 can_use_volume 在后续 apply_position_snapshot/rebuild 中权威兜底，
+        故占位日不精确不致 T+1 违规（卖不出券商未释放的当日买入量）。
+        """
+        try:
+            return self._calendar.next_open(day)
+        except Exception as exc:  # noqa: BLE001 日历越界绝不丢仓/崩溃，fail-closed 占位
+            fallback = self._fallback_weekday(day, forward=True)
+            self._logger.error(
+                "position_calendar_next_open_exhausted_fallback",
+                day=str(day), fallback=str(fallback), error=str(exc),
+                note="交易日历已耗尽(未及时外延),持仓仍以保守占位可卖日进状态机;请立即外延 a_trade_calendar 导出文件",
+            )
+            return fallback
+
+    def _safe_prev_open(self, day: date) -> date:
+        """取上一交易日，日历越界（最早端）时 fail-closed 兜底（评审 doc/21 C1，与 _safe_next_open 同口径）。"""
+        try:
+            return self._calendar.prev_open(day)
+        except Exception as exc:  # noqa: BLE001 日历越界绝不丢仓/崩溃，fail-closed 占位
+            fallback = self._fallback_weekday(day, forward=False)
+            self._logger.error(
+                "position_calendar_prev_open_exhausted_fallback",
+                day=str(day), fallback=str(fallback), error=str(exc),
+                note="交易日历最早端越界,buy_date 以保守占位进状态机;请补齐 a_trade_calendar 导出文件",
+            )
+            return fallback
+
+    # ------------------------------------------------------------------
     # 买入成交回报落地（§5.6 mark_position_on_fill）
     # ------------------------------------------------------------------
     def mark_position_on_fill(
@@ -112,7 +158,9 @@ class PositionManager:
         # —— 最早可卖日：经交易日历取买入日 B 的下一交易日（禁自然日 +1）——
         # 日历计算无共享状态，放在锁外；后续对单元字典/字段的读-改-写整体纳入 self._lock（评审三轮
         # EXEC-position-01：杜绝回调线程与调度线程对同一 unit 的脏读/丢更新）。
-        earliest_sellable_date = self._calendar.next_open(today)
+        # 日历末日越界 fail-closed（评审 doc/21 C1）：经 _safe_next_open 兜底，绝不让 next_open 抛 ValueError
+        # 冒泡被上层 except 吞掉而把这笔已成交买入静默丢出状态机（隔夜裸奔无止损）。
+        earliest_sellable_date = self._safe_next_open(today)
 
         key = (account_id, ts_code)
         # 全段读-改-写纳入 RLock 临界区（可重入，内部互调不自锁）。
@@ -621,74 +669,86 @@ class PositionManager:
         # 调度线程的 refresh_state/卖出巡检对同一 unit 字段读改互斥。
         with self._lock:
           for rec in records or []:
-            ts_code = getattr(rec, "ts_code", None)
-            if ts_code is None:
-                continue
-            vol_raw = getattr(rec, "volume", None)
-            volume = int(vol_raw) if vol_raw is not None else 0
-            cu_raw = getattr(rec, "can_use_volume", None)
-            can_use = int(cu_raw) if cu_raw is not None else 0
-            if volume <= 0:
-                continue  # 券商无持仓量：不建空单元
-            avg_raw = getattr(rec, "avg_price", None)
-            if avg_raw is None:
-                avg_raw = getattr(rec, "avg_cost", None)
-            avg_cost = Decimal(str(avg_raw)) if avg_raw is not None else Decimal("0")
+            # 单条记录 per-item 兜底（评审 doc/21 C1）：任一条记录处理异常（如脏 volume/avg_price、日历越界等）
+            # 只跳过该条 + 强告警，绝不抛出中断【整批】重建——否则一条坏记录会让全部隔夜持仓重建失败、穿透
+            # prewarm 致当日调度瘫痪（全仓卖出管理失效）。日历越界已由 _safe_next/prev_open 内部 fail-closed 兜底。
+            try:
+                ts_code = getattr(rec, "ts_code", None)
+                if ts_code is None:
+                    continue
+                vol_raw = getattr(rec, "volume", None)
+                volume = int(vol_raw) if vol_raw is not None else 0
+                cu_raw = getattr(rec, "can_use_volume", None)
+                can_use = int(cu_raw) if cu_raw is not None else 0
+                if volume <= 0:
+                    continue  # 券商无持仓量：不建空单元
+                avg_raw = getattr(rec, "avg_price", None)
+                if avg_raw is None:
+                    avg_raw = getattr(rec, "avg_cost", None)
+                avg_cost = Decimal(str(avg_raw)) if avg_raw is not None else Decimal("0")
 
-            # account_id 取记录自带（多账户隔离）；normalize_position 已填，缺失则该记录无法定位单元键。
-            rec_account_id = getattr(rec, "account_id", None)
-            if rec_account_id is None:
-                continue
-            key = (rec_account_id, ts_code)
-            unit = self._units.get(key)
+                # account_id 取记录自带（多账户隔离）；normalize_position 已填，缺失则该记录无法定位单元键。
+                rec_account_id = getattr(rec, "account_id", None)
+                if rec_account_id is None:
+                    continue
+                key = (rec_account_id, ts_code)
+                unit = self._units.get(key)
 
-            if unit is not None and unit.state != PositionState.SOLD:
-                # 已有活跃单元：以 QMT 权威校准 volume/can_use_volume（保留状态机/成本/buy_date）。
-                unit.volume = volume
-                unit.can_use_volume = can_use
-                unit.volume_authoritative = True  # 评审三轮 EXEC-position-07：校准后量权威，迟到回调只去重不累加
+                if unit is not None and unit.state != PositionState.SOLD:
+                    # 已有活跃单元：以 QMT 权威校准 volume/can_use_volume（保留状态机/成本/buy_date）。
+                    unit.volume = volume
+                    unit.can_use_volume = can_use
+                    unit.volume_authoritative = True  # 评审三轮 EXEC-position-07：校准后量权威，迟到回调只去重不累加
+                    touched += 1
+                    continue
+
+                if not create_missing and (unit is None or unit.state == PositionState.SOLD):
+                    continue
+
+                # 口径边界（评审复审 P2）：以券商快照"量权威"重建的单元 counted_trade_ids 为空——若重建后又收到一笔
+                # 已被该快照 volume 计入的【迟到买入成交回调】，mark_position_on_fill 去重集为空会在权威量上再加一次
+                # （多报持仓）。属"快照量权威 vs 事件量权威"混用的固有边界，概率低（重建多在盘前/重连点、晚于当日成交
+                # 回放窗口），且收盘对账的资产/持仓偏差会兜底告警。如需根治可在拿到券商成交序号时预填去重集。
+                # 新建 / 重建（本地无单元，或本地终态 SOLD 但券商仍有量=遗漏）。
+                if can_use > 0:
+                    state = PositionState.HOLDING
+                    earliest = today
+                    buy_date = self._safe_prev_open(today)  # 日历越界 fail-closed（评审 doc/21 C1）
+                else:
+                    state = PositionState.LOCKED_T1
+                    earliest = self._safe_next_open(today)  # 日历越界 fail-closed（评审 doc/21 C1）
+                    buy_date = today
+                # 已在外层 self._lock 临界区内（评审三轮 EXEC-position-01），结构性写入直接落定。
+                self._units[key] = PositionUnit(
+                    account_id=key[0],
+                    ts_code=ts_code,
+                    volume=volume,
+                    can_use_volume=can_use,
+                    avg_cost=avg_cost,
+                    earliest_sellable_date=earliest,
+                    state=state,
+                    mode=PositionMode.TECH_EXIT,  # 重建单元默认纯技术退出，refresh_state 据先验再校正
+                    buy_date=buy_date,
+                    volume_authoritative=True,  # 评审三轮 EXEC-position-07：以券商快照量重建，迟到回调只去重不累加
+                )
                 touched += 1
+                self._logger.info(
+                    "position_rebuilt_from_broker",
+                    account_id=key[0],
+                    ts_code=ts_code,
+                    volume=volume,
+                    can_use_volume=can_use,
+                    state=str(state),
+                    earliest_sellable_date=str(earliest),
+                )
+            except Exception as exc:  # noqa: BLE001 单条记录异常不拖垮整批重建（评审 doc/21 C1）
+                self._logger.error(
+                    "position_rebuild_record_failed",
+                    account_id=getattr(rec, "account_id", None),
+                    ts_code=getattr(rec, "ts_code", None),
+                    error=str(exc),
+                )
                 continue
-
-            if not create_missing and (unit is None or unit.state == PositionState.SOLD):
-                continue
-
-            # 口径边界（评审复审 P2）：以券商快照"量权威"重建的单元 counted_trade_ids 为空——若重建后又收到一笔
-            # 已被该快照 volume 计入的【迟到买入成交回调】，mark_position_on_fill 去重集为空会在权威量上再加一次
-            # （多报持仓）。属"快照量权威 vs 事件量权威"混用的固有边界，概率低（重建多在盘前/重连点、晚于当日成交
-            # 回放窗口），且收盘对账的资产/持仓偏差会兜底告警。如需根治可在拿到券商成交序号时预填去重集。
-            # 新建 / 重建（本地无单元，或本地终态 SOLD 但券商仍有量=遗漏）。
-            if can_use > 0:
-                state = PositionState.HOLDING
-                earliest = today
-                buy_date = self._calendar.prev_open(today)
-            else:
-                state = PositionState.LOCKED_T1
-                earliest = self._calendar.next_open(today)
-                buy_date = today
-            # 已在外层 self._lock 临界区内（评审三轮 EXEC-position-01），结构性写入直接落定。
-            self._units[key] = PositionUnit(
-                account_id=key[0],
-                ts_code=ts_code,
-                volume=volume,
-                can_use_volume=can_use,
-                avg_cost=avg_cost,
-                earliest_sellable_date=earliest,
-                state=state,
-                mode=PositionMode.TECH_EXIT,  # 重建单元默认纯技术退出，refresh_state 据先验再校正
-                buy_date=buy_date,
-                volume_authoritative=True,  # 评审三轮 EXEC-position-07：以券商快照量重建，迟到回调只去重不累加
-            )
-            touched += 1
-            self._logger.info(
-                "position_rebuilt_from_broker",
-                account_id=key[0],
-                ts_code=ts_code,
-                volume=volume,
-                can_use_volume=can_use,
-                state=str(state),
-                earliest_sellable_date=str(earliest),
-            )
         if touched:
             self._logger.info("position_rebuild_done", count=touched, today=str(today))
         return touched

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
@@ -149,7 +149,16 @@ def backfill_signal_trade_date(
     if parsed is not None:
         return parsed
     # 兜底：买入日 T+1 的上一交易日即信号日 T。
-    return calendar.prev_open(trade_date)
+    # 日历越界 fail-closed（评审 doc/21 C1 同源）：trade_date 落在日历最早端之前（历史补采老成交）时 prev_open
+    # 抛 ValueError，绝不让其冒泡中断整轮对账；退化为「上一非周末自然日」占位（仅用于回流 signal_trade_date 标签，
+    # 不参与 T+1 / 下单安全），保证对账继续推进。
+    try:
+        return calendar.prev_open(trade_date)
+    except Exception:  # noqa: BLE001 日历越界不阻断对账，占位反推 signal_trade_date 标签
+        d = trade_date - timedelta(days=1)
+        while d.weekday() >= 5:  # 跳过周末（仅占位）
+            d -= timedelta(days=1)
+        return d
 
 
 def _resolve(code: Optional[str]) -> Optional[str]:

@@ -190,6 +190,17 @@ def test_backfill_invalid_remark_falls_back_across_weekend():
     assert t == date(2026, 6, 12)
 
 
+def test_backfill_prev_open_calendar_underflow_fallback():
+    """评审 doc/21 C1 同源：trade_date 落在日历最早端之前 → prev_open 越界，fail-closed 占位反推、不抛(不中断对账)。
+
+    历史补采老成交时 trade_date 可能早于日历首日；原裸 prev_open 会 ValueError 中断整轮对账。
+    """
+    cal = StaticTradeCalendar([date(2026, 6, 15), date(2026, 6, 16)])  # 首日=2026-06-15
+    # 买入日 2026-06-15(周一)早于/等于首日 → prev_open 越界 → 退化为上一非周末自然日(周五 2026-06-12)。
+    t = backfill_signal_trade_date(date(2026, 6, 15), None, cal)
+    assert t == date(2026, 6, 12)
+
+
 # ---------------------------------------------------------------------------
 # 二、resolved_ts_code 归一（§6.8）
 # ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ from typing import Optional
 
 from qmt_strategy.common.logger import RecordingLogger
 from qmt_strategy.common.time_utils import FakeClock
+from qmt_strategy.common.trade_calendar import StaticTradeCalendar
 from qmt_strategy.contracts.enums import PositionMode, PositionState
 from qmt_strategy.contracts.models import SignalPrior
 from qmt_strategy.contracts.xt_objects import FakeXtTrade
@@ -315,3 +316,34 @@ def test_reconcile_stuck_selling_keeps_on_filled(calendar):
     n = pm.reconcile_stuck_selling(T_SELL, lambda a, c: "FILLED")  # 已成 → 交回报，不复位
     assert n == 0
     assert pm.get_unit(ACCOUNT, TS).state == PositionState.SELLING
+
+
+# ---------------------------------------------------------------------------
+# 评审 doc/21 C1：交易日历末日越界 fail-closed（不丢仓、不崩溃、单条不拖垮整批）
+# ---------------------------------------------------------------------------
+def test_calendar_exhausted_buy_writeback_keeps_position():
+    """日历末日==今日时 next_open 越界 → _safe_next_open fail-closed 占位，已成交持仓仍进状态机(不丢仓裸奔)。"""
+    cal = StaticTradeCalendar([date(2026, 6, 11), T_BUY])  # 末日=T_BUY(周五) → next_open(T_BUY) 越界
+    pm = _make_pm(cal)
+    unit = pm.mark_position_on_fill(_fill(volume=1000), T_BUY, account_id=ACCOUNT)
+    assert unit is not None and unit.volume == 1000
+    assert unit.state == PositionState.LOCKED_T1                 # 当日买入仍守 T+1，未被丢出状态机
+    assert unit.earliest_sellable_date == date(2026, 6, 15)     # 退化为下一非周末自然日(周一)，非抛异常
+    assert "position_calendar_next_open_exhausted_fallback" in pm._logger.events()
+
+
+def test_rebuild_calendar_exhausted_builds_units_and_isolates_failure():
+    """rebuild 在日历越界时仍逐条建单元(占位)，且单条坏记录不拖垮整批(per-item 兜底)。"""
+    cal = StaticTradeCalendar([date(2026, 6, 11), T_BUY])
+    pm = _make_pm(cal)
+    recs = [
+        _pos_rec(ts_code="600000.SH", volume=500, can_use=0),    # 当日锁定 → 触发 _safe_next_open 占位
+        _pos_rec(ts_code="600036.SH", volume=300, can_use=300),  # 隔夜可卖 → 触发 _safe_prev_open
+    ]
+    touched = pm.rebuild_from_broker_positions(recs, T_BUY)
+    assert touched == 2                                          # 两条都重建成功，无 ValueError 中断整批
+    u1 = pm.get_unit(ACCOUNT, "600000.SH")
+    assert u1 is not None and u1.state == PositionState.LOCKED_T1
+    assert u1.earliest_sellable_date == date(2026, 6, 15)       # next_open 占位
+    u2 = pm.get_unit(ACCOUNT, "600036.SH")
+    assert u2 is not None and u2.state == PositionState.HOLDING

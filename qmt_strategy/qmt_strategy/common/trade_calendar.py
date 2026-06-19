@@ -41,6 +41,14 @@ class StaticTradeCalendar:
                 return day
         raise ValueError(f"prev_open: 已知交易日历无 {d} 之前的交易日，请补齐 a_trade_calendar")
 
+    def trading_days_left(self, d: date) -> int:
+        """已知交易日历中严格晚于 d 的交易日个数（评审 doc/21 C1）：供盘前覆盖度预警。
+
+        返回 0 表示 d 已是/晚于日历末日——此后 next_open(d) 必越界（走 fail-closed 占位）。
+        日历是有限静态集，运维须在耗尽前外延 a_trade_calendar 导出文件。
+        """
+        return sum(1 for day in self._sorted if day > d)
+
 
 class WeekdayTradeCalendar:
     """仅排除周末的近似日历（不含法定节假日）。仅作无日历数据时的降级兜底。
@@ -63,3 +71,7 @@ class WeekdayTradeCalendar:
         while not self.is_open(prev):
             prev -= timedelta(days=1)
         return prev
+
+    def trading_days_left(self, d: date) -> int:
+        """周末近似日历无末日边界（next_open 永不越界），返回一个大数表示「覆盖度充足」（评审 doc/21 C1）。"""
+        return 10 ** 6
