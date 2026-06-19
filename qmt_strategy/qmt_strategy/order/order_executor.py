@@ -546,9 +546,13 @@ class OrderExecutor:
         # 「漏单凭空消失」（missing_report），污染 §6.10 告警语义。这里落 ERROR 终态 + 留痕 + 转次优。
         if order_id is None or order_id < 0:
             self._report_conn(False)  # 同步下单失败 = 通道可能不可用，反馈不健康（连续失败由 heartbeat/gate 冻结）
+            # 不把负哨兵 order_id 写入台账（评审 doc/21 B2）：order_stock 同步失败返回 <0 是【失败哨兵】、非真实
+            # 委托号；若写入 order_id 字段会被 _index_order_id 注册进两级反查索引（该索引只跳过 None、不拦负值），
+            # 污染索引（多笔失败在 (-1,today) 互相覆盖、留痕被串），并使任何携负 order_id 的回报经 _resolve_biz(-1)
+            # 误改写该 ERROR 行。故保持 order_id=None（不传该字段），失败码留在 error_msg 供审计；_resolve_biz 永不命中负值。
             self._ledger.update(
-                biz_no, order_id=order_id, state=OrderState.ERROR,
-                error_msg="order_stock 同步下单失败(返回<0)", updated_at=self._clock.now_utc(),
+                biz_no, state=OrderState.ERROR,
+                error_msg=f"order_stock 同步下单失败(返回{order_id})", updated_at=self._clock.now_utc(),
             )
             self._logger.error(
                 "order_submit_failed_sync",
@@ -715,9 +719,10 @@ class OrderExecutor:
 
         if order_id is None or order_id < 0:
             self._report_conn(False)
+            # 不把负哨兵 order_id 写入台账（评审 doc/21 B2，与买入同口径）：保持 order_id=None，避免污染反查索引。
             self._ledger.update(
-                biz_no, order_id=order_id, state=OrderState.ERROR,
-                error_msg="sell order_stock 同步下单失败(返回<0)", updated_at=self._clock.now_utc(),
+                biz_no, state=OrderState.ERROR,
+                error_msg=f"sell order_stock 同步下单失败(返回{order_id})", updated_at=self._clock.now_utc(),
             )
             self._logger.error(
                 "order_sell_submit_failed_sync",

@@ -526,6 +526,27 @@ def test_place_flushes_ledger_before_order(clock_0916):
     assert events.index("insert") < events.index("flush") < events.index("order")
 
 
+def test_sync_failure_keeps_order_id_none_no_index_pollution(clock_0916):
+    """评审 doc/21 B2：同步下单失败(order_stock 返回<0)不把负哨兵写入 order_id，反查索引不被污染、负值回报不串单。"""
+    class FailTrader(FakeTrader):
+        def order_stock(self, *a, **k):
+            return -1  # 同步失败哨兵（委托未被券商受理）
+
+    ledger = InMemoryLocalLedger()
+    ex = _executor(FailTrader(), clock_0916, ledger=ledger)
+    biz = ex.place(_decision(plan_volume=1000))
+    led = ledger.get(biz)
+    assert led.state == OrderState.ERROR
+    assert led.order_id is None                       # 负哨兵未写入 order_id 字段
+    assert "返回-1" in (led.error_msg or "")          # 失败码改留在 error_msg 供审计
+    # 负 order_id 反查不到该失败单（未被 _index_order_id 注册）
+    assert ledger.get_by_order_id(-1) is None
+    # 即便有携负 order_id 的迟到 add_fill，也解析不到该失败单 → 不会被误累计成持仓
+    assert ledger.add_fill(-1, "x", 100, Decimal("11.0")) is None
+    assert ledger.get(biz).filled_volume == 0
+    assert ledger.get(biz).state == OrderState.ERROR
+
+
 def test_place_sell_kill_switch_blocks(clock_0916):
     """kill_switch=True → place_sell 不下单、返回 None。"""
     trader = FakeTrader()
