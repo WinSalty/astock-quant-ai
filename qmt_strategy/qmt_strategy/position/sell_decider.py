@@ -126,15 +126,15 @@ class SellDecider:
         if self._is_book_missing(book):
             return self._hold(unit, reason="盘口缺失,安全默认不卖", phase="auction")
 
-        # —— 竞价封板续持（评审 doc/19 C-2）：实时已封涨停且封流比强 → 一票续持（最强实时盘口信号）——
-        # 业务意图：竞价一字 / 秒封涨停是最强的实时盘口信号；先验弱只代表「无延续预期」，不代表要在涨停高点
-        # 主动放弃一只仍在封板的强势仓（更不该以现价≈涨停价挂卖砸开自家封板）。与分时 decide_intraday 的
-        # 「秒板稳封→HOLD」(本文件 _is_seal_strong 同口径) 对齐，修复原 decide_auction 全程不读 is_sealed、
-        # 把正封涨停的隔夜【弱先验】票走兜底误判「弱开」清仓的缺陷。置于背离/弱开判定之前：实时封板一票否决。
-        # 边界：封流比未知/过低（_is_seal_strong=False，多因 plan 缺 float_mktcap）→ 封板质量不可信、不据此
-        # 续持，落到下方原有分支处理（与 intraday「seal 不强则不进续持分支」一致），不过度保护误持弱质封板。
-        if book.is_sealed and self._is_seal_strong(book):
-            return self._hold(unit, reason="竞价封板续持", phase="auction")
+        # —— 竞价封板统一裁决（评审 doc/19 C-2 + doc/21 P2/P3/P4）：实时已封涨停 → 在此一票收口，绝不落到
+        # 下方「背离/弱开」等会以涨停价挂清仓单砸自家封板的分支 ——
+        # 业务意图：竞价一字 / 秒封涨停是最强的实时盘口信号；现价触及涨停价时，绝不该以现价≈涨停价挂卖砸开自家
+        # 封板、把仍在封板的强势仓在涨停高点卖飞。_decide_sealed_board 三态分流：封流比不可得→保守续持(修 P2/P3
+        # 「缺 float_mktcap 致误判弱开清仓」)、强封→续持、弱封→不 auto-HOLD 而减仓不全清(修 P4「弱封被误判稳封拒卖」)。
+        if book.is_sealed:
+            return self._decide_sealed_board(
+                unit, book, prior_strong=prior_strong, reason_hold="竞价封板续持", phase="auction"
+            )
 
         # —— 扳机一：量价背离（盘口背离 或 命中 fail_conditions 背离类）→ 一票否决续持 ——
         # 业务意图：高开但量能虚高 / 骤缩，封板预期落空，即便先验强也转减 / 清（盘口一票否决，§5.3.1）。
@@ -217,10 +217,14 @@ class SellDecider:
         if self._is_messy_board(book):
             return self._clear(unit, reason="烂板出", phase="intraday")
 
-        # —— 秒板 / 稳封续持：封涨停且封流比高 → 吃 continuation_prob 先验续持 ——
+        # —— 封板统一裁决（评审 doc/21 P2/P3/P4）：现价已封涨停 → 在此一票收口，绝不落到下方「冲高止盈/尾盘
+        # 了结/弱先验兜底」等会以涨停价挂清仓单砸自家封板的分支 ——
         # 业务意图：先验定基调——秒板稳封是最强续持信号，但仍要求「未命中上面任一破位/炸板/烂板」才进此分支。
-        if book.is_sealed and self._is_seal_strong(book):
-            return self._hold(unit, reason="秒板续持", phase="intraday")
+        # _decide_sealed_board 三态分流：封流比不可得→保守续持(修 P2/P3 砸自家封板)、强封→续持、弱封→减仓不全清(修 P4)。
+        if book.is_sealed:
+            return self._decide_sealed_board(
+                unit, book, prior_strong=prior_strong, reason_hold="秒板续持", phase="intraday"
+            )
 
         # —— 冲高止盈：涨幅显著但量能透支 / 上方筹码压力（量价背离）→ 减 / 清 ——
         if book.price_volume_diverge:
@@ -369,17 +373,44 @@ class SellDecider:
         return book.open_pct <= Decimal("0")
 
     def _is_seal_strong(self, book: OrderBook) -> bool:
-        """封板是否「稳」：封流比高（封单额相对流通市值占比足够）。
+        """封板是否「稳」：封流比达战法标定的强封阈值（评审 doc/21 P4）。
 
-        业务意图（§5.3.3 秒板续持）：is_sealed 仅表示当前封涨停，还需封流比高才算稳封，
-        才支撑「吃 continuation_prob 续持」。封流比阈值由执行侧战法定参；这里以
-        seal_to_float_ratio 存在且 > 0 作为已加工信号的判据（盘口已把强弱折叠进该值）。
-        边界：seal_to_float_ratio 为 None → 封板质量未知，保守判「封不稳」（不续持）。
+        业务意图（§5.3.3 秒板续持）：is_sealed 仅表示现价触及涨停价，还需【封流比足够高】才算稳封、
+        才支撑「吃 continuation_prob 续持」。
+        修复 P4：原实现仅判 `ratio > 0`——只要触价涨停且买一档有任意量即视稳封 → 弱封/烂封票被误判稳封而
+        拒卖、错过炸板前减仓窗口。改用与买入侧同一封流比下限 `settings.seal_ratio_min`：ratio>=阈值才算强封。
+        阈值默认 0（实测 bidVol 量纲前不约束，保持「任意正 ratio 即强」的旧行为不引回归）；目标机实测后配正
+        阈值（如 0.005）即对弱封票启用减仓口径。
+        边界：seal_to_float_ratio 为 None / <=0（封板质量不可信）→ 非强封（由 _decide_sealed_board 走
+        「不可得→保守续持」分支，绝不据此清仓砸自家封板）。
         """
         ratio = book.seal_to_float_ratio
-        if ratio is None:
+        if ratio is None or ratio <= Decimal("0"):
             return False
-        return ratio > Decimal("0")
+        return ratio >= self._settings.seal_ratio_min
+
+    def _decide_sealed_board(
+        self, unit: PositionUnit, book: OrderBook, *, prior_strong: bool, reason_hold: str, phase: str
+    ) -> SellAction:
+        """正封涨停板（is_sealed=True）的统一卖出裁决（评审 doc/21 P2/P3/P4）。
+
+        核心口径：现价已触及涨停价（封板）时，【绝不】落到「弱开/尾盘了结」等会以涨停价挂【清仓】单砸自家封板
+        买一队列、把仍在封板的强势仓在涨停高点卖飞的分支。三态分流：
+        - 封流比不可得（ratio None/<=0，多因信号侧缺 float_mktcap 致封流比算不出）→ 保守续持 HOLD：
+          没有可信封板质量证据时，绝不主动卖一只正封涨停板（修 P2/P3：原走兜底「弱开/尾盘了结」清仓）。
+        - 强封（_is_seal_strong：ratio>=seal_ratio_min）→ 续持 HOLD（吃 continuation_prob 先验，正常口径）。
+        - 弱封（0<ratio<seal_ratio_min，仅配置正阈值后可达）→ 不再 auto-HOLD（修 P4）：先验强暂持 HOLD（等
+          炸板等硬扳机），先验弱则 REDUCE 减仓（炸板前减仓窗口，挂部分卖入封单博/避险，但【绝不全清】砸板）。
+        """
+        ratio = book.seal_to_float_ratio
+        if ratio is None or ratio <= Decimal("0"):
+            return self._hold(unit, reason=f"{reason_hold}(封流比不可得,保守不卖正封涨停板)", phase=phase)
+        if self._is_seal_strong(book):
+            return self._hold(unit, reason=reason_hold, phase=phase)
+        # 弱封：先验强暂持、先验弱减仓（绝不全清砸板）。
+        if prior_strong:
+            return self._hold(unit, reason=f"{reason_hold}(弱封但先验强,维持)", phase=phase)
+        return self._emit(unit, action=SellActionType.REDUCE, reason="弱封减仓", phase=phase)
 
     def _is_messy_board(self, book: OrderBook) -> bool:
         """烂板判定：反复开板（open_times 多）、封不实。

@@ -443,14 +443,52 @@ def test_auction_not_sealed_weak_open_still_clears(decider: SellDecider) -> None
     assert action.reason == "弱开"
 
 
-def test_auction_sealed_but_weak_seal_strength_not_held(decider: SellDecider) -> None:
-    """竞价 is_sealed=True 但封流比未知（seal_to_float_ratio=None）+ 先验弱 → 封板质量不可信，不进续持分支，
-    落原弱开兜底 CLEAR（与 intraday『seal 不强不续持』一致，不过度保护弱质封板）。"""
+def test_auction_sealed_ratio_unknown_holds_not_clears(decider: SellDecider) -> None:
+    """评审 doc/21 P2：竞价 is_sealed=True 但封流比不可得(seal_to_float_ratio=None,多因缺 float_mktcap)+ 先验弱
+    → 保守续持 HOLD，绝不落弱开兜底以涨停价挂【清仓】单砸自家封板（原误判 CLEAR=卖飞正封涨停板）。"""
     unit = _unit(mode=PositionMode.TECH_EXIT)
+    # open_pct=-0.01（表观弱开）但 is_sealed=True：验证封板裁决先于弱开分支、不被误判清仓。
     book = _book(open_pct=Decimal("-0.01"), is_sealed=True, seal_to_float_ratio=None)
     action = decider.decide_auction(unit, None, book)
-    assert action.action in (SellActionType.CLEAR, SellActionType.REDUCE)
-    assert action.reason == "弱开"
+    assert action.action == SellActionType.HOLD
+    assert "封流比不可得" in action.reason
+
+
+def test_intraday_sealed_ratio_unknown_holds_not_clears(decider: SellDecider) -> None:
+    """评审 doc/21 P3：分时同源——is_sealed=True 但封流比不可得 + 先验弱 → 保守续持 HOLD，不落尾盘了结清仓砸自家封板。"""
+    unit = _unit(mode=PositionMode.TECH_EXIT)
+    book = _book(is_sealed=True, seal_to_float_ratio=None)
+    action = decider.decide_intraday(unit, None, book)
+    assert action.action == SellActionType.HOLD
+    assert "封流比不可得" in action.reason
+
+
+def test_intraday_weak_seal_weak_prior_reduces_not_holds() -> None:
+    """评审 doc/21 P4：配了封流比强阈值后，弱封(0<ratio<seal_ratio_min)+ 先验弱 → 减仓 REDUCE（炸板前减仓窗口），
+    既不 auto-HOLD（原弱封被误判稳封拒卖）也不全清砸板。"""
+    d = SellDecider(Settings(seal_ratio_min=Decimal("0.01")), _clock(), RecordingLogger())
+    unit = _unit(mode=PositionMode.TECH_EXIT)
+    book = _book(is_sealed=True, seal_to_float_ratio=Decimal("0.005"))  # 弱封 < 0.01 阈值
+    action = d.decide_intraday(unit, None, book)
+    assert action.action == SellActionType.REDUCE
+
+
+def test_intraday_weak_seal_strong_prior_holds() -> None:
+    """评审 doc/21 P4：弱封但先验强 → 暂持 HOLD（等炸板等硬扳机），不减仓。"""
+    d = SellDecider(Settings(seal_ratio_min=Decimal("0.01")), _clock(), RecordingLogger())
+    unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
+    book = _book(is_sealed=True, seal_to_float_ratio=Decimal("0.005"))
+    action = d.decide_intraday(unit, _prior(), book)  # 强先验 0.7
+    assert action.action == SellActionType.HOLD
+
+
+def test_intraday_strong_seal_still_holds(decider: SellDecider) -> None:
+    """回归：强封(ratio>0,默认阈值 0)+ 任意先验 → 续持 HOLD（修复不破坏强封续持）。"""
+    unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
+    book = _book(is_sealed=True, seal_to_float_ratio=Decimal("0.05"))
+    action = decider.decide_intraday(unit, _prior(), book)
+    assert action.action == SellActionType.HOLD
+    assert action.reason == "秒板续持"
 
 
 def test_auction_flat_open_zero_still_exits(decider: SellDecider) -> None:

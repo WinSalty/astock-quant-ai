@@ -38,7 +38,8 @@ class ChaseLimitUpStrategy(EntryStrategy):
 
         # —— 弃条件 2：封单不稳（封流比有值但低于下限）→ 视为炸板 / 封单快速减小风险，放弃（评审二轮 P2#41）。——
         # 边界：封流比为 None（达涨停但买一量缺、或市值缺）时不据此否决，避免数据缺口误杀强势板。
-        # 下限取 settings.seal_ratio_min（默认 0.005），原硬编码 0.0 使该护栏恒不触发=对任何顶板无条件跟买。
+        # 下限取 settings.seal_ratio_min（默认 0=关闭，目标机实测 bidVol 量纲后再配正阈值如 0.005，见 settings.py 注释；
+        # 评审 doc/21 P2/P3/P4 复审订正：此处原注释「默认 0.005」与实际默认 0 不符，已对齐）。默认 0 时该护栏不触发。
         ratio = snap.seal_to_float_ratio
         if ratio is not None and ratio < settings.seal_ratio_min:
             return StrategyOutcome(
