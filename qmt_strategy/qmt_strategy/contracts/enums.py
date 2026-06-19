@@ -59,16 +59,28 @@ class OrderState(StrEnum):
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
     ERROR = "ERROR"
+    # 部成撤单终态（评审 doc/21 B1）：部成单(filled>0)的【未成部分被撤/废】后的终态收口态。
+    # 与 PART_TRADED（部成且仍在途/待推进）严格区分：PART_CANCELLED 的未成部分已死（券商已无该活动委托、
+    # 冻结现金已释放），故【不再】被 on_ttl_expired 当作可撤在途单反复撤单、未成 remaining 也【不再】占用
+    # 预算承诺；但其已成 filled 部分是真实建仓，仍占建仓只数名额、仍参与 find_active 幂等（防同计划重复下单）。
+    PART_CANCELLED = "PART_CANCELLED"
 
     # 终态集合：到达任一终态后不再推进/重复下单（幂等收口）。
     @classmethod
     def terminal(cls) -> "frozenset[OrderState]":
-        return frozenset({cls.TRADED, cls.PART_TRADED, cls.CANCELLED, cls.REJECTED, cls.ERROR})
+        return frozenset(
+            {cls.TRADED, cls.PART_TRADED, cls.PART_CANCELLED, cls.CANCELLED, cls.REJECTED, cls.ERROR}
+        )
 
     # 「活跃单」集合：用于 has_active 幂等判定（已报/部成/已成视为已占用该计划）。
+    # PART_CANCELLED 纳入（评审 doc/21 B1）：部成撤单单的 filled 是真实建仓，须继续被 find_active 视为
+    # 「该计划已占用」以防重复下单；其未成 remaining 不占预算由 committed_amount/_committed_* 单独对
+    # PART_CANCELLED 置 remaining=0 处理（见 order_executor），与「属 active 集合」并不矛盾。
     @classmethod
     def active(cls) -> "frozenset[OrderState]":
-        return frozenset({cls.PLANNED, cls.SUBMITTED, cls.REPORTED, cls.PART_TRADED, cls.TRADED, cls.CANCELLING})
+        return frozenset(
+            {cls.PLANNED, cls.SUBMITTED, cls.REPORTED, cls.PART_TRADED, cls.PART_CANCELLED, cls.TRADED, cls.CANCELLING}
+        )
 
 
 class AuctionPhase(StrEnum):

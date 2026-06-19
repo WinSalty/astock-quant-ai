@@ -115,8 +115,8 @@ class ExecCallback:
 
         判据修正（review F02 死路）：**用回报的原始终态状态 terminal_status 判定撤/废/拒，绝不读台账 state**——
         on_stock_order 先调 ledger.sync_status，对【CANCELLED/REJECTED 且 filled>0】的部成撤单已 fill-aware 收口为
-        PART_TRADED（local_ledger.sync_status），若仍按 entry.state∈终态集合判定，部成单永远进不来、on_road 当日不
-        回扣 = 漏卖（F02 本要堵的窗口）。故改以回报原始状态判定。
+        PART_CANCELLED（local_ledger.sync_status，评审 doc/21 B1；原收口 PART_TRADED），若仍按 entry.state∈终态集合
+        判定，部成单永远进不来、on_road 当日不回扣 = 漏卖（F02 本要堵的窗口）。故改以回报原始状态判定。
 
         统一精确回扣（review #2）：零成交与部成【统一】按本单未成量 unfilled=plan_volume-filled 经
         sell_on_road_release_sink 精确回扣 on_road（绝不整体清零误清同单元其它在途单的冻结量）；release 内在 on_road
@@ -129,7 +129,7 @@ class ExecCallback:
         entry = self._ledger.get_by_order_id(order_id)
         if entry is None or entry.side != TradeSide.SELL:
             return
-        # 撤/废/拒终态判定取【回报原始状态】，不取台账 state（sync_status 已对部成撤单收口为 PART_TRADED）。
+        # 撤/废/拒终态判定取【回报原始状态】，不取台账 state（sync_status 已对部成撤单收口为 PART_CANCELLED）。
         if terminal_status not in (OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.ERROR):
             return
         filled = entry.filled_volume or 0

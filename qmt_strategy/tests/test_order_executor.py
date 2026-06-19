@@ -208,6 +208,35 @@ def test_partial_fill_then_ttl_cancel(clock_0916):
     assert final.filled_volume == 600                      # 已成 600 计成交
 
 
+def test_part_cancelled_no_recancel_loop(clock_0916):
+    """评审 doc/21 B1：部成单被撤 → CANCELLED 回报收口 PART_CANCELLED 后，后续 sweep 不再重复撤单（破死循环）。
+
+    原缺陷：部成撤单收口回 PART_TRADED（既属 active() 又在 on_ttl_expired 可撤集合 {SUBMITTED,REPORTED,
+    PART_TRADED}）→ 每个 grace 周期 sweep 都对一笔券商侧早已撤销的委托反复发 cancel，到收盘为止无界重复废撤单。
+    改用独立终态 PART_CANCELLED 后退出可撤集合，首撤即终止、不再复发。
+    """
+    trader = FakeTrader()
+    ledger = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=ledger)
+    biz = ex.place(_decision(plan_volume=1000))
+    led = ledger.get(biz)
+    # 部成 600 → PART_TRADED；TTL 到撤未成 → CANCELLING（首次且应是唯一一次撤单）。
+    ledger.sync_status(led.order_id, OrderState.REPORTED)
+    ledger.add_fill(led.order_id, "tr-part", 600, Decimal("11.00"))
+    ex.on_ttl_expired(biz)
+    assert trader.cancel_calls == [led.order_id]
+    assert ledger.get(biz).state == OrderState.CANCELLING
+    # 券商 CANCELLED 回报到达 → 收口 PART_CANCELLED（终态）。
+    ledger.sync_status(led.order_id, OrderState.CANCELLED)
+    assert ledger.get(biz).state == OrderState.PART_CANCELLED
+    # 过 grace 后再 sweep（仍在 9:15–9:20 可撤段）：deadline 被 pop、on_ttl_expired 走终态分支 → 绝不再撤、不再续 deadline。
+    clock_0916.set(utc_at_east8(T_BUY, 9, 17, 30))
+    ex.sweep_expired()
+    assert trader.cancel_calls == [led.order_id]          # 仍只有一次撤单，未复发（死循环已破）
+    assert biz not in ex._ttl_deadline                    # 退出 TTL 盯防，不会再被 sweep 触达
+    assert ledger.get(biz).state == OrderState.PART_CANCELLED
+
+
 # ---------------------------------------------------------------------------
 # 成交确认口径：place 后无 add_fill → 停在 SUBMITTED（不计 TRADED）
 # ---------------------------------------------------------------------------
@@ -452,6 +481,26 @@ def test_committed_amount_counts_active_buys(clock_0916):
     # 再下一只不同标的：累计 +5000×9.00=45000 → 56000。
     ex.place(_decision(ts_code="600000.SH", plan_volume=5000, limit_price=Decimal("9.00")))
     assert ex.committed_amount(T_BUY) == Decimal("56000")
+
+
+def test_committed_amount_excludes_part_cancelled_dead_remaining(clock_0916):
+    """评审 doc/21 B1：部成撤单单(PART_CANCELLED)的未成 remaining 已死，不再计已承诺（只计真实已成 filled）。
+
+    原缺陷：部成撤单收口 PART_TRADED 仍属 active()，committed_amount 按 filled+remaining 全额计入，
+    一笔永不会再成交的死量 remaining 永久超额承诺、挤占其它龙头预算。改 PART_CANCELLED 后 remaining 置 0。
+    """
+    trader = FakeTrader()
+    ledger = InMemoryLocalLedger()
+    ex = _executor(trader, clock_0916, ledger=ledger)
+    biz = ex.place(_decision(plan_volume=1000, limit_price=Decimal("11.00")))
+    led = ledger.get(biz)
+    assert ex.committed_amount(T_BUY) == Decimal("11000")        # 全额在途
+    ledger.add_fill(led.order_id, "f1", 600, Decimal("11.00"))   # 部成 600 → 600+400 仍 = 11000
+    assert ex.committed_amount(T_BUY) == Decimal("11000")
+    ex.on_ttl_expired(biz)                                       # 撤未成 → CANCELLING
+    ledger.sync_status(led.order_id, OrderState.CANCELLED)       # 收口 PART_CANCELLED
+    # 死量 remaining(400×11) 不再占承诺，只计已成 600×11 = 6600。
+    assert ex.committed_amount(T_BUY) == Decimal("6600")
 
 
 def test_place_flushes_ledger_before_order(clock_0916):

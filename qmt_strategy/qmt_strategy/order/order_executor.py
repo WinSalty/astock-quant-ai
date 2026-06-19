@@ -769,7 +769,9 @@ class OrderExecutor:
             # 原实现对部成/已成单仍按 plan_volume×plan_price 全额计入——已成部分应按真实成交均价、未成部分才按
             # 计划价占用，否则会高估已承诺、误判预算耗尽而少买。filled_volume 钳到 plan_volume 防回报超量污染。
             filled = min(e.filled_volume or 0, e.plan_volume)
-            remaining = e.plan_volume - filled
+            # 部成撤单单 remaining 已死、不占承诺（评审 doc/21 B1）：PART_CANCELLED 的未成部分已撤、冻结现金已释放，
+            # 绝不再按 plan_price 计入已承诺（否则死量永久超额承诺、挤占其它龙头预算），只计真实已成 filled 段。
+            remaining = 0 if e.state == OrderState.PART_CANCELLED else (e.plan_volume - filled)
             filled_amt = (e.avg_filled_price or e.plan_price) * Decimal(filled)
             remaining_amt = e.plan_price * Decimal(remaining)
             total += filled_amt + remaining_amt
@@ -824,7 +826,8 @@ class OrderExecutor:
             if resolve_code(e.ts_code) != target:
                 continue
             filled = min(e.filled_volume or 0, e.plan_volume)
-            remaining = e.plan_volume - filled
+            # 部成撤单单 remaining 已死、不占单票承诺（评审 doc/21 B1）：同 committed_amount 口径。
+            remaining = 0 if e.state == OrderState.PART_CANCELLED else (e.plan_volume - filled)
             total += (e.avg_filled_price or e.plan_price) * Decimal(filled) + e.plan_price * Decimal(remaining)
         return total
 
@@ -847,7 +850,8 @@ class OrderExecutor:
             if resolve_code(e.ts_code) != target:
                 continue
             filled = min(e.filled_volume or 0, e.plan_volume)
-            remaining = e.plan_volume - filled
+            # 部成撤单单未成段已死、不计在途敞口（评审 doc/21 B1）：PART_CANCELLED 的 remaining 已撤、非在途，置 0。
+            remaining = 0 if e.state == OrderState.PART_CANCELLED else (e.plan_volume - filled)
             # 只计未成在途段（已成 filled 已体现在 _held_value 的持仓市值里，不再重复计入，堵 F13 双重扣减）。
             total += e.plan_price * Decimal(remaining)
         return total

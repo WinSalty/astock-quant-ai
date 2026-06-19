@@ -105,8 +105,12 @@ def test_add_fill_ignores_non_positive_volume():
     assert led.get_by_order_id(10).filled_volume == 0
 
 
-def test_sync_status_fill_aware_cancel_keeps_part_traded():
-    """部成单撤单后 QMT 报 CANCELLED，已有成交 → 终态收口为 PART_TRADED（§4.7/§4.9 评审 medium#2）。"""
+def test_sync_status_fill_aware_cancel_settles_part_cancelled():
+    """部成单撤单后 QMT 报 CANCELLED，已有成交 → 终态收口为 PART_CANCELLED（评审 doc/21 B1，原 PART_TRADED）。
+
+    改用独立终态 PART_CANCELLED：既不被改写为 CANCELLED（保留真实建仓事实），又与「部成且仍在途」的
+    PART_TRADED 区分，使其退出 on_ttl_expired 可撤集合、未成 remaining 不再占预算（见 B1 闭环测试）。
+    """
     led = InMemoryLocalLedger()
     e = _entry(plan_volume=1000)
     e.order_id = 11
@@ -114,8 +118,32 @@ def test_sync_status_fill_aware_cancel_keeps_part_traded():
     led.add_fill(11, "f1", 600, Decimal("11.00"))  # 部成 600
     led.sync_status(11, OrderState.CANCELLED)       # 撤剩余 400 → QMT 报已撤
     got = led.get_by_order_id(11)
-    assert got.state == OrderState.PART_TRADED       # 不被改写为 CANCELLED
+    assert got.state == OrderState.PART_CANCELLED    # 不被改写为 CANCELLED，且与 PART_TRADED 区分
     assert got.filled_volume == 600
+
+
+def test_part_cancelled_is_sticky_terminal_no_downgrade():
+    """PART_CANCELLED 终态粘滞（评审 doc/21 B1）：迟到委托态/成交回报都不得把它降级回在途/部成态。
+
+    若放行降级，一笔已撤的部成单会重新落入 on_ttl_expired 可撤集合 → 无界重复撤单复活，正是 B1 要根治的死循环。
+    """
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 13
+    led.insert(e)
+    led.add_fill(13, "f1", 600, Decimal("11.00"))  # 部成 600
+    led.sync_status(13, OrderState.CANCELLED)       # 撤剩余 → PART_CANCELLED
+    assert led.get_by_order_id(13).state == OrderState.PART_CANCELLED
+    # 迟到委托态（部成/已报）回报：不得降级
+    led.sync_status(13, OrderState.PART_TRADED)
+    assert led.get_by_order_id(13).state == OrderState.PART_CANCELLED
+    led.sync_status(13, OrderState.REPORTED)
+    assert led.get_by_order_id(13).state == OrderState.PART_CANCELLED
+    # 撤单瞬间在途的迟到成交：filled 仍累计（真实成交须计入），但状态保持 PART_CANCELLED 不复活
+    led.add_fill(13, "f2", 100, Decimal("11.00"))
+    got = led.get_by_order_id(13)
+    assert got.state == OrderState.PART_CANCELLED
+    assert got.filled_volume == 700
 
 
 def test_sync_status_cancel_without_fill_is_cancelled():

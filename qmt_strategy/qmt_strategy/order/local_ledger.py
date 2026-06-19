@@ -149,15 +149,21 @@ class InMemoryLocalLedger:
         if biz is None:
             return
         e = self._by_biz[biz]
-        # 已 TRADED（全成事实已确认）→ 任何迟到的委托态回报都不降级，仅按需记 error_msg（H-1）。
-        # 注：不用 OrderState.terminal() 作判据——它含 PART_TRADED，会放行「迟到部成降级已成单」，等于没修。
-        if e.state == OrderState.TRADED:
+        # 终态收口「不回退」守卫（H-1 + 评审 doc/21 B1）：已 TRADED（全成）或 PART_CANCELLED（部成撤单收口）
+        # 都是【终态收口】，任何迟到的委托态回报都不得把它降级回在途态，仅按需记 error_msg。
+        # - TRADED：不回退见 H-1（迟到部成/已报回报不降级已全成单）。
+        # - PART_CANCELLED：不回退是 B1 闭环关键——若放行迟到 REPORTED/PART_TRADED 把它降级回在途/部成态，
+        #   会让一笔已撤的部成单重新落入 on_ttl_expired 可撤集合 → 无界重复撤单复活。
+        # 注：不用 OrderState.terminal() 作判据——它含 PART_TRADED（部成且仍在途），会误放行「迟到部成降级已成单」。
+        if e.state in (OrderState.TRADED, OrderState.PART_CANCELLED):
             if msg is not None:
                 e.error_msg = msg
             return
-        # fill-aware：撤单/废单终态遇已有成交 → 收口为 PART_TRADED（不抹掉真实建仓事实）。
+        # fill-aware：撤单/废单终态遇已有成交 → 收口为 PART_CANCELLED（评审 doc/21 B1，原收口 PART_TRADED）。
+        # 改用独立终态 PART_CANCELLED：未成部分已撤死、不再被 TTL 反复撤单、remaining 不占预算（见 order_executor），
+        # 但 filled 真实建仓仍占名额/参与幂等。完全未成（filled==0）仍落 CANCELLED/REJECTED（无建仓事实）。
         if state in (OrderState.CANCELLED, OrderState.REJECTED) and e.filled_volume > 0:
-            e.state = OrderState.PART_TRADED
+            e.state = OrderState.PART_CANCELLED
         else:
             e.state = state
         if msg is not None:
@@ -206,8 +212,11 @@ class InMemoryLocalLedger:
         if new_vol > 0:
             e.avg_filled_price = (prev_amt + add_price * Decimal(vol)) / Decimal(new_vol)
         e.filled_volume = new_vol
-        # 推进状态：达计划量 → TRADED，否则 PART_TRADED（不回退已是 TRADED 的态）。
-        if e.state != OrderState.TRADED:
+        # 推进状态：达计划量 → TRADED，否则 PART_TRADED。
+        # 不回退守卫（评审 doc/21 B1）：已 TRADED 或已 PART_CANCELLED（部成撤单终态）都不再据成交改状态——
+        # PART_CANCELLED 单若收到撤单瞬间在途的迟到成交，filled/均价仍按本笔累计（成交是真实事实，须计入持仓/成本），
+        # 但状态保持 PART_CANCELLED 终态，绝不被重新推回 PART_TRADED 而复活 TTL 重撤循环。
+        if e.state not in (OrderState.TRADED, OrderState.PART_CANCELLED):
             if e.plan_volume and new_vol >= e.plan_volume:
                 e.state = OrderState.TRADED
             elif new_vol > 0:
@@ -234,7 +243,10 @@ class InMemoryLocalLedger:
         # 污染，正是 H-1 的下游危害）。已 TRADED 单的 filled_volume/counted 快照已是终态全成、与其明细同事务落盘
         # （M-1 原子写），无需也不应据（可能不全的）明细重算下修；且 add_fill 对 TRADED 不再计入新成交，counted
         # 无需重建。故已 TRADED 直接跳过重算、保留全成快照，使台账三处状态收口口径全对齐「已成不回退」。
-        if e.state == OrderState.TRADED:
+        # PART_CANCELLED 同样跳过重算（评审 doc/21 B1）：部成撤单终态的 filled/状态已与明细同事务原子落盘
+        # （M-1），是已敲定的终态收口；据可能不全的明细重算只会徒增风险（甚至把它降回 PART_TRADED 复活 TTL 重撤），
+        # 故与 TRADED 同口径直接跳过，保留持久化的 PART_CANCELLED 终态与 filled 快照。
+        if e.state in (OrderState.TRADED, OrderState.PART_CANCELLED):
             return
         total_vol = 0
         total_amt = Decimal("0")
@@ -251,9 +263,9 @@ class InMemoryLocalLedger:
         e.avg_filled_price = (total_amt / Decimal(total_vol)) if total_vol > 0 else None
         # 明细重算后按 filled vs plan 重新收口状态（与 add_fill / sync_status 同口径）：
         if e.state in (OrderState.CANCELLED, OrderState.REJECTED):
-            # 终态撤/废：有成交则 fill-aware 收口 PART_TRADED，否则保持终态。
+            # 终态撤/废：有成交则 fill-aware 收口 PART_CANCELLED（评审 doc/21 B1，原 PART_TRADED），否则保持终态。
             if total_vol > 0:
-                e.state = OrderState.PART_TRADED
+                e.state = OrderState.PART_CANCELLED
         else:
             if e.plan_volume and total_vol >= e.plan_volume:
                 e.state = OrderState.TRADED
