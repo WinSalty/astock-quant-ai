@@ -762,8 +762,10 @@ class OrderExecutor:
 
         业务意图：发单前从可用预算里扣减已承诺，避免券商 frozen_cash 未及时刷新时多只票各按"全额现金"
         测算而超额下单废单；并作为总敞口闸 max_total_exposure 的已用额度。
-        口径：只计 BUY 方向且处于活跃态（PLANNED..TRADED/CANCELLING）的单；终态失败
-        （CANCELLED/REJECTED/ERROR）不占用资金故不计。同一计划当日多单各自计入（与下单事实一致）。
+        口径：只计 BUY 方向且处于活跃态（OrderState.active()：PLANNED/SUBMITTED/REPORTED/PART_TRADED/
+        TRADED/CANCELLING/PART_CANCELLED）的单；纯终态失败（CANCELLED/REJECTED/ERROR，零成交）不占用资金故不计。
+        其中 PART_CANCELLED（部成撤单终态，评审 doc/21 B1）虽属 active 集合（保 find_active 幂等），但其未成
+        remaining 已撤死、只计真实已成 filled 段（见下方 remaining 三元口径）。同一计划当日多单各自计入（与下单事实一致）。
         """
         active = OrderState.active()
         total = Decimal("0")
