@@ -85,6 +85,16 @@ class AuctionPoller:
         """请求停止主循环（下一轮检查时退出）。供测试 / 外部信号打断常驻进程。"""
         self._stop = True
 
+    def reset_history(self) -> None:
+        """每个交易日盘前清空累积帧序列（评审 doc/21 E3）。
+
+        背景：_history 仅在 __init__ 建一次、poll_once 每轮只增不减；AuctionPoller 随 Engine 一次性构造、
+        进程跨交易日常驻，若不重置，第 N 日竞价帧会一直堆在 _history 里被第 N+1 日继续追加 →
+        (票数×每日帧数) 线性无界增长（长期不重启可致 OOM），且 tick_seq=len(prev_ticks)+1 被前几日帧数抬高、
+        留痕/归因失真，auction_centroid 每轮遍历的帧列表也随天数线性变重。故 prewarm 每日调用本方法从空历史起算。
+        """
+        self._history.clear()
+
     def poll_once(self, now_utc: datetime) -> List[AuctionSnapshot]:
         """单轮轮询：批量取 tick → 逐 code 算四因子 → push 下游，返回本轮 snapshot 列表（§3.6）。
 

@@ -139,6 +139,18 @@ class EntryRouter:
         """
         self._decided.discard(ts_code)
 
+    def reset_day(self) -> None:
+        """每个交易日盘前重置【当日】幂等/留痕状态（评审 doc/21 E2）。
+
+        背景：_decided（已产出有效 BUY 的票）与 _last_recorded_action（去抖留痕）都是【当日】语义；
+        EntryRouter 随 Engine 一次性构造、进程跨交易日常驻（run.py while True + DailyScheduler 按 date 连续运行），
+        若不在盘前重置，昨日已产出 OPENING BUY（多为已成交）的标的次日以连板身份再入选 watchlist 时会被
+        on_auction_snapshot 的 _decided 短路 → 永不路由、永不下单 = 跨日「该买不买」，系统性漏掉强龙头连续接力建仓
+        （与 main._strength_budget_volume 显式预期的「跨日复买同一连板龙头」自相矛盾）。故 prewarm 每日调用本方法清空。
+        """
+        self._decided.clear()
+        self._last_recorded_action.clear()
+
     def route(self, plan: PlanRow, snap: AuctionSnapshot) -> Optional[EntryDecision]:
         """路由主逻辑（§4.8）：先闸门 _should_skip，否则按 (family, setup) 选策略得决策。
 

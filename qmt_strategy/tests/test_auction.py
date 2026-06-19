@@ -353,6 +353,28 @@ def test_poll_once_centroid_accumulates_across_frames():
     assert s3.centroid_trend == CentroidTrend.DOWN
 
 
+def test_reset_history_clears_accumulated_frames():
+    """评审 doc/21 E3：reset_history 清空累积帧 → 跨日不再无界增长、tick_seq 从空历史重新起算。"""
+    plans = {"600000.SH": make_plan_row("600000.SH", first_board_vol=100000)}
+    responses = [
+        {"600000.SH": {"lastPrice": 12.0, "lastClose": 10.0, "volume": 0}},
+        {"600000.SH": {"lastPrice": 12.0, "lastClose": 10.0, "volume": 100}},
+        {"600000.SH": {"lastPrice": 12.5, "lastClose": 10.0, "volume": 200}},
+    ]
+    tsrc = FakeTickSource(responses=responses)
+    poller, _, _ = _make_poller(tsrc, plans, utc_at_east8(D, 9, 16, 0))
+    poller.poll_once(utc_at_east8(D, 9, 16, 0))
+    s2 = poller.poll_once(utc_at_east8(D, 9, 17, 0))[0]
+    assert poller._history.get("600000.SH")        # 已累积历史帧
+    assert s2.tick_seq == 2                          # 第二帧序号=2（含本帧）
+    # 次日盘前重置 → 清空累积帧
+    poller.reset_history()
+    assert poller._history == {}
+    # 重置后 tick_seq 从 1 重新起算（不被前日帧数抬高，留痕不失真）
+    s_after = poller.poll_once(utc_at_east8(D, 9, 18, 0))[0]
+    assert s_after.tick_seq == 1
+
+
 # ---------------------------------------------------------------------------
 # 8. 整体降级 B（get_full_tick 只回 last_price / 或抛错）
 # ---------------------------------------------------------------------------

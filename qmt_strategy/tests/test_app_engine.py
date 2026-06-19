@@ -159,6 +159,40 @@ def test_empty_position_state_blocks_open():
     assert deps.trader.order_calls == []                # 空仓禁开新仓
 
 
+def test_transient_risk_block_releases_lock_allows_later_buy():
+    """评审 doc/21 E1：单帧瞬时风控拒单（行情中断）应解锁幂等，使条件恢复后的后续帧能重评下单（破 fail-then-stuck）。
+
+    原缺陷：on_auction_snapshot 在产出 BUY 的那一帧即把 ts_code 锁进 _decided，而 _open_blocked_by_risk/
+    _limit_price_sane 晚于它执行；单帧瞬时拒单不解锁 → 该票当日被永久锁死、再不评估 = 该买不买。
+    """
+    deps = _deps({"QMT_AUCTION_TIMING_ENABLED": "true"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    # 这一帧行情中断 → risk.gate FREEZE → _open_blocked_by_risk True：拒单但应解锁。
+    eng.report_market_feed(False)
+    eng._router_sink(_strong_auction_snap())
+    assert deps.trader.order_calls == []                       # 本帧未下单
+    assert "600036.SH" not in eng._entry._decided              # 已解锁（关键：未被永久锁死）
+    # 行情恢复后的后续帧 → 重评并真正下单（证明瞬时拒单未把强龙头锁死）。
+    eng.report_market_feed(True)
+    eng._router_sink(_strong_auction_snap())
+    assert len(deps.trader.order_calls) == 1
+    assert deps.trader.order_calls[0][0] == "600036.SH"
+
+
+def test_persistent_risk_block_dedups_留痕_no_flood():
+    """评审 doc/21 E1 复审：持久拒因下解锁重评不洪泛——每票每拒因每日只留痕一次（防 decision_log/日志洪泛）。"""
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    eng._reconcile_blocked = True             # 持久拒因（对账未通过，不会因帧变化而恢复）
+    for _ in range(5):
+        eng._router_sink(_strong_auction_snap())
+    assert deps.trader.order_calls == []      # 持续禁开新仓
+    # 解锁重评 5 帧，但对账阻断内部留痕被 quiet 去抖、只记一次（否则 5 帧 ×N 票会洪泛）。
+    assert deps.logger.events().count("engine_open_blocked_reconcile_unconfirmed") == 1
+
+
 def _two_candidate_deps(env=None):
     """两只候选：600036.SH 强度 90、600000.SH 强度 30（用于验证强度加权分配）。"""
     rows = []

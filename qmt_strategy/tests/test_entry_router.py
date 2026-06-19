@@ -243,6 +243,24 @@ def test_idempotent_buy_then_none():
     assert len([d for d in log if d.ts_code == plan.ts_code]) == 1
 
 
+def test_reset_day_clears_idempotent_lock_allows_next_day_buy():
+    """评审 doc/21 E2：reset_day 清空当日幂等锁 → 昨日已 BUY 的票次日可再次路由出 BUY（破跨日「该买不买」）。"""
+    router, _, _ = _router()
+    plan = make_plan_row(strategy_family="打板", setup="首板", market_state="启动")
+    snap = _snap(open_pct=Decimal("0.06"), auction_vol_ratio=Decimal("0.5"),
+                 centroid_trend=CentroidTrend.UP, last_price=Decimal("10.60"))
+    first = router.on_auction_snapshot(snap, plan)
+    assert first is not None and first.action == EntryAction.CHASE_AUCTION_STRONG
+    assert router.on_auction_snapshot(snap, plan) is None        # 当日幂等短路
+    # 次日盘前重置 → 幂等集 + 去抖留痕清空
+    router.reset_day()
+    assert plan.ts_code not in router._decided
+    assert router._last_recorded_action == {}
+    # 同票次日再入选 watchlist → 不再被永久短路，可再次路由出 BUY
+    second = router.on_auction_snapshot(snap, plan)
+    assert second is not None and second.action == EntryAction.CHASE_AUCTION_STRONG
+
+
 def test_skip_not_marked_decided_allows_later_buy():
     """SKIP 不登记幂等集合：先弱开 SKIP，后续帧转强仍可再路由出 BUY（§4.2 末仅 BUY 幂等）。"""
     router, _, _ = _router()

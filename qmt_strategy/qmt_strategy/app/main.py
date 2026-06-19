@@ -239,6 +239,11 @@ class Engine:
         self._reconcile_blocked = False
         # 竞价择时关时"仅采集"留痕去抖集合（复审 P2-2）：同一票每帧重复采集会洪泛日志，每票每日只留痕一次。
         self._auction_collect_logged: set = set()
+        # 编排层拒单留痕去抖集合（评审 doc/21 E1 复审）：E1 让风控/限价拒单分支每帧解锁重评以容瞬时拒因恢复，
+        # 但持久拒因（存储不健康/对账阻断/退潮冰点/限价口径错等）会每帧×每票重复 emit SKIP_ORCHESTRATION 到
+        # decision_log（有界队列 2000，洪泛会 drop 真实决策行）+ 刷 engine 日志。这里按 (ts_code, reason_code)
+        # 去抖：每票每拒因每日只留痕一次（与 _auction_collect_logged 同范本），解锁/重评照常、仅抑制重复留痕。
+        self._orch_block_logged: set = set()
 
     # ------------------------------------------------------------------
     # 对外暴露（供 main / 连接守护注册回调 / 调度）
@@ -366,6 +371,12 @@ class Engine:
         # 盘口源在断流时置 False；避免前一日末轮的 False 状态跨日残留，导致开盘即全程冻结。
         self._market_feed_ok = True
         self._auction_collect_logged.clear()  # 新交易日重置竞价采集去抖集合（复审 P2-2）
+        self._orch_block_logged.clear()        # 新交易日重置编排层拒单留痕去抖集合（评审 doc/21 E1 复审）
+        # 新交易日重置建仓路由/竞价采集的【当日】状态（评审 doc/21 E2/E3）：
+        # - EntryRouter._decided/_last_recorded_action：清当日幂等锁，否则昨日已成交标的次日被永久短路不建仓（E2）。
+        # - AuctionPoller._history：清累积帧，否则跨日无界增长 + tick_seq 失真（E3）。
+        self._entry.reset_day()
+        self._poller.reset_history()
         # 对账阻断标记（评审二轮 P1#9）：上一交易日对账未通过且未人工清除 → 今日只守仓不开新仓。
         self._reconcile_blocked = self._read_reconcile_block()
         if self._reconcile_blocked:
@@ -565,7 +576,7 @@ class Engine:
         dd = (self._day_open_equity - cur_dec) / self._day_open_equity
         return dd if dd > 0 else Decimal("0")
 
-    def _open_blocked_by_risk(self, ts_code: str) -> bool:
+    def _open_blocked_by_risk(self, ts_code: str, *, quiet: bool = False) -> bool:
         """买入前风控总闸（评审 P0-B1/B2）：返回 True 表示禁止开新仓。
 
         判据（任一命中即禁开）：
@@ -573,14 +584,20 @@ class Engine:
         - is_open_blocked(market_state)：退潮/冰点/空仓等情绪周期禁开（市场级，§5.4.2）。
         注意：本闸门只管「开新仓」；卖出（风险减仓）不受账户回撤/空仓闸门影响，避免冻结必要的止损出场，
         故 run_sell_pass 的 gate 仍只用行情/下单中断口径（不喂账户回撤）。
+
+        quiet（评审 doc/21 E1 复审）：E1 让 _router_sink 拒单分支每帧解锁重评，本闸被每帧调用；持久拒因
+        （存储/对账/回撤/情绪周期）每帧刷 error/info 日志会洪泛。quiet=True 时只算裁决、不打内部留痕日志
+        （由调用方据去抖集合 _orch_block_logged 决定是否仍是「首帧」需留痕）；裁决结果与 quiet 无关、始终正确。
         """
         # —— 存储 fail-closed（评审二轮 P0#2）：持久化失效则禁开新仓（重启幂等/对账依赖可信落盘）——
         if not self._storage_ok:
-            self._logger.error("engine_open_blocked_storage_unhealthy", ts_code=ts_code)
+            if not quiet:
+                self._logger.error("engine_open_blocked_storage_unhealthy", ts_code=ts_code)
             return True
         # —— 对账未通过阻断（评审二轮 P1#9）：上一交易日对账有漏单/串单/资产偏差且未人工清除 → 禁开新仓——
         if self._reconcile_blocked:
-            self._logger.error("engine_open_blocked_reconcile_unconfirmed", ts_code=ts_code)
+            if not quiet:
+                self._logger.error("engine_open_blocked_reconcile_unconfirmed", ts_code=ts_code)
             return True
         # —— 账户回撤闸缺基线 fail-closed（评审 F15）：运维显式启用回撤保护(account_drawdown_limit 非 None)，
         # 但盘前日初权益基线抓取失败(_day_open_equity 为 None) → 整日算不出回撤、回撤熔断形同虚设(fail-open)。
@@ -589,14 +606,16 @@ class Engine:
         if self._settings.account_drawdown_limit is not None and (
             self._day_open_equity is None or self._day_open_equity <= 0
         ):
-            self._logger.error("engine_open_blocked_drawdown_no_baseline", ts_code=ts_code)
+            if not quiet:
+                self._logger.error("engine_open_blocked_drawdown_no_baseline", ts_code=ts_code)
             return True
         # —— 账户回撤 fail-closed（评审二轮 P2#70）：有日初基线但当前资产查询失败 → 无法核验回撤 →
         # 禁开新仓（不冻结卖出）。原实现 _account_drawdown() 失败返 None → gate 当"无回撤"放行 = 账户级
         # 止损闸 fail-open。这里在有基线时把"算不出回撤"显式当作"不可放行开仓"。
         drawdown = self._account_drawdown()
         if self._day_open_equity is not None and self._day_open_equity > 0 and drawdown is None:
-            self._logger.error("engine_open_blocked_drawdown_unknown", ts_code=ts_code)
+            if not quiet:
+                self._logger.error("engine_open_blocked_drawdown_unknown", ts_code=ts_code)
             return True
         verdict = self._risk.gate(
             market_state=self._market_state,
@@ -607,13 +626,14 @@ class Engine:
             unit_float_loss=None,        # 开新仓为全新标的，无既有浮亏
         )
         if verdict.verdict != RiskVerdict.ALLOW or self._risk.is_open_blocked(self._market_state):
-            self._logger.info(
-                "engine_open_blocked_by_risk",
-                ts_code=ts_code,
-                verdict=str(verdict.verdict),
-                market_state=self._market_state,
-                reason=verdict.reason,
-            )
+            if not quiet:
+                self._logger.info(
+                    "engine_open_blocked_by_risk",
+                    ts_code=ts_code,
+                    verdict=str(verdict.verdict),
+                    market_state=self._market_state,
+                    reason=verdict.reason,
+                )
             return True
         return False
 
@@ -894,14 +914,23 @@ class Engine:
             return
         # 风控总闸（评审 P0-B1/B2）：买入也必须过 risk.gate——账户日内回撤击穿 / 行情或下单中断 /
         # 空仓 / 退潮冰点 → 禁开新仓。原实现买入路径完全绕过 gate，账户熔断对开仓零作用。
-        if self._open_blocked_by_risk(decision.ts_code):
-            self._emit_decision(
-                decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
-                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
-                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
-                order_phase=decision.order_phase, reason="风控总闸禁开新仓", reason_code="risk_block",
-                factors=decision.factors_snapshot,
-            )
+        # 去抖键（评审 doc/21 E1 复审）：首帧才留痕，并据此让 _open_blocked_by_risk 的内部 fail-closed 日志静默重复帧。
+        risk_key = (decision.ts_code, "risk_block")
+        if self._open_blocked_by_risk(decision.ts_code, quiet=risk_key in self._orch_block_logged):
+            if risk_key not in self._orch_block_logged:
+                self._orch_block_logged.add(risk_key)
+                self._emit_decision(
+                    decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
+                    ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                    trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                    order_phase=decision.order_phase, reason="风控总闸禁开新仓", reason_code="risk_block",
+                    factors=decision.factors_snapshot,
+                )
+            # 解锁幂等以容后续帧重评（评审 doc/21 E1）：on_auction_snapshot 在产出 BUY 的那一帧即已把 ts_code
+            # 锁进 _decided，而本风控闸晚于它执行；若拒单不解锁，单帧瞬时拒单（行情/下单中断、账户回撤查询瞬断
+            # fail-closed 等）会把该票永久锁死、当日再不评估 = 该买不买。这里拒单即解锁，使条件恢复后的后续帧能重评；
+            # 留痕由上面的 _orch_block_logged 去抖（每票每拒因每日一次），解锁/重评照常不受影响。
+            self._entry.release(decision.ts_code)
             return
         # 竞价择时闸门：竞价单仅在实测开关打开时下单，否则只采集留痕（§7.1.6）。
         if decision.order_phase == OrderPhase.AUCTION and not self._settings.auction_timing_enabled:
@@ -928,14 +957,22 @@ class Engine:
         # 防价位口径错误（如 ST 误算成 10%、参考价兜底错位）直发废单或追高失控。
         sane, why = self._limit_price_sane(decision, plan, snap)
         if not sane:
-            self._logger.warn("engine_limit_price_rejected", ts_code=decision.ts_code, reason=why)
-            self._emit_decision(
-                decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
-                ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
-                trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
-                order_phase=decision.order_phase, reason=f"限价校验未过:{why}", reason_code="limit_price_guard",
-                limit_price=decision.limit_price, factors=decision.factors_snapshot,
-            )
+            # 留痕去抖（评审 doc/21 E1 复审）：限价拒因（缺现价瞬时 / 口径错持久）在解锁重评下会每帧重复，
+            # 每票每日只 warn+emit 一次，避免洪泛 decision_log/日志；解锁照常以容瞬时拒因恢复。
+            limit_key = (decision.ts_code, "limit_price_guard")
+            if limit_key not in self._orch_block_logged:
+                self._orch_block_logged.add(limit_key)
+                self._logger.warn("engine_limit_price_rejected", ts_code=decision.ts_code, reason=why)
+                self._emit_decision(
+                    decision_type="SKIP_ORCHESTRATION", decision_stage="ORCHESTRATION", action="SKIP",
+                    ts_code=decision.ts_code, signal_trade_date=decision.signal_trade_date,
+                    trade_date=decision.target_trade_date, strategy_family=decision.strategy_family,
+                    order_phase=decision.order_phase, reason=f"限价校验未过:{why}", reason_code="limit_price_guard",
+                    limit_price=decision.limit_price, factors=decision.factors_snapshot,
+                )
+            # 解锁幂等以容后续帧重评（评审 doc/21 E1）：限价偏离护栏在 snap.last_price 缺失（降级/无 tick 帧）时
+            # fail-closed 拒发，若拒单不解锁则该票被这一坏帧永久锁死；解锁使后续有效盘口帧能重评下单。
+            self._entry.release(decision.ts_code)
             return
         # 通过全部闸门 → 下单（place 内仍有 kill_switch / 幂等 / 资金校验）。
         self._order.place(decision)
