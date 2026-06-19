@@ -544,3 +544,53 @@ def test_reconcile_unknown_side_trade_degrades_asset_check():
     assert report.asset_discrepancy is None
     assert report.asset_checked is False
     assert "reconcile_asset_skipped_unknown_side" in logger.events()
+
+
+# ---------------------------------------------------------------------------
+# 评审 doc/21 R1/R2/R3：对账关联缺陷
+# ---------------------------------------------------------------------------
+def test_r1_error_ledger_row_does_not_grab_orphan_sell_report():
+    """R1：同步失败的 ERROR 卖单台账行(order_id=None)不参与关联、不弱关联抢走无主的真实卖单回报。"""
+    e_err = _ledger_entry(biz_order_no="s_err", order_id=None, state=OrderState.ERROR,
+                          side=TradeSide.SELL, filled_volume=0)
+    o = _order_record(order_id=777, side=TradeSide.SELL)  # 一笔真实卖单回报，台账无强关联主
+    rec, logger, _, _ = _build([e_err], [o], [])
+    report = rec.run(T_BUY)
+    kinds = [d.kind for d in report.order_discrepancies]
+    assert "order_failed" in kinds       # ERROR 行正确归 order_failed（不抢回报）
+    assert "manual_order" in kinds        # 真实回报无台账主 → 正确标手工单（未被 ERROR 行掩盖）
+    assert report.matched_orders == 0     # ERROR 行不计 matched
+
+
+def test_r2_strong_relation_first_prevents_weak_stealing_sibling_report():
+    """R2：强关联优先两遍法 → 缺 order_id 的卖单台账行不抢走强关联兄弟单的回报致兄弟单误报漏单。"""
+    e_weak = _ledger_entry(biz_order_no="wk", order_id=None, state=OrderState.SUBMITTED,
+                           side=TradeSide.SELL, filled_volume=0)
+    e_strong = _ledger_entry(biz_order_no="st", order_id=601, state=OrderState.TRADED, side=TradeSide.SELL)
+    o_strong = _order_record(order_id=601, side=TradeSide.SELL)
+    rec, _, _, _ = _build([e_weak, e_strong], [o_strong], [])  # e_weak 先插入，验证两遍法仍先处理强关联
+    report = rec.run(T_BUY)
+    missing = [d.biz_order_no for d in report.order_discrepancies if d.kind == "missing_report"]
+    assert "st" not in missing            # 强关联全成单未被弱台账行抢报致误判漏单
+
+
+def test_r2_sell_weak_match_multi_candidate_warns_ambiguous():
+    """R2：缺 order_id 的卖单弱关联命中多条同标的回报 → 落歧义告警（不静默任意认领）。"""
+    e1 = _ledger_entry(biz_order_no="sw1", order_id=None, state=OrderState.SUBMITTED,
+                       side=TradeSide.SELL, filled_volume=0)
+    o1 = _order_record(order_id=801, side=TradeSide.SELL)
+    o2 = _order_record(order_id=802, side=TradeSide.SELL)
+    rec, logger, _, _ = _build([e1], [o1, o2], [])
+    rec.run(T_BUY)
+    assert "reconcile_sell_weak_match_ambiguous" in logger.events()
+
+
+def test_r3_orphan_trade_no_order_detected():
+    """R3：有成交无委托(qmt_trade 的 order_id 不在 qmt_order)→ 检出孤儿成交 + needs_backfill + 告警。"""
+    t = _trade_record(traded_id="orphan1", order_id=999, side=TradeSide.SELL, traded_volume=500)
+    rec, logger, _, _ = _build([], [], [t])  # 无任何 qmt_order（委托回报漏采）
+    report = rec.run(T_BUY)
+    assert report.needs_backfill is True
+    orphan = [d for d in report.trade_discrepancies if "孤儿成交" in (d.detail or "")]
+    assert orphan and orphan[0].order_id == 999 and orphan[0].trade_volume_sum == 500
+    assert "reconcile_orphan_trade_no_order" in logger.events()

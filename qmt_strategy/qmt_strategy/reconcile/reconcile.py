@@ -284,7 +284,13 @@ class Reconcile:
         ledger_order_ids_today: set = {e.order_id for e in ledger_entries if e.order_id is not None}
 
         # 台账→回报：逐条计划单找对应回报（matched_order_ids 同时作为"已消费回报"集合，保证一对一）。
-        for e in ledger_entries:
+        # 强关联优先两遍法（评审 doc/21 R2）：先处理【已回填 order_id】的台账行（强关联候选），再处理缺 order_id 的
+        # （只能弱关联）。否则缺 order_id 的卖单台账行若在其同标的强关联兄弟单之前被处理，会按 ts_code+方向抢走兄弟单
+        # 本应强关联的回报 → 兄弟单落 missing_report（误置 reconcile_blocked 阻断次日开仓）、被抢回报另被误标手工单。
+        # 两遍法保证强关联先认领各自 order_id 回报、加入 consumed，再轮到弱关联在剩余回报里匹配。
+        ordered_entries = [e for e in ledger_entries if e.order_id is not None] + \
+            [e for e in ledger_entries if e.order_id is None]
+        for e in ordered_entries:
             matched = self._match_ledger_to_order(e, orders_by_id, orders, matched_order_ids)
             if matched is not None:
                 matched_order_ids.add(matched.order_id)
@@ -367,8 +373,17 @@ class Reconcile:
         - #35：卖单 order_remark 形如 `SELL|reason`（不含 ts_code / T，与买单 `LUP|T|ts_code` 不同前缀），
           原弱关联只认 `LUP|` → 缺 order_id 的卖单恒弱关联失败、被误报漏单。卖单改按【归一 ts_code + 方向】弱关联。
         """
+        consumed = consumed_order_ids if consumed_order_ids is not None else set()
+        # ERROR 台账行不参与关联（评审 doc/21 R1）：同步下单失败的 ERROR 行（委托未被券商受理、order_id=None）
+        # 本不该有 qmt_order 回报；若放它走弱关联，会按「归一 ts_code + 方向」抢走同标的一笔【真实】卖单回报 →
+        # 既掩盖该失败（误计 matched，fail-open）、又使真实回报被消费致其本主台账行落 missing_report（误置
+        # reconcile_blocked 阻断次日开仓，spurious fail-closed）。直接判不匹配，由 _reconcile_orders 据 e.state==ERROR
+        # 正确归为 order_failed（良性、不阻断）。
+        if self._ledger_state_is_error(e):
+            return None
         # 强关联：台账已回填 order_id 且回报存在该 order_id（并校验方向，#36）。
-        if e.order_id is not None and e.order_id in orders_by_id:
+        # consumed 校验（评审 doc/21 R1）：同一 order_id 不被两条台账行重复强配（双重 matched 计数 + 抢报）。
+        if e.order_id is not None and e.order_id in orders_by_id and e.order_id not in consumed:
             cand = orders_by_id[e.order_id]
             if cand.trade_side == e.side:
                 return cand
@@ -383,8 +398,8 @@ class Reconcile:
                 return cand
             # 方向不符（疑似 order_id 跨日复用串单）：不强配，落入弱关联兜底。
         # 弱关联：order_id 缺失 / 方向不符时按方向 + 业务键匹配（仅非 ERROR 回报）。
-        consumed = consumed_order_ids if consumed_order_ids is not None else set()
         e_code = _resolve(e.ts_code)
+        sell_candidates: List[OrderRecord] = []  # 卖单弱关联多候选歧义检测（评审 doc/21 R2）
         for o in orders:
             if o.order_status == OrderStatus.ERROR:
                 continue
@@ -397,7 +412,7 @@ class Reconcile:
             if o.trade_side != e.side and o.trade_side != TradeSide.UNKNOWN:
                 continue
             if e.side == TradeSide.BUY:
-                # 买单：按 order_remark(LUP|T|ts_code) 解析的 ts_code + 信号日 T 弱关联。
+                # 买单：按 order_remark(LUP|T|ts_code) 解析的 ts_code + 信号日 T 弱关联（唯一可定位，首条命中即返回）。
                 remark_code = self._ledger_biz_from_remark(o.order_remark)
                 remark_t = parse_order_remark(o.order_remark)
                 if (
@@ -408,9 +423,21 @@ class Reconcile:
                 ):
                     return o
             else:
-                # 卖单（#35）：remark 不含 ts_code，按【归一 ts_code + 方向】弱关联（方向上方已校验）。
+                # 卖单（#35）：remark 不含 ts_code，只能按【归一 ts_code + 方向】弱关联（方向上方已校验）。
+                # 多候选收集（评审 doc/21 R2）：同标的多笔卖单(先 REDUCE 后 CLEAR)且其一缺 order_id 走弱关联时，
+                # 仅 ts_code+方向无法唯一区分 → 先收集全部未消费同标的同向候选，多于 1 条落歧义告警而非静默任意认领。
                 if e_code is not None and _resolve(o.ts_code) == e_code:
-                    return o
+                    sell_candidates.append(o)
+        if sell_candidates:
+            if len(sell_candidates) > 1:
+                # 多候选歧义：缺 order_id 卖单按 ts_code+方向命中多条回报，按首条认领可能张冠李戴 → 显式强告警
+                # 供人工核对（评审 doc/21 R2，不静默任意认领；配合 _reconcile_orders 的强关联优先两遍法收窄触发）。
+                self._logger.warn(
+                    "reconcile_sell_weak_match_ambiguous",
+                    ts_code=e.ts_code, biz_order_no=e.biz_order_no, candidates=len(sell_candidates),
+                    note="缺 order_id 卖单弱关联命中多条同标的回报，按首条认领可能张冠李戴，需人工核对 order_id 回填",
+                )
+            return sell_candidates[0]
         return None
 
     @staticmethod
@@ -464,6 +491,30 @@ class Reconcile:
                     order_traded_volume=order_vol,
                     trade_volume_sum=sum_vol,
                 )
+
+        # 孤儿成交检测（评审 doc/21 R3）：成交回报存在（order_id 在 qmt_trade）但对应【委托回报完全缺失】
+        # （order_id 不在 qmt_order）——即「有成交、无委托」的典型【委托回报漏采】时序。原四类勾稽只从 orders 侧
+        # 反查 trades（上方 for o in orders），此类孤儿成交不被任一 order 命中、也不在委托/滑点勾稽出现 → 漏单/
+        # 漏采的「最后一道闸」对它失效、不报警不补采，与本模块自述相悖。这里补检：落 trade_discrepancy +
+        # needs_backfill（触发 query_stock_orders 补采委托）+ error 告警，使「有成交无委托」漏采被捕获、补采、纳入阻断。
+        order_ids_present = {o.order_id for o in orders if o.order_id is not None}
+        ts_by_order = {t.order_id: getattr(t, "ts_code", None) for t in trades if t.order_id is not None}
+        for oid, vol in trade_vol_by_order.items():
+            if oid in order_ids_present:
+                continue  # 委托回报存在（含 ERROR 行）→ 非孤儿，由上方量勾稽处理
+            disc = TradeDiscrepancy(
+                order_id=oid,
+                ts_code=ts_by_order.get(oid),
+                order_traded_volume=0,
+                trade_volume_sum=vol,
+                needs_backfill=True,
+                detail="qmt_trade 有成交但 qmt_order 无对应委托回报：委托回报漏采(孤儿成交)，需 query_stock_orders 补采",
+            )
+            report.trade_discrepancies.append(disc)
+            self._logger.error(
+                "reconcile_orphan_trade_no_order",
+                order_id=oid, ts_code=ts_by_order.get(oid), trade_volume_sum=vol,
+            )
 
     # ---------------------------------------------------------------
     # 资产对账（§6.7 第三类，粗校验）
