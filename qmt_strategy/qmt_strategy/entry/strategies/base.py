@@ -2,7 +2,7 @@
 
 业务意图：
 - 把「按 action 判定如果…就买 / 弃」的逻辑抽象为统一策略接口 ``EntryStrategy``，每类 action
-  一个实现文件（chase_limit_up / chase_auction_strong / dip_buy_ma / leader_pullback / skip），
+  一个实现文件（chase_limit_up / chase_auction_strong / dip_buy_ma / skip；leader_pullback 已随 J-2 弃用删除），
   便于单测与扩展（§4.1 各策略一文件）。
 - 提供注册 / 选择机制（``register`` 装饰器 + ``get_strategy``），entry_router 据
   (strategy_family, setup) 推出 action 后，按 action 取对应策略实例。

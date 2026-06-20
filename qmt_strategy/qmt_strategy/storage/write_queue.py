@@ -57,6 +57,12 @@ class AsyncWriteQueue:
         # 最近一次写是否成功（仅写线程写、健康检查线程读；CPython bool 读写原子，不引锁以免污染热路径）。
         # 让 is_healthy 纳入「最近写成功」而非只看线程存活，否则磁盘满下写线程存活但持续丢数据仍误报健康。
         self._last_write_ok = True
+        # E-4（评审 doc/24）：健康位 sticky 门闩——任一写失败即置 degraded，**单次成功不清零**，需连续
+        # _fail_after 次成功（持续恢复）才解除。否则「失败、成功、失败、成功…」间歇丢数据时 _consecutive_fail
+        # 永攒不到阈值、is_healthy 在 True/False 间抖动、storage_health_tick 恰落「刚成功」即漏判，而期间失败的
+        # 成交/状态写已被 rollback 丢弃（write-behind 不重投）→ 台账与券商不一致却无人察觉。
+        self._write_degraded = False     # sticky：任一写失败置 True
+        self._healthy_streak = 0         # 连续成功计数，达 _fail_after 才解除 degraded
         # on_failure：存储不可用时的告警钩子（写线程已死/建连失败）。供上层触发停盘/运维告警,不抛错(不影响交易)。
         self._on_failure = on_failure
         self._q: "queue.Queue[WriteTask]" = queue.Queue()
@@ -114,7 +120,15 @@ class AsyncWriteQueue:
         # 队列上限熔断（评审三轮 EXEC-storage-03）：写线程阻塞挂起(如 fsync 永久卡死)时无界堆积会内存爆掉；
         # max_queue>0 且积压超限时显式丢弃本任务 + 强告警 + on_failure，绝不静默无界堆积。
         if self._max_queue > 0 and self._q.qsize() >= self._max_queue:
+            # 溢出即丢弃本任务——但丢弃的可能是「发单前 PLANNED 关键落盘」。若此时 is_healthy 仍报健康，
+            # _persist_critical_before_order 会在「flush_confirm 超时 + 健康」下放行下单（评审 doc/24 E-1），
+            # 导致券商已收委托而本机 SQLite 无台账行、崩溃重启读不到 → 同一计划重复下单（真金重复建仓）。
+            # 故溢出视为存储级 fail-closed 故障：置 _last_write_ok=False + set _failed，使 is_healthy 立即转 False、
+            # flush_confirm 立即判失败（line 255 已先检 _failed），当前这笔发单前关键落盘即被拒发；并触发 on_failure
+            # 告警停开新仓。_failed 一旦置位即持久 fail-closed（队列打到上限=持久化已严重崩坏，本日不再带病交易）。
             self._logger.error("write_queue_overflow", depth=self._q.qsize(), name=self._name)
+            self._last_write_ok = False
+            self._failed.set()
             self._invoke_on_failure("write_queue_overflow")
             return
         self._q.put_nowait(task)
@@ -145,6 +159,7 @@ class AsyncWriteQueue:
             and self._thread is not None
             and self._thread.is_alive()
             and self._last_write_ok
+            and not self._write_degraded
             and not self._is_stuck()
         )
 
@@ -191,6 +206,10 @@ class AsyncWriteQueue:
                 # 写成功：清零连续失败计数 + 置最近写成功（评审三轮 EXEC-storage-03）。
                 self._consecutive_fail = 0
                 self._last_write_ok = True
+                # E-4 sticky 恢复：需连续 _fail_after 次成功（持续恢复）才解除 degraded，单次成功不清零。
+                self._healthy_streak += 1
+                if self._write_degraded and self._healthy_streak >= self._fail_after:
+                    self._write_degraded = False
             except Exception as e:
                 # 关键不变量 2：写失败只记日志 + 回滚，绝不冒泡到交易线程。
                 try:
@@ -204,6 +223,9 @@ class AsyncWriteQueue:
                 # 即 _failed.set()+on_failure，让 is_healthy 转 False、上层 fail-closed（区分瞬时锁等待与持续故障）。
                 self._consecutive_fail += 1
                 self._last_write_ok = False
+                # E-4：任一写失败即 sticky 置 degraded + 清零成功连击；is_healthy 据此持续 False 直到持续恢复。
+                self._write_degraded = True
+                self._healthy_streak = 0
                 if self._consecutive_fail >= self._fail_after and not self._failed.is_set():
                     self._failed.set()
                     self._logger.error(

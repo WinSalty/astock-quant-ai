@@ -326,28 +326,8 @@ def test_dip_buy_ma_abandon_overheat():
     assert "高开超" in decision.reason
 
 
-def test_leader_pullback_buy():
-    """LEADER_PULLBACK 买：龙头强度高 + 续板不弱 → 限价吸。"""
-    router, _, _ = _router()
-    plan = make_plan_row(strategy_family="龙回头", setup="高位回踩", market_state="启动",
-                         leader_strength_score=Decimal("0.8"), continuation_prob=Decimal("0.6"),
-                         reasonable_open_low=Decimal("9.80"))
-    snap = _snap(open_pct=Decimal("0.02"), centroid_trend=CentroidTrend.UP, last_price=Decimal("10.20"))
-    decision = router.route(plan, snap)
-    assert decision.action == EntryAction.LEADER_PULLBACK
-    assert decision.limit_price == Decimal("10.20")
-    assert decision.order_phase == OrderPhase.OPENING
-
-
-def test_leader_pullback_abandon_weak_strength():
-    """LEADER_PULLBACK 弃：龙头强度不足（被新龙头取代）→ SKIP。"""
-    router, _, _ = _router()
-    plan = make_plan_row(strategy_family="龙回头", setup="高位回踩", market_state="启动",
-                         leader_strength_score=Decimal("0.2"), continuation_prob=Decimal("0.6"))
-    snap = _snap(open_pct=Decimal("0.02"), centroid_trend=CentroidTrend.UP, last_price=Decimal("10.20"))
-    decision = router.route(plan, snap)
-    assert decision.action == EntryAction.SKIP
-    assert "强度不足" in decision.reason
+# J-2（评审 doc/26）：原 test_leader_pullback_buy / test_leader_pullback_abandon_weak_strength 已随
+# LEADER_PULLBACK 死策略删除而移除（信号侧不产『龙回头』语义、该分支恒不可达）。
 
 
 def test_skip_action_unmatched_family():
@@ -638,7 +618,6 @@ def test_dip_buy_ma_rejects_garbage_low_last_price():
 # 打板因子 E2：策略消费新因子（默认关=零行为变化；配阈值才生效，双守卫不误杀，脏时刻 fail-open）
 # ===========================================================================
 from qmt_strategy.entry.strategies.chase_limit_up import ChaseLimitUpStrategy  # noqa: E402
-from qmt_strategy.entry.strategies.leader_pullback import LeaderPullbackStrategy  # noqa: E402
 
 
 def _topped_snap():
@@ -695,19 +674,7 @@ def test_e2_dip_buy_takes_open_times_not_high_return():
     assert out.action == EntryAction.DIP_BUY_MA
 
 
-def test_e2_leader_pullback_first_limit_too_late_and_fail_open():
-    """龙回头：首封晚于 deadline → 弃；脏/缺时刻 fail-open 不触发（不误杀）。"""
-    strat = LeaderPullbackStrategy()
-    snap = _snap(last_price=Decimal("10.50"))
-    s = _settings(pullback_entry_deadline_hm="09:45")
-    out = strat.decide(make_plan_row(first_limit_time="10:30:00"), snap, s)
-    assert out.action == EntryAction.SKIP and "首封太晚" in out.reason
-    assert strat.decide(make_plan_row(first_limit_time="09:31:00"), snap, s).action == (
-        EntryAction.LEADER_PULLBACK
-    )
-    # 脏时刻 / 缺时刻 → fail-open 不弃。
-    assert strat.decide(make_plan_row(first_limit_time="坏数据"), snap, s).action == EntryAction.LEADER_PULLBACK
-    assert strat.decide(make_plan_row(first_limit_time=None), snap, s).action == EntryAction.LEADER_PULLBACK
+# J-2（评审 doc/26）：原 test_e2_leader_pullback_first_limit_too_late_and_fail_open 已随 LeaderPullbackStrategy 删除而移除。
 
 
 def test_e2_chase_auction_strong_high_return_before_degrade_b():

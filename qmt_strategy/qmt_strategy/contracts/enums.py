@@ -114,7 +114,9 @@ class EntryAction(StrEnum):
     CHASE_LIMIT_UP = "CHASE_LIMIT_UP"          # 打板跟买
     CHASE_AUCTION_STRONG = "CHASE_AUCTION_STRONG"  # 竞价强开追
     DIP_BUY_MA = "DIP_BUY_MA"                  # 均线低吸
-    LEADER_PULLBACK = "LEADER_PULLBACK"        # 龙回头
+    LEADER_PULLBACK = "LEADER_PULLBACK"        # 龙回头（J-2 评审 doc/26：已弃用——信号侧不产出『龙回头』
+    #                                            语义、该策略对真实 payload 恒不可达，LeaderPullbackStrategy 实现已删除；
+    #                                            枚举保留仅为兼容历史台账/复盘数据，路由不再产出此动作）
     SKIP = "SKIP"                              # 放弃（仍留痕）
 
 

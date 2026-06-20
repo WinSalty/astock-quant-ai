@@ -211,3 +211,49 @@ def test_per_interface_token_fallback_and_override():
     assert s2.resolve_watchlist_token() == "wl"        # 各取各自，运维隔离权限不互相 401
     assert s2.resolve_ingest_token() == "ing"
     assert s2.resolve_signal_token() == "unified"
+
+
+def test_redacted_hides_split_interface_tokens():
+    """评审 doc/24 E-5：分接口 token（watchlist/ingest）用 env 直配时，redacted() 必须脱敏，
+    不得明文进 engine_boot 启动日志。"""
+    s = Settings.from_env(
+        {
+            "QMT_SIGNAL_WATCHLIST_TOKEN": "wl-secret-123",
+            "QMT_SIGNAL_INGEST_TOKEN": "ig-secret-456",
+        }
+    )
+    red = s.redacted()
+    assert red["signal_watchlist_token"] == "***REDACTED***"
+    assert red["signal_ingest_token"] == "***REDACTED***"
+    # 真值绝不出现在脱敏快照里
+    assert "wl-secret-123" not in str(red)
+    assert "ig-secret-456" not in str(red)
+
+
+def test_explicit_zero_not_swallowed():
+    """评审 doc/24 E-7：显式配 0 不被 `or 默认` 当假值吞（与 seal_ratio_min 等同口径）。"""
+    s = Settings.from_env(
+        {
+            "QMT_ORDER_TTL_SECONDS": "0",
+            "QMT_AUCTION_POLL_INTERVAL_SEC": "0",
+            "QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD": "0",
+            "QMT_CANCEL_GRACE_SECONDS": "0",
+            "QMT_DECISION_LOG_QUEUE_SIZE": "0",
+        }
+    )
+    assert s.order_ttl_seconds == 0          # 原 bug：被 or 60 吞回 60
+    assert s.auction_poll_interval_sec == 0.0
+    assert s.trade_conn_heartbeat_fail_threshold == 0
+    assert s.cancel_grace_seconds == 0
+    assert s.decision_log_queue_size == 0
+
+
+def test_invalid_numeric_env_fails_closed():
+    """评审 doc/24 E-8：非空非法数值即 fail-closed 启动报错（不静默回默认），错误含原值。"""
+    import pytest
+
+    with pytest.raises(ValueError) as ei:
+        Settings.from_env({"QMT_MAX_POSITIONS_PER_DAY": "abc"})
+    assert "abc" in str(ei.value)
+    # 空串/未配仍走默认，不报错
+    assert Settings.from_env({"QMT_MAX_POSITIONS_PER_DAY": ""}).max_positions_per_day == 5

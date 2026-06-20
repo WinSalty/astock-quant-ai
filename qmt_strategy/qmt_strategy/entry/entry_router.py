@@ -29,7 +29,6 @@ from .strategies import base as strategy_base
 from .strategies import chase_limit_up as _chase_limit_up  # noqa: F401
 from .strategies import chase_auction_strong as _chase_auction_strong  # noqa: F401
 from .strategies import dip_buy_ma as _dip_buy_ma  # noqa: F401
-from .strategies import leader_pullback as _leader_pullback  # noqa: F401
 from .strategies import skip as _skip  # noqa: F401
 
 # 仓位测算回调：给定 (plan, limit_price) 返回计划股数；为 None 则交由 order_executor 按账户算。
@@ -260,8 +259,10 @@ class EntryRouter:
         口径（关键词包含匹配，兼容信号侧用语带前后缀）：
           - 打板 / 半路 / 连板接力 → CHASE_LIMIT_UP；打板 + 竞价 / 首板（竞价定方向）→ CHASE_AUCTION_STRONG。
           - 低吸 / 均线 / 回踩 → DIP_BUY_MA。
-          - 龙回头 / 龙头 + 高位回踩 / 分歧转一致 → LEADER_PULLBACK。
           - 未匹配任何战法 → SKIP（不臆造动作）。
+        （J-2 评审 doc/26：原「龙回头 → LEADER_PULLBACK」分支对信号侧真实 strategy_family/setup 值域恒不可达——
+          信号侧只产 DABAN/BANLU/DIXI × 首板/连板/高位，从不含『龙/龙回头/高位回踩/分歧』，故该分支为死代码，已删除；
+          高位连板回调统一落 DIP_BUY_MA。LeaderPullbackStrategy 实现已移除，enums 中 LEADER_PULLBACK 仅保留兼容历史数据。）
 
         评审修复：
           - P0-A1：family 先经 _normalize_family 把英文枚举(DABAN/BANLU/DIXI)归一为中文战法词，
@@ -279,10 +280,6 @@ class EntryRouter:
         # —— 低吸族 ——
         if ("低吸" in hay) or ("均线" in setup) or ("回踩" in setup and "龙" not in hay):
             return EntryAction.DIP_BUY_MA
-
-        # —— 龙回头族 ——（角色类，按 family/ setup 的龙头语义匹配）
-        if ("龙回头" in family) or ("龙" in family and ("高位回踩" in setup or "分歧" in setup)):
-            return EntryAction.LEADER_PULLBACK
 
         # —— 打板 / 半路族：竞价定方向（首板 / 竞价）走竞价强开追，连板接力 / 半路走打板跟买。——
         # 受控词表（不含裸「板」）：打板 / 连板 / 半路。

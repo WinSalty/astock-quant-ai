@@ -140,8 +140,11 @@ class DailyScheduler:
         """
         report = getattr(self._engine, "report_market_feed", None) if manage_feed else None
         if self._sell_books_provider is None:
-            if callable(report):
-                report(False)  # 盘中无盘口源 → 保守置行情不健康（FREEZE），竞价段(report=None)不动
+            # E-10（评审 doc/24）：卖出门控关（QMT_SELL_PASS_LIVE=false → provider=None）是「有意不接卖出」，
+            # 不等于「行情断流」。原实现在此 report(False) 把全局 _market_feed_ok 置 False、污染 risk.gate 第 1 层
+            # （把「卖出未接线」误编码为「行情不健康」恒 FREEZE，盘中任何依赖该标志的逻辑被语义混淆）。
+            # 此处直接返回、**不触碰行情健康位**——「保守不卖」已由 provider=None（run_sell_pass 不被调用）达成；
+            # 行情健康由竞价段买入侧 AuctionPoller 的 feed_health_sink 自管。
             return
         try:
             books = self._sell_books_provider(today)

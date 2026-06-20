@@ -201,4 +201,72 @@ def test_write_queue_overflow_triggers_on_failure():
         assert "write_queue_overflow" in failures
     finally:
         block.set()
+
+
+def test_write_queue_overflow_fails_closed():
+    """评审 doc/24 E-1：溢出丢弃了「发单前 PLANNED 关键落盘」后，is_healthy 必须立即转 False、
+    flush_confirm 必判失败——使 _persist_critical_before_order 在「超时+健康」下不再放行下单，
+    堵住「券商已收委托而本机无台账 → 崩溃重启重复下单」的窗口。"""
+    import threading
+
+    from qmt_strategy.common.logger import RecordingLogger
+    from qmt_strategy.storage.write_queue import AsyncWriteQueue
+
+    block = threading.Event()
+
+    class _OkConn:
+        def commit(self):
+            pass
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    q = AsyncWriteQueue(lambda: _OkConn(), RecordingLogger(), name="t", max_queue=5)
+    q.start()
+    try:
+        q.submit(lambda conn: block.wait(2.0))   # 卡住写线程，使后续积压
+        for _ in range(12):                       # 积压超 max_queue → 触发溢出丢弃
+            q.submit(lambda conn: None)
+        assert q.is_healthy() is False            # E-1：溢出后健康位立即转 False（原 bug：仍报 True）
+        assert q.flush_confirm(timeout=0.2) is False  # E-1：关键落盘确认必判失败（原 bug：返回 True 放行）
+    finally:
+        block.set()
+
+
+def test_write_queue_health_is_sticky_across_intermittent_failures():
+    """评审 doc/24 E-4：写失败后**单次成功不得**把 is_healthy 拉回 True（sticky 门闩），需连续
+    fail_after 次成功（持续恢复）才解除——否则间歇丢数据时健康位 True/False 抖动、storage_health_tick 漏判。"""
+    from qmt_strategy.common.logger import RecordingLogger
+    from qmt_strategy.storage.write_queue import AsyncWriteQueue
+
+    state = {"fail_next": False}
+
+    class _FlakyConn:
+        def commit(self):
+            if state["fail_next"]:
+                raise OSError("intermittent")
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    q = AsyncWriteQueue(lambda: _FlakyConn(), RecordingLogger(), name="t", fail_after=3)
+    q.start()
+    try:
+        # 一次失败 + 一次成功：sticky 应保持不健康（原 bug：单次成功即恢复 True）。
+        state["fail_next"] = True
+        q.submit(lambda conn: None)
+        q.flush(1.0)
+        state["fail_next"] = False
+        q.submit(lambda conn: None)
+        q.flush(1.0)
+        assert q.is_healthy() is False     # E-4：单次成功不清零，仍不健康
+        # 连续 fail_after 次成功（持续恢复）后才解除 degraded → 恢复健康。
+        for _ in range(3):
+            q.submit(lambda conn: None)
+        q.flush(1.0)
+        assert q.is_healthy() is True
+    finally:
+        q.stop()
         q.stop()

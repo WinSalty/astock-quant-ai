@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import List, Mapping, Optional
 
 # 敏感字段名集合：redacted() 打印时一律脱敏，禁止进日志（§7.1 / AGENTS.md）。
@@ -23,6 +23,11 @@ _SENSITIVE = {
     "ingest_token",
     "writeback_base_url",
     "signal_internal_token",
+    # E-5（评审 doc/24）：分接口 token 同属内网鉴权机密，必须脱敏——否则运维用 env 直配
+    # QMT_SIGNAL_WATCHLIST_TOKEN / QMT_SIGNAL_INGEST_TOKEN 时，engine_boot 启动日志会明文泄露
+    # GET watchlist / POST ingest 的写凭据（违反 AGENTS.md「token 不进日志」红线）。
+    "signal_watchlist_token",
+    "signal_ingest_token",
 }
 
 
@@ -33,22 +38,34 @@ def _as_bool(v) -> bool:
     return str(v).strip().lower() in {"1", "true", "yes", "on", "y", "t"}
 
 
+# E-8（评审 doc/24）：三个数值解析助手——空串/未配视为未配置走默认；**非空非法值不静默回默认**
+# （交易配置静默回默认有资金风险，如 QMT_MAX_POSITIONS_PER_DAY=abc 悄悄回默认 5），而是 fail-closed
+# 抛出含原值的清晰错误，让启动即失败、便于定位是哪个配置写错（原实现裸 int()/Decimal() 冒泡，报错难定位）。
 def _as_decimal(v) -> Optional[Decimal]:
     if v is None or str(v).strip() == "":
         return None
-    return Decimal(str(v))
+    try:
+        return Decimal(str(v))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError(f"配置项数值解析失败（期望 Decimal，实际值={v!r}）：请修正后重启") from exc
 
 
 def _as_int(v) -> Optional[int]:
     if v is None or str(v).strip() == "":
         return None
-    return int(str(v))
+    try:
+        return int(str(v))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"配置项数值解析失败（期望 int，实际值={v!r}）：请修正后重启") from exc
 
 
 def _as_float(v) -> Optional[float]:
     if v is None or str(v).strip() == "":
         return None
-    return float(str(v))
+    try:
+        return float(str(v))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"配置项数值解析失败（期望 float，实际值={v!r}）：请修正后重启") from exc
 
 
 @dataclass
@@ -217,7 +234,8 @@ class Settings:
 
         业务意图：所有 QMT_* 配置统一在此解析，缺省走 dataclass 默认；
         ``strategy_enabled`` 收集所有形如 QMT_STRATEGY_<NAME>_ENABLED 的开关。
-        边界：数值/布尔做容错解析（空串视为未配置，走默认）。
+        边界（E-8 修正口径）：空串/未配视为未配置走默认；**非空非法数值即 fail-closed 启动报错**
+        （不静默回默认——交易配置静默回默认有资金风险），错误信息含原值便于定位是哪个 QMT_* 写错。
         """
         g = env.get
         # 汇总各战法开关：键为 <NAME> 小写，值为 bool。
@@ -252,8 +270,14 @@ class Settings:
             signal_watchlist_token_file=g("QMT_SIGNAL_WATCHLIST_TOKEN_FILE") or None,
             signal_ingest_token=g("QMT_SIGNAL_INGEST_TOKEN") or None,
             signal_ingest_token_file=g("QMT_SIGNAL_INGEST_TOKEN_FILE") or None,
-            http_timeout_seconds=_as_float(g("QMT_HTTP_TIMEOUT_SECONDS")) or 10.0,
-            auction_poll_interval_sec=_as_float(g("QMT_AUCTION_POLL_INTERVAL_SEC")) or 3.0,
+            # E-7（评审 doc/24）：is-not-None 守卫——显式配 0 是运维显式值（误配自负），不被 `or 默认` 当假值吞，
+            # 与 seal_ratio_min/write_queue_max 等同口径（消除「有的项配 0 生效、有的被悄悄改默认」的不一致）。
+            http_timeout_seconds=(
+                _v if (_v := _as_float(g("QMT_HTTP_TIMEOUT_SECONDS"))) is not None else 10.0
+            ),
+            auction_poll_interval_sec=(
+                _v if (_v := _as_float(g("QMT_AUCTION_POLL_INTERVAL_SEC"))) is not None else 3.0
+            ),
             close_snapshot_time=g("QMT_CLOSE_SNAPSHOT_TIME") or "15:05",
             auction_abandon_pct=_as_decimal(g("QMT_AUCTION_ABANDON_PCT")),
             auction_lowbuy_pct_low=_as_decimal(g("QMT_AUCTION_LOWBUY_PCT_LOW")),
@@ -310,17 +334,25 @@ class Settings:
                 _v if (_v := _as_decimal(g("QMT_RECONCILE_ASSET_REL_RATE"))) is not None else Decimal("0.003")
             ),
             decision_log_enabled=_as_bool(g("QMT_DECISION_LOG_ENABLED") or "true"),
-            decision_log_queue_size=_as_int(g("QMT_DECISION_LOG_QUEUE_SIZE")) or 2000,
-            decision_log_batch_size=_as_int(g("QMT_DECISION_LOG_BATCH_SIZE")) or 50,
+            decision_log_queue_size=(
+                _v if (_v := _as_int(g("QMT_DECISION_LOG_QUEUE_SIZE"))) is not None else 2000
+            ),
+            decision_log_batch_size=(
+                _v if (_v := _as_int(g("QMT_DECISION_LOG_BATCH_SIZE"))) is not None else 50
+            ),
             auction_timing_enabled=_as_bool(g("QMT_AUCTION_TIMING_ENABLED") or "false"),
             auction_timing_verified=_as_bool(g("QMT_AUCTION_TIMING_VERIFIED") or "false"),
             sell_pass_live=_as_bool(g("QMT_SELL_PASS_LIVE") or "false"),
             kill_switch=_as_bool(g("QMT_KILL_SWITCH") or "false"),
-            order_ttl_seconds=_as_int(g("QMT_ORDER_TTL_SECONDS")) or 60,
-            trade_conn_heartbeat_fail_threshold=(
-                _as_int(g("QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD")) or 3
+            order_ttl_seconds=(
+                _v if (_v := _as_int(g("QMT_ORDER_TTL_SECONDS"))) is not None else 60
             ),
-            cancel_grace_seconds=_as_int(g("QMT_CANCEL_GRACE_SECONDS")) or 30,
+            trade_conn_heartbeat_fail_threshold=(
+                _v if (_v := _as_int(g("QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD"))) is not None else 3
+            ),
+            cancel_grace_seconds=(
+                _v if (_v := _as_int(g("QMT_CANCEL_GRACE_SECONDS"))) is not None else 30
+            ),
             repository_unique_with_trade_date=_as_bool(
                 g("QMT_UNIQUE_WITH_TRADE_DATE") or "true"
             ),

@@ -58,6 +58,15 @@ class TradeCalendar(Protocol):
         """d 之前的上一交易日（pretrade_date，供 signal_trade_date 反推）。"""
         ...
 
+    def trading_days_left(self, d: date) -> int:
+        """从 d 起（含）日历内剩余可推算交易日数（E-9 评审 doc/24：日历耗尽前的覆盖度预警入口，doc/21 C1）。
+
+        纳入 Protocol 契约：使任何自定义日历实现（如未来注入的 DbTradeCalendar）漏实现该方法时，
+        类型/契约检查即可见，不再因 app/main.py 用 getattr 兜底而静默跳过覆盖度预警（日历静默耗尽→
+        next_open 越界 fail-closed 占位、可卖日不精确却无提前告警）。
+        """
+        ...
+
 
 @runtime_checkable
 class SelectedStockSource(Protocol):

@@ -219,12 +219,14 @@ def test_intraday_calls_heartbeat():
     assert eng.heartbeats == 1                # 盘中主动探活下单通道
 
 
-def test_intraday_no_books_provider_reports_feed_false():
-    # 无盘口源 → 盘中保守置行情不健康（FREEZE），不跑 run_sell_pass。
+def test_intraday_no_books_provider_does_not_touch_feed_health():
+    # E-10（评审 doc/24）：卖出门控关（provider=None）是「有意不接卖出」，不等于「行情断流」——
+    # 盘中不再 report_market_feed(False) 污染全局 _market_feed_ok（原 bug 会把「卖出未接线」误编码为
+    # 「行情不健康」恒 FREEZE）。仍不跑 run_sell_pass（保守不卖由 provider=None 达成）。
     clock = FakeClock(utc_at_east8(TRADING_DAY, 9, 35))
     s, eng, _g, _st = _rich_sched(clock, sell_books_provider=None)
     s.dispatch(Action.INTRADAY, TRADING_DAY)
-    assert eng.feed_reports == [False]
+    assert eng.feed_reports == []        # 不触碰行情健康位（原 bug：[False]）
     assert _count(eng, "sell") == 0
 
 
