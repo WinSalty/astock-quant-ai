@@ -85,6 +85,9 @@ TABLE_META: Dict[str, Dict[str, List[str]]] = {
             # 打板因子（契约 1.2.0）：封板时序 + 位置/强度，经 SQLite 无损 round-trip（时刻 TEXT、open_times INT、三比例 TEXT）。
             "first_limit_time", "last_limit_time", "open_times",
             "volume_ratio", "return_5d_pct", "return_10d_pct",
+            # 数据缺测标记（doc/29 B1；评审 Stage B 修复）：必须经 SQLite 无损 round-trip，否则盘前 save→盘中 fetch
+            # 会把 data_missing 静默丢成 False，致 B2 _rule_data_missing 永不命中、B3 缺测强卖在实盘失效。
+            "data_missing", "data_missing_reason",
         ],
         "unique": ["ts_code", "target_trade_date"],
         "coalesce": [],
@@ -177,6 +180,7 @@ _DDL: Dict[str, str] = {
             board_level INTEGER, tier TEXT,
             first_limit_time TEXT, last_limit_time TEXT, open_times INTEGER,
             volume_ratio TEXT, return_5d_pct TEXT, return_10d_pct TEXT,
+            data_missing INTEGER, data_missing_reason TEXT,
             PRIMARY KEY (ts_code, target_trade_date)
         )""",
     # 系统标志位 kv（评审二轮 P1#9）：跨进程/跨日持久的运行态标记，如对账未通过阻断次日开仓。
@@ -197,6 +201,9 @@ _COLUMN_MIGRATIONS = {
         # 使 row_to_selected 的 SELECT * 列集必含这些列；列定义须与上方 DDL 完全一致。
         ("first_limit_time", "TEXT"), ("last_limit_time", "TEXT"), ("open_times", "INTEGER"),
         ("volume_ratio", "TEXT"), ("return_5d_pct", "TEXT"), ("return_10d_pct", "TEXT"),
+        # 数据缺测标记（doc/29 B1；评审 Stage B 修复）：旧库无此列时幂等补上，使 row_to_selected 的 SELECT *
+        # 列集必含这两列，data_missing/data_missing_reason 经 SQLite 无损 round-trip。
+        ("data_missing", "INTEGER"), ("data_missing_reason", "TEXT"),
     ],
 }
 

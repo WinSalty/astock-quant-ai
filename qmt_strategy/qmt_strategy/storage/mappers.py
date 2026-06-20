@@ -311,6 +311,10 @@ def selected_to_row(r: SelectedStockRow) -> Dict[str, Any]:
         "volume_ratio": dec_text(r.volume_ratio),
         "return_5d_pct": dec_text(r.return_5d_pct),
         "return_10d_pct": dec_text(r.return_10d_pct),
+        # 数据缺测标记（doc/29 B1；评审 Stage B 修复）：data_missing 落 0/1（bool_int），data_missing_reason TEXT 直存。
+        # 必须无损 round-trip，否则盘前 save→盘中 fetch 丢成 False，B2 _rule_data_missing 永不命中、B3 缺测强卖失效。
+        "data_missing": bool_int(r.data_missing),
+        "data_missing_reason": r.data_missing_reason,
     }
 
 
@@ -347,4 +351,9 @@ def row_to_selected(row: Any) -> SelectedStockRow:
         volume_ratio=text_dec(_g(row, "volume_ratio")),
         return_5d_pct=text_dec(_g(row, "return_5d_pct")),
         return_10d_pct=text_dec(_g(row, "return_10d_pct")),
+        # 数据缺测标记（doc/29 B1；评审 Stage B 修复）：data_missing 非可空 bool（默认 False）——NULL/0→False、1→True，
+        # 用 bool() 统一兜底（旧行迁移补列后为 NULL）。data_missing_reason TEXT 直读（NULL→None）。
+        # 两列同样由 _apply_column_migrations 对旧库幂等补齐，故 SELECT * 列集必含。
+        data_missing=bool(_g(row, "data_missing")),
+        data_missing_reason=_g(row, "data_missing_reason"),
     )

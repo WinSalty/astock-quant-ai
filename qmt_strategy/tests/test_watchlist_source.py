@@ -51,6 +51,8 @@ def _make_row(
     volume_ratio=None,
     return_5d_pct=None,
     return_10d_pct=None,
+    data_missing: bool = False,
+    data_missing_reason=None,
 ) -> SelectedStockRow:
     """构造一行信号契约（默认主板可交易强势票，带完整价位 / 先验 / 失败条件，便于断言字段一致）。"""
     return SelectedStockRow(
@@ -79,6 +81,8 @@ def _make_row(
         volume_ratio=volume_ratio,
         return_5d_pct=return_5d_pct,
         return_10d_pct=return_10d_pct,
+        data_missing=data_missing,
+        data_missing_reason=data_missing_reason,
     )
 
 
@@ -182,6 +186,29 @@ def test_round_trip_preserves_daban_factors(tmp_path):
         b = got["000001.SZ"]
         assert b.first_limit_time is None and b.last_limit_time is None and b.open_times is None
         assert b.volume_ratio is None and b.return_5d_pct is None and b.return_10d_pct is None
+    finally:
+        wq.stop()
+
+
+def test_round_trip_preserves_data_missing_sentinel(tmp_path):
+    """评审 Stage B 修复：data_missing/data_missing_reason 经【真实 SQLite save→fetch】无损 round-trip。
+    回归此前断裂——schema/mapper 未含该两列时盘前 save 会把 data_missing 丢成 False，致 B2/B3 在实盘失效。"""
+    db, wq = _setup_db(tmp_path)
+    try:
+        src = SqliteSelectedStockSource(db, RecordingLogger())
+        src.save_watchlist(
+            [
+                _make_row("600000.SH", tradable_flag=False, data_missing=True,
+                          data_missing_reason="missing:close,open_times"),
+                _make_row("000001.SZ"),  # 无缺测 → data_missing=False、reason=None
+            ]
+        )
+        assert wq.flush(timeout=2.0)
+        got = {r.ts_code: r for r in src.fetch(T_BUY)}
+        assert got["600000.SH"].data_missing is True
+        assert got["600000.SH"].data_missing_reason == "missing:close,open_times"
+        assert got["000001.SZ"].data_missing is False
+        assert got["000001.SZ"].data_missing_reason is None
     finally:
         wq.stop()
 

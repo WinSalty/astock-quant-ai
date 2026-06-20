@@ -125,6 +125,22 @@ def test_selected_round_trip_json_fields():
     assert back.limit_up_price == Decimal("11.00")
 
 
+def test_selected_round_trip_data_missing_sentinel():
+    """评审 Stage B 修复：data_missing/data_missing_reason 经 mapper round-trip 无损（默认 False/None 兼容旧行）。"""
+    miss = SelectedStockRow(
+        ts_code="600036.SH", trade_date=T_SIGNAL, target_trade_date=T_BUY,
+        tradable_flag=False, data_missing=True, data_missing_reason="missing:close,open_times",
+    )
+    back = mappers.row_to_selected(mappers.selected_to_row(miss))
+    assert back.data_missing is True
+    assert back.data_missing_reason == "missing:close,open_times"
+    # 默认（无缺测）行：data_missing=False、reason=None
+    ok = SelectedStockRow(ts_code="600036.SH", trade_date=T_SIGNAL, target_trade_date=T_BUY)
+    back_ok = mappers.row_to_selected(mappers.selected_to_row(ok))
+    assert back_ok.data_missing is False
+    assert back_ok.data_missing_reason is None
+
+
 # ===========================================================================
 # write_queue —— 关键不变量：不阻塞 + 异常只吞不传播 + FIFO + flush
 # ===========================================================================
