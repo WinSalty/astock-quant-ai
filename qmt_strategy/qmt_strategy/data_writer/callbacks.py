@@ -147,6 +147,29 @@ class ExecCallback:
     # ------------------------------------------------------------------
     # 成交回报：唯一事实源，绝不可丢（§6.2.1 on_stock_trade）
     # ------------------------------------------------------------------
+    def _warn_if_dirty(self, kind: str, key: Any, fields: dict) -> None:
+        """J-4/5/6 执行侧脏行源头告警（doc/29 C）：normalize 产出的关键字段缺失/不可判时 warn 一次。
+
+        fields 取值约定：普通字段 None 即视为缺；trade_side_unknown=True 表示方向不可判（UNKNOWN）。
+        把缺失项拼成 'missing:col1,col2'（与信号侧回流 ingest_data_quality 留痕格式对称），便于监控/排查定位脏源；
+        仅告警、不阻断落库（脏行仍按放宽后的可空列入库，由对账/复盘兜底）。无缺失项则不产生噪声日志。
+        """
+        missing = []
+        for name, value in fields.items():
+            if name == "trade_side_unknown":
+                if value:
+                    missing.append("trade_side")
+            elif value is None:
+                missing.append(name)
+        if missing and self._logger is not None:
+            self._logger.warn(
+                "callback_normalize_dirty_row",
+                account_id=self._account_id,
+                kind=kind,
+                key=key,
+                data_quality="missing:" + ",".join(missing),
+            )
+
     def on_stock_trade(self, t: Any) -> None:
         """成交回报落库 + 同步台账累计成交。
 
@@ -164,6 +187,20 @@ class ExecCallback:
             trade_date=self._trade_date_provider(),
             data_source=DataSource.CALLBACK,
             side_resolver=self._side_resolver,
+        )
+        # J-4/5/6 执行侧脏行源头告警（doc/29 C）：normalize 把脏字段（归一失败 ts_code=None、方向不可判 UNKNOWN、
+        # 价/量/时间缺）落 None 后照常入库（信号侧四表已放宽 NOT NULL + ingest_data_quality 留痕），但执行侧须在
+        # 源头 warn 一次——使脏回报在落库前可被监控/排查定位，不被静默淹没（与信号侧回流缺测留痕对称）。
+        self._warn_if_dirty(
+            "trade",
+            getattr(t, "traded_id", None),
+            {
+                "ts_code": rec.ts_code,
+                "trade_side_unknown": rec.trade_side == TradeSide.UNKNOWN,
+                "traded_price": rec.traded_price,
+                "traded_volume": rec.traded_volume,
+                "traded_time": rec.traded_time,
+            },
         )
         # 顺序修正（评审二轮 P2#62）：成交是唯一事实源——必须【先更新内存权威】（台账累计 + 持仓状态机），
         # 【再写 qmt_* 镜像】。原实现先 upsert_trade，一旦落库异常抛出，add_fill/持仓回写就被跳过，使同一笔
@@ -211,6 +248,16 @@ class ExecCallback:
             data_source=DataSource.CALLBACK,
             side_resolver=self._side_resolver,
             status_resolver=self._status_resolver,
+        )
+        # J-4/5/6 执行侧脏行源头告警（doc/29 C）：委托归一脏字段（ts_code=None、方向 UNKNOWN、order_volume 缺）在源头 warn。
+        self._warn_if_dirty(
+            "order",
+            getattr(o, "order_id", None),
+            {
+                "ts_code": rec.ts_code,
+                "trade_side_unknown": rec.trade_side == TradeSide.UNKNOWN,
+                "order_volume": rec.order_volume,
+            },
         )
         self._dw.upsert_order(rec)
         # 同步台账状态：OrderStatus → OrderState 显式映射，未知态兜底 REPORTED（在途，不臆造终态）。

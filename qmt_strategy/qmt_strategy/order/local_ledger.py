@@ -273,6 +273,57 @@ class InMemoryLocalLedger:
                 e.state = OrderState.PART_TRADED
             # else 保持装载态（SUBMITTED/PLANNED 等），不臆造
 
+    def reconcile_filled_from_broker_orders(self, broker_orders: Any) -> List[str]:
+        """E-6（doc/29）：以券商 query_stock_orders 的【权威累计成交量】收口本地 filled_volume。
+
+        业务意图：缺 traded_id 时 add_fill 用脆弱合成键 (order_id|vol|price) 去重——两笔同量同价的真实碎单会被
+        误去重(少计)、或重投因浮点价抖动被误判新成交(多计)，两难。这里在盘前/重连（已查 query_stock_orders 处）
+        以券商该委托的 traded_volume（券商权威累计成交量）为准，把本地 entry.filled_volume 收口为权威值并据此
+        推进状态，不再依赖脆弱临时编号。幂等：每次盘前/重连重跑都以券商当下权威值收口，故无需跨重启持久（重启
+        后下次 prewarm 会再收口；进程内崩溃窗口仍以 add_fill 明细为best-effort）。
+
+        口径（守既有状态机不变量）：
+        - 仅对台账已知委托（order_id 能反查 biz）生效；手工单/未知单忽略。
+        - 券商 traded_volume 缺失/非法（None/非数/<0）跳过，不臆造。
+        - 不回退【状态】终态 TRADED/PART_CANCELLED（与 add_fill/reconcile_fills_from_detail 同口径，避免复活 TTL 重撤）；
+          但 filled_volume 仍按券商权威校正（值与状态解耦——持仓量另由 query_stock_positions 权威重建，见 position_manager）。
+        - avg_filled_price 不在此动（订单成本均价非本步职责；持仓成本以券商持仓 avg_price 为权威）。
+        返回实际被收口（filled_volume 有变更）的 biz 列表，供持久层落盘镜像。
+        """
+        touched: List[str] = []
+        for o in broker_orders or []:
+            order_id = getattr(o, "order_id", None)
+            broker_vol_raw = getattr(o, "traded_volume", None)
+            if order_id is None or broker_vol_raw is None:
+                continue
+            try:
+                broker_vol = int(broker_vol_raw)
+            except (TypeError, ValueError):
+                continue
+            if broker_vol < 0:
+                continue
+            biz = self._resolve_biz(order_id)
+            if biz is None:
+                continue
+            e = self._by_biz.get(biz)
+            if e is None or e.filled_volume == broker_vol:
+                continue
+            if self._logger is not None:
+                self._logger.info(
+                    "ledger_filled_reconciled_from_broker",
+                    biz_order_no=biz, order_id=order_id,
+                    local_filled=e.filled_volume, broker_traded_volume=broker_vol,
+                )
+            e.filled_volume = broker_vol
+            # 状态收口：不回退 TRADED/PART_CANCELLED 终态；其余按券商权威量 vs 计划量推进。
+            if e.state not in (OrderState.TRADED, OrderState.PART_CANCELLED):
+                if e.plan_volume and broker_vol >= e.plan_volume:
+                    e.state = OrderState.TRADED
+                elif broker_vol > 0:
+                    e.state = OrderState.PART_TRADED
+            touched.append(biz)
+        return touched
+
     def all_for_date(self, target_trade_date: date) -> List[LedgerEntry]:
         return [
             copy.deepcopy(e)

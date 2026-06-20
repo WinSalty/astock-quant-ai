@@ -241,6 +241,17 @@ class PersistentLocalLedger:
             # 取 order_id 反查到的最新 entry；为 None 即未知单，_mirror 内部跳过。
             self._mirror(self._mem.get_by_order_id(order_id))
 
+    def reconcile_filled_from_broker_orders(self, broker_orders: Any) -> List[str]:
+        """E-6（doc/29）：以券商权威累计成交量收口本地 filled_volume，并把被收口的行异步镜像落盘。
+
+        内存收口（权威）→ 逐个被改动的 biz 镜像最新 entry 落盘，与 insert/update/sync_status 同套 write-behind 口径。
+        """
+        with self._lock:
+            touched = self._mem.reconcile_filled_from_broker_orders(broker_orders)
+            for biz in touched:
+                self._mirror(self._mem.get(biz))
+        return touched
+
     def add_fill(
         self, order_id: int, traded_id: Any, traded_volume: int, traded_price: Any
     ) -> None:

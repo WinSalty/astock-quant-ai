@@ -183,6 +183,21 @@ def test_on_stock_trade_code_normalization_dirty_code():
     assert rec.qmt_stock_code == "SH600036"
 
 
+def test_on_stock_trade_dirty_row_warns_at_source():
+    """J-4/5/6 执行侧脏行源头告警（doc/29 C）：归一失败 ts_code=None + 方向不可判 UNKNOWN → 落库前 warn 一次。"""
+    repo, _w, _l, logger, cb, _h = _build()
+    # stock_code 无法归一(→ts_code None) + order_type 不可判方向(→UNKNOWN)
+    cb.on_stock_trade(_full_trade(stock_code="BADCODE", order_type=999))
+    dirty = [f for lvl, e, f in logger.records if e == "callback_normalize_dirty_row"]
+    assert dirty, "归一脏行应在源头 warn callback_normalize_dirty_row"
+    dq = dirty[0].get("data_quality", "")
+    assert "ts_code" in dq and "trade_side" in dq  # 缺测列名拼进 missing:...
+    # 干净回报不产生噪声告警
+    repo2, _w2, _l2, logger2, cb2, _h2 = _build()
+    cb2.on_stock_trade(_full_trade(stock_code="600036.SH", order_type=23))
+    assert "callback_normalize_dirty_row" not in logger2.events()
+
+
 # ---------------------------------------------------------------------------
 # 1) 回调落库：委托规整 + 状态映射 + 台账状态同步
 # ---------------------------------------------------------------------------

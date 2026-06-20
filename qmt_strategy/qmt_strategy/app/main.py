@@ -458,6 +458,13 @@ class Engine:
         except Exception as exc:  # noqa: BLE001 查询失败保守跳过（不复位、不误判），仅告警
             self._logger.warn("engine_stuck_selling_query_failed", error=str(exc))
             return
+        # E-6（doc/29）：以券商委托【权威累计成交量 traded_volume】收口本地 filled_volume，替代缺 traded_id 时
+        # add_fill 的脆弱合成键去重（同价同量碎单误丢 / 重投浮点抖动误增）。复用本次已查的全量 orders（买卖都收口），
+        # 故置于「只看卖单」的卡死对账过滤之前。失败不拖垮（reconcile_filled_from_broker_orders 内部对脏行已跳过）。
+        try:
+            self._ledger.reconcile_filled_from_broker_orders(orders)
+        except Exception as exc:  # noqa: BLE001 收口失败不阻断盘前其余对账，仅告警
+            self._logger.warn("engine_filled_reconcile_failed", error=str(exc))
         # OrderStatus → reconcile 终态字符串（撤/废/拒/错=复位；已成=交回报；在途=不动）。
         _term = {
             OrderStatus.CANCELLED: "CANCELLED", OrderStatus.REJECTED: "REJECTED",

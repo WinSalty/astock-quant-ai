@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 
 from qmt_strategy.contracts.enums import OrderState, TradeSide
 from qmt_strategy.contracts.models import LedgerEntry
 from qmt_strategy.order.local_ledger import InMemoryLocalLedger
 
 T_BUY = date(2026, 6, 12)
+
+
+def _broker_order(order_id, traded_volume):
+    """构造券商 query_stock_orders 委托对象（仅需 order_id + traded_volume 两属性）。"""
+    return SimpleNamespace(order_id=order_id, traded_volume=traded_volume)
 
 
 def _entry(biz="20260612_600036.SH_CHASE_LIMIT_UP_001", plan_volume=1000, state=OrderState.PLANNED):
@@ -68,6 +74,52 @@ def test_add_fill_dedup_by_traded_id():
     got = led.get_by_order_id(9)
     assert got.filled_volume == 600  # 不翻倍
     assert got.state == OrderState.PART_TRADED
+
+
+def test_reconcile_filled_from_broker_corrects_fragile_key_undercount():
+    """E-6（doc/29）：缺 traded_id 时同价同量碎单被合成键误去重→少计；以券商 traded_volume 权威收口校正。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 7
+    led.insert(e)
+    # 缺 traded_id 的两笔同价同量碎单：合成键 (order_id|vol|price) 相同 → 第二笔被误去重 → 少计为 500。
+    led.add_fill(7, None, 500, Decimal("11.00"))
+    led.add_fill(7, None, 500, Decimal("11.00"))
+    assert led.get_by_order_id(7).filled_volume == 500  # 脆弱键误丢第二笔
+    # 券商权威累计成交量=1000 → 收口校正、状态推进 TRADED。
+    touched = led.reconcile_filled_from_broker_orders([_broker_order(7, 1000)])
+    got = led.get_by_order_id(7)
+    assert got.filled_volume == 1000
+    assert got.state == OrderState.TRADED
+    assert touched == [e.biz_order_no]
+
+
+def test_reconcile_filled_from_broker_noop_and_guards():
+    """E-6：值一致不动；未知委托/脏 traded_volume 跳过；不回退 TRADED 终态状态。"""
+    led = InMemoryLocalLedger()
+    e = _entry(plan_volume=1000)
+    e.order_id = 8
+    led.insert(e)
+    led.add_fill(8, "tr1", 600, Decimal("11.00"))  # filled=600, PART_TRADED
+    # (a) 券商与本地一致 → 不动、不计入 touched
+    assert led.reconcile_filled_from_broker_orders([_broker_order(8, 600)]) == []
+    # (b) 未知委托(order_id 不在台账) / 脏 traded_volume(None/负/非数) → 跳过，不抛
+    assert led.reconcile_filled_from_broker_orders([_broker_order(999, 100)]) == []
+    assert led.reconcile_filled_from_broker_orders([_broker_order(8, None)]) == []
+    assert led.reconcile_filled_from_broker_orders([_broker_order(8, -5)]) == []
+    assert led.reconcile_filled_from_broker_orders([_broker_order(8, "x")]) == []
+    assert led.get_by_order_id(8).filled_volume == 600  # 全程未被脏值污染
+
+    # (c) 已 TRADED 终态：filled 仍按券商权威校正，但状态不回退（守状态机不变量）。
+    e2 = _entry(biz="b2", plan_volume=1000)
+    e2.order_id = 10
+    led.insert(e2)
+    led.add_fill(10, "x1", 1000, Decimal("11.00"))  # TRADED
+    assert led.get_by_order_id(10).state == OrderState.TRADED
+    led.reconcile_filled_from_broker_orders([_broker_order(10, 800)])  # 券商称仅 800
+    got = led.get_by_order_id(10)
+    assert got.filled_volume == 800          # 值被权威校正
+    assert got.state == OrderState.TRADED    # 状态不回退（不复活 TTL 重撤）
 
 
 def test_add_fill_dedup_int_then_str_traded_id():
