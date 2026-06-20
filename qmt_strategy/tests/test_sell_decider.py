@@ -86,6 +86,8 @@ def _prior(
     continuation_prob: Optional[Decimal] = Decimal("0.7"),
     fail_conditions=None,
     market_state: str = "启动",
+    data_missing: bool = False,
+    data_missing_reason=None,
 ) -> SignalPrior:
     """构造信号先验视图（默认强先验：continuation_prob=0.7 >= 0.6 阈值、无失败条件）。"""
     return SignalPrior(
@@ -97,6 +99,8 @@ def _prior(
         market_state=market_state,
         role="龙头",
         strategy="打板",
+        data_missing=data_missing,
+        data_missing_reason=data_missing_reason,
     )
 
 
@@ -147,6 +151,47 @@ def test_t1_locked_short_circuits_to_hold(decider: SellDecider) -> None:
     assert a_auction.reason == "不可卖(守T+1)"
     assert a_intraday.action is SellActionType.HOLD
     assert a_intraday.reason == "不可卖(守T+1)"
+
+
+# ---------------------------------------------------------------------------
+# 用例 1b：缺测强卖（doc/29 B3）——prior.data_missing → CLEAR，先于盘口/弱势分支；但守 T+1 仍优先
+# ---------------------------------------------------------------------------
+def test_data_missing_forces_clear(decider: SellDecider) -> None:
+    """已过 T+1 的可卖单元，prior.data_missing=True → 竞价/分时一律 CLEAR（即便先验强、盘口看似稳封）。"""
+    unit = _unit(state=PositionState.HOLDING)
+    prior = _prior(continuation_prob=Decimal("0.8"), data_missing=True)  # 即便强先验也清
+    # 盘口看似稳封（正常会 HOLD），缺测应一票 CLEAR
+    book = _book(is_sealed=True, seal_to_float_ratio=Decimal("0.05"), open_times=0)
+    a_auction = decider.decide_auction(unit, prior, book)
+    a_intraday = decider.decide_intraday(unit, prior, book)
+    assert a_auction.action is SellActionType.CLEAR and a_auction.reason == "缺测强制清仓"
+    assert a_intraday.action is SellActionType.CLEAR and a_intraday.reason == "缺测强制清仓"
+
+
+def test_data_missing_clears_even_without_book(decider: SellDecider) -> None:
+    """缺测强卖先于「盘口缺失→HOLD」早退：竞价盘口整体缺失时，缺测票仍 CLEAR（不被盘口缺失挡成 HOLD）。"""
+    unit = _unit(state=PositionState.HOLDING)
+    prior = _prior(data_missing=True)
+    book = _book()  # 全 None/False = 盘口缺失（正常会 HOLD「盘口缺失,安全默认不卖」）
+    action = decider.decide_auction(unit, prior, book)
+    assert action.action is SellActionType.CLEAR and action.reason == "缺测强制清仓"
+
+
+def test_data_missing_does_not_override_t1_lock(decider: SellDecider) -> None:
+    """守 T+1 优先于缺测强卖：当日买入(LOCKED_T1)即便缺测也不可卖（A 股 T+1 物理约束）→ HOLD。"""
+    unit = _unit(state=PositionState.LOCKED_T1)
+    prior = _prior(data_missing=True)
+    action = decider.decide_intraday(unit, prior, _book())
+    assert action.action is SellActionType.HOLD and action.reason == "不可卖(守T+1)"
+
+
+def test_no_prior_not_force_cleared(decider: SellDecider) -> None:
+    """口径③：隔夜不在今日名单的持仓 prior=None → 不因缺测强卖（走现有盘口/技术退出逻辑）。"""
+    unit = _unit(state=PositionState.HOLDING)
+    # 稳封 + 无先验：正常技术退出逻辑（封板续持），不被强制清仓
+    book = _book(is_sealed=True, seal_to_float_ratio=Decimal("0.05"))
+    action = decider.decide_intraday(unit, None, book)
+    assert action.action is not SellActionType.CLEAR
 
 
 # ---------------------------------------------------------------------------

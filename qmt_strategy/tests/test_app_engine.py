@@ -19,7 +19,7 @@ from qmt_strategy.contracts.models import AuctionSnapshot
 from qmt_strategy.contracts.xt_objects import FakeStockAccount, FakeXtAsset
 from qmt_strategy.data_writer.repository import InMemoryQmtRepository
 from qmt_strategy.watchlist.sources import CallableSelectedStockSource
-from tests.conftest import T_BUY, make_selected_row, utc_at_east8
+from tests.conftest import T_BUY, T_SIGNAL, make_selected_row, utc_at_east8
 
 
 class _Cal:
@@ -386,6 +386,65 @@ def test_buy_fill_writes_position_then_sellable_next_day_and_no_double_sell():
     assert sold2 == []
     sell_calls2 = [c for c in deps.trader.order_calls if c[1] == 24]
     assert len(sell_calls2) == 1   # 仍只有 1 张卖单，未重复
+
+
+def test_data_missing_force_clears_holding_even_without_book():
+    """doc/29 B3：已过 T+1 的持仓，今日名单判该票缺测(prior.data_missing)→ 即便无盘口(books={})也强制清仓下卖单。"""
+    import dataclasses
+    from qmt_strategy.contracts.enums import PositionState
+    from qmt_strategy.contracts.models import SignalPrior
+    from qmt_strategy.contracts.xt_objects import FakeXtTrade
+
+    def _missing_prior(ts, today):
+        # 今日名单判 600036.SH 核心指标缺测 → 强卖；其余票无先验(None)。
+        if str(ts).startswith("600036"):
+            return SignalPrior(
+                ts_code="600036.SH", trade_date=T_SIGNAL, target_trade_date=today,
+                data_missing=True, data_missing_reason="missing:close,open_times",
+            )
+        return None
+
+    deps = dataclasses.replace(_deps(), prior_provider=_missing_prior)
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    # 建仓 → LOCKED_T1（当日不可卖）
+    eng.callback.on_stock_trade(FakeXtTrade(
+        account_id="acc1", stock_code="600036.SH", traded_id="TR1", order_id=1,
+        traded_price=11.00, traded_volume=1000, order_type=23,
+    ))
+    next_day = deps.calendar.next_open(T_BUY)
+    eng._position.refresh_state(next_day)
+    assert len(eng._position.sellable_units(next_day)) == 1
+    # 关键：books={} 无盘口，缺测票仍强制清仓（B3：先于「盘口缺失→不卖」早退）。
+    sold = eng.run_sell_pass(next_day, books={})
+    assert sold == ["600036.SH"]
+    sell_calls = [c for c in deps.trader.order_calls if c[1] == 24]  # otype=24=卖出
+    assert len(sell_calls) == 1
+    assert eng._position.get_unit("acc1", "600036.SH").state == PositionState.SELLING
+
+
+def test_data_missing_locked_t1_not_sold_even_without_book():
+    """doc/29 B3 守 T+1：当日买入(LOCKED_T1)的缺测票当天不可卖（sellable_units 不含），不下卖单。"""
+    import dataclasses
+    from qmt_strategy.contracts.models import SignalPrior
+    from qmt_strategy.contracts.xt_objects import FakeXtTrade
+
+    def _missing_prior(ts, today):
+        return SignalPrior(
+            ts_code="600036.SH", trade_date=T_SIGNAL, target_trade_date=today, data_missing=True,
+        )
+
+    deps = dataclasses.replace(_deps(), prior_provider=_missing_prior)
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    eng.callback.on_stock_trade(FakeXtTrade(
+        account_id="acc1", stock_code="600036.SH", traded_id="TR1", order_id=1,
+        traded_price=11.00, traded_volume=1000, order_type=23,
+    ))
+    # 买入当日(T_BUY)即便缺测也不卖（守 T+1 物理约束）
+    sold = eng.run_sell_pass(T_BUY, books={})
+    assert sold == []
+    assert [c for c in deps.trader.order_calls if c[1] == 24] == []
 
 
 def test_run_sell_pass_skips_during_lunch():
