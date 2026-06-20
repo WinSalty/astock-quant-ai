@@ -84,19 +84,28 @@ class TradeCalendarRefresher:
         merge_fn = getattr(self._calendar, "merge_days", None)
         added = merge_fn(days) if callable(merge_fn) else 0
         # 落回本地文件（持久，下次启动可用）：失败仅告警不阻断（内存已更新、本轮仍可用）。
+        # 评审 #5 加固：只用日历的【全量开市日】整体覆盖写；若日历不提供 open_days（无法取全量）则【跳过落盘 + 告警】，
+        # 绝不退化为「仅本次拉取的子集」覆盖写（那会把本地文件截断成子集、丢历史/其它交易所日）。
         if added and self._persist_fn is not None:
-            try:
-                open_days_fn = getattr(self._calendar, "open_days", None)
-                self._persist_fn(open_days_fn() if callable(open_days_fn) else days)
-            except Exception as exc:  # noqa: BLE001 落盘失败不阻断本轮（内存已更新）
-                self._warn("trade_calendar_persist_failed", today, reason=repr(exc))
+            open_days_fn = getattr(self._calendar, "open_days", None)
+            if callable(open_days_fn):
+                try:
+                    self._persist_fn(open_days_fn())
+                except Exception as exc:  # noqa: BLE001 落盘失败不阻断本轮（内存已更新）
+                    self._warn("trade_calendar_persist_failed", today, reason=repr(exc))
+            else:
+                self._warn("trade_calendar_persist_skipped_no_open_days", today)
         ok = self._covered(today)
         if self._logger is not None:
+            # 措辞对齐 engine 实际门控（评审 #4）：ensure_coverage 的 min_forward(默认5) 是【提前补取的余量阈值】，
+            # 并非 engine 的 fail-closed 线——engine 仅在 trading_days_left(today)<=0（无 today 之后交易日、T+1 无法映射）
+            # 时才真正阻断开仓。故这里 ok=False 表示「覆盖余量不足、请尽快外延日历」，不等同于「engine 必 fail-closed」。
             event_fn = self._logger.info if ok else self._logger.error
             event_fn(
                 "trade_calendar_refreshed",
                 today=str(today), added=added, covered=ok,
-                note=None if ok else "补取后仍不足覆盖，engine 将 fail-closed 阻断开仓，请排查信号侧日历/连通",
+                note=None if ok else "补取后覆盖余量仍不足(< 预取阈值)，请尽快外延日历/排查信号侧连通；"
+                "engine 仅在日历耗尽(today 之后无交易日)时 fail-closed 阻断开仓",
             )
         return ok
 

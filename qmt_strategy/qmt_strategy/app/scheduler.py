@@ -197,9 +197,11 @@ class DailyScheduler:
                 try:
                     ok = self._calendar_refresh(today)
                     if not ok:
+                        # 措辞对齐 engine 实际门控（评审 #4）：ok=False=「覆盖余量低于预取阈值」，请尽快外延日历；
+                        # engine 仅在日历真正耗尽(today 之后无交易日)时才 fail-closed 阻断开仓，二者阈值有意分层。
                         self._logger.error(
                             "scheduler_calendar_coverage_insufficient", trade_date=str(today),
-                            note="盘前交易日历校验/补取后仍不足，engine 将 fail-closed 只守仓不开新仓",
+                            note="盘前交易日历覆盖余量不足(< 预取阈值)，请尽快外延日历；日历耗尽时 engine 才 fail-closed 只守仓",
                         )
                 except Exception as exc:  # noqa: BLE001 校验/补取已内部兜底，这里再保险一层不拖垮 PREWARM
                     self._logger.error(

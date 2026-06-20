@@ -95,7 +95,7 @@ def test_reconcile_filled_from_broker_corrects_fragile_key_undercount():
 
 
 def test_reconcile_filled_from_broker_noop_and_guards():
-    """E-6：值一致不动；未知委托/脏 traded_volume 跳过；不回退 TRADED 终态状态。"""
+    """E-6（整体评审修复后：单调向上收口）：值一致/券商更低不动；未知委托/脏 traded_volume 跳过；绝不下修。"""
     led = InMemoryLocalLedger()
     e = _entry(plan_volume=1000)
     e.order_id = 8
@@ -110,16 +110,27 @@ def test_reconcile_filled_from_broker_noop_and_guards():
     assert led.reconcile_filled_from_broker_orders([_broker_order(8, "x")]) == []
     assert led.get_by_order_id(8).filled_volume == 600  # 全程未被脏值污染
 
-    # (c) 已 TRADED 终态：filled 仍按券商权威校正，但状态不回退（守状态机不变量）。
+    # (c) 券商量【低于】本地累计（重连 stale 快照 / 迟到回调）→ 单调向上：绝不下修，filled 保持本地、不计入 touched。
+    #     下修会欠计 filled → committed/exposure 偏小 → 过度承诺/漏卖（危险方向），故只升不降（评审 #2/#3）。
     e2 = _entry(biz="b2", plan_volume=1000)
     e2.order_id = 10
     led.insert(e2)
-    led.add_fill(10, "x1", 1000, Decimal("11.00"))  # TRADED
-    assert led.get_by_order_id(10).state == OrderState.TRADED
-    led.reconcile_filled_from_broker_orders([_broker_order(10, 800)])  # 券商称仅 800
+    led.add_fill(10, "x1", 1000, Decimal("11.00"))  # TRADED, filled=1000
+    assert led.reconcile_filled_from_broker_orders([_broker_order(10, 800)]) == []  # 800<1000 → 跳过
     got = led.get_by_order_id(10)
-    assert got.filled_volume == 800          # 值被权威校正
-    assert got.state == OrderState.TRADED    # 状态不回退（不复活 TTL 重撤）
+    assert got.filled_volume == 1000          # 不下修
+    assert got.state == OrderState.TRADED
+
+    # (d) 重启 reconcile_fills_from_detail 不撤销券商收口（评审 #2）：明细 sum 低于已收口 filled 时取 max、不下修。
+    e3 = _entry(biz="b3", plan_volume=2000)
+    e3.order_id = 12
+    led.insert(e3)
+    led.add_fill(12, None, 500, Decimal("11.00"))  # 碎单误去重少计：明细仅 500
+    led.reconcile_filled_from_broker_orders([_broker_order(12, 1000)])  # 券商权威 1000 → 上修
+    assert led.get_by_order_id(12).filled_volume == 1000
+    # 模拟重启按明细(500)重算：取 max(500, 已持久 1000)=1000，收口不被撤销。
+    led.reconcile_fills_from_detail("b3", [("noid1", 500, Decimal("11.00"))])
+    assert led.get_by_order_id(12).filled_volume == 1000  # 仍 1000，未被明细 500 下修
 
 
 def test_add_fill_dedup_int_then_str_traded_id():

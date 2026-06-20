@@ -259,7 +259,11 @@ class InMemoryLocalLedger:
             total_vol += v
             total_amt += (Decimal(str(price)) if price is not None else Decimal("0")) * Decimal(v)
         e.counted_trade_ids = counted
-        e.filled_volume = total_vol
+        # 不下修券商权威收口（整体评审 #2）：重启 load_from_db 先把持久行（含上次 broker 收口的 filled_volume）装入 e，
+        # 再调本方法按 local_order_fill 明细 sum 重算。E-6 收口的偏差正是「明细少计、券商权威更高」——若无条件用 total_vol
+        # 覆盖会把已收口值下修回少计量、撤销 E-6。故取 max(明细 sum, 已持久 filled)，与「filled 单调不下修」口径一致；
+        # 正常无收口时 total_vol == 已持久值、max 无副作用。avg 仍按明细算（成本另以券商持仓 avg_price 为权威）。
+        e.filled_volume = max(total_vol, e.filled_volume or 0)
         e.avg_filled_price = (total_amt / Decimal(total_vol)) if total_vol > 0 else None
         # 明细重算后按 filled vs plan 重新收口状态（与 add_fill / sync_status 同口径）：
         if e.state in (OrderState.CANCELLED, OrderState.REJECTED):
@@ -306,7 +310,15 @@ class InMemoryLocalLedger:
             if biz is None:
                 continue
             e = self._by_biz.get(biz)
-            if e is None or e.filled_volume == broker_vol:
+            # 仅【向上】收口（整体评审修复，最关键）：只在券商量 > 本地累计时上修，绝不下修。理由——
+            # (1) #3 重连竞态：query_stock_orders 快照可能短暂滞后于已由 on_stock_trade 回调累计的本地量，
+            #     下修会欠计 filled → committed/exposure 偏小 → 过度承诺/漏卖（危险方向）；
+            # (2) #2 重启：本地持久 filled（含上次收口值）若被券商 stale 量下修同样欠计；
+            # 故 filled_volume 单调非降、只朝券商真值【上修】。券商量≤本地时跳过（含 == 与 < 两种 noop）。
+            # 残留 #1（迟到回调在收口量之上经 add_fill 二次累计 → 过度计数）是【安全方向】（高估 filled →
+            # remaining 变小 → 偏保守不追买；持仓另由 query_stock_positions 权威重建），本步不下修故不纠正它；
+            # 彻底去重需 query_stock_trades 拿逐笔 traded_id，本期不做（成本高、收益边际）。
+            if e is None or broker_vol <= e.filled_volume:
                 continue
             if self._logger is not None:
                 self._logger.info(
@@ -315,8 +327,13 @@ class InMemoryLocalLedger:
                     local_filled=e.filled_volume, broker_traded_volume=broker_vol,
                 )
             e.filled_volume = broker_vol
-            # 状态收口：不回退 TRADED/PART_CANCELLED 终态；其余按券商权威量 vs 计划量推进。
-            if e.state not in (OrderState.TRADED, OrderState.PART_CANCELLED):
+            # 状态收口：只对【活跃态】(PLANNED/SUBMITTED/PART_TRADED) 按券商权威量 vs 计划量推进；终态
+            # (TRADED/PART_CANCELLED/CANCELLED/REJECTED) 一律不改状态——filled 值已上修(成交是事实)，但 CANCELLED/
+            # REJECTED 的「成交-aware 终态」由 reconcile_fills_from_detail 收口为 PART_CANCELLED，收口不在此越权改终态。
+            if e.state not in (
+                OrderState.TRADED, OrderState.PART_CANCELLED,
+                OrderState.CANCELLED, OrderState.REJECTED,
+            ):
                 if e.plan_volume and broker_vol >= e.plan_volume:
                     e.state = OrderState.TRADED
                 elif broker_vol > 0:
