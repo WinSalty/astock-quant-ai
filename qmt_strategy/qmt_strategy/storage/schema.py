@@ -82,6 +82,9 @@ TABLE_META: Dict[str, Dict[str, List[str]]] = {
             "name", "is_st",
             # 连板维度（doc/18 禁买四板及以上）：board_level=连板高度、tier=入选分层，经 SQLite 无损 round-trip。
             "board_level", "tier",
+            # 打板因子（契约 1.2.0）：封板时序 + 位置/强度，经 SQLite 无损 round-trip（时刻 TEXT、open_times INT、三比例 TEXT）。
+            "first_limit_time", "last_limit_time", "open_times",
+            "volume_ratio", "return_5d_pct", "return_10d_pct",
         ],
         "unique": ["ts_code", "target_trade_date"],
         "coalesce": [],
@@ -172,6 +175,8 @@ _DDL: Dict[str, str] = {
             reasonable_open_high_low TEXT, reasonable_open_high_high TEXT, first_board_vol INTEGER,
             float_mktcap TEXT, strategy_family TEXT, setup TEXT, name TEXT, is_st INTEGER,
             board_level INTEGER, tier TEXT,
+            first_limit_time TEXT, last_limit_time TEXT, open_times INTEGER,
+            volume_ratio TEXT, return_5d_pct TEXT, return_10d_pct TEXT,
             PRIMARY KEY (ts_code, target_trade_date)
         )""",
     # 系统标志位 kv（评审二轮 P1#9）：跨进程/跨日持久的运行态标记，如对账未通过阻断次日开仓。
@@ -188,6 +193,10 @@ _DDL: Dict[str, str] = {
 _COLUMN_MIGRATIONS = {
     "watchlist": [
         ("name", "TEXT"), ("is_st", "INTEGER"), ("board_level", "INTEGER"), ("tier", "TEXT"),
+        # 打板因子（契约 1.2.0）：旧库无此 6 列时幂等补上（CREATE TABLE IF NOT EXISTS 不给旧表加列），
+        # 使 row_to_selected 的 SELECT * 列集必含这些列；列定义须与上方 DDL 完全一致。
+        ("first_limit_time", "TEXT"), ("last_limit_time", "TEXT"), ("open_times", "INTEGER"),
+        ("volume_ratio", "TEXT"), ("return_5d_pct", "TEXT"), ("return_10d_pct", "TEXT"),
     ],
 }
 

@@ -399,4 +399,11 @@ class WatchlistLoader:
             # 供 entry_router 与 order_executor 的禁买四板及以上闸复核（与 ST 同样三层兜底）。
             board_level=row.board_level,
             tier=row.tier,
+            # 打板因子透传（契约 1.2.0）：封板时序 + 位置/强度，带到 PlanRow 供策略消费（默认不改行为，配阈值才生效）。
+            first_limit_time=row.first_limit_time,
+            last_limit_time=row.last_limit_time,
+            open_times=row.open_times,
+            volume_ratio=row.volume_ratio,
+            return_5d_pct=row.return_5d_pct,
+            return_10d_pct=row.return_10d_pct,
         )

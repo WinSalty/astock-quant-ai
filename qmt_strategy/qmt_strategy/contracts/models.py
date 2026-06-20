@@ -81,6 +81,16 @@ class SelectedStockRow:
     # （信号侧恒非空，HIGH_BOARD ⟺ board_level>=4）。二者经 buy_prefilter 双源判高板：board_level 优先、tier 兜底。
     board_level: Optional[int] = None
     tier: Optional[str] = None
+    # 打板因子（watchlist 契约 1.2.0，信号侧已下发，执行侧透传供策略消费；默认不改行为，配阈值才生效）：
+    # 封板时序——first_limit_time/last_limit_time=首/末封时刻(HH:MM:SS 文本，东八区，不参与 UTC 下注体系、不做±8h)；
+    # open_times=当日开板(炸板)次数(0=未开板/一字)。位置/强度——volume_ratio=T 日量比(≠盘中 auction_vol_ratio)；
+    # return_5d_pct/return_10d_pct=近 5/10 日涨幅%(可为负)。均可空，缺失即 None、策略侧降级不误杀。
+    first_limit_time: Optional[str] = None
+    last_limit_time: Optional[str] = None
+    open_times: Optional[int] = None
+    volume_ratio: Optional[Decimal] = None
+    return_5d_pct: Optional[Decimal] = None
+    return_10d_pct: Optional[Decimal] = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +138,13 @@ class TradableEntry:
     # 使「禁买四板及以上」三层闸（loader 前置过滤 / entry_router / order_executor）都拿得到连板高度信号。
     board_level: Optional[int] = None
     tier: Optional[str] = None
+    # 打板因子透传（1.2.0）：封板时序 + 位置/强度，一路带到 PlanRow 供策略消费（口径见 SelectedStockRow 同名字段）。
+    first_limit_time: Optional[str] = None
+    last_limit_time: Optional[str] = None
+    open_times: Optional[int] = None
+    volume_ratio: Optional[Decimal] = None
+    return_5d_pct: Optional[Decimal] = None
+    return_10d_pct: Optional[Decimal] = None
 
     def to_plan_row(self) -> "PlanRow":
         """转为 auction/entry 消费的计划行（窄视图）。"""
@@ -156,6 +173,13 @@ class TradableEntry:
             # 连板维度透传给路由/下单层做禁买四板及以上闸（doc/18）。
             board_level=self.board_level,
             tier=self.tier,
+            # 打板因子透传（1.2.0）：封板时序 + 位置/强度，供策略消费（默认不改行为，配阈值才生效）。
+            first_limit_time=self.first_limit_time,
+            last_limit_time=self.last_limit_time,
+            open_times=self.open_times,
+            volume_ratio=self.volume_ratio,
+            return_5d_pct=self.return_5d_pct,
+            return_10d_pct=self.return_10d_pct,
         )
 
 
@@ -207,6 +231,15 @@ class PlanRow:
     # entry_router._should_skip 经 buy_prefilter 据此对四板及以上标的一律 SKIP，绝不产 BUY 决策。
     board_level: Optional[int] = None
     tier: Optional[str] = None
+    # 打板因子（watchlist 契约 1.2.0）：封板时序 + 位置/强度，供 entry 策略消费（口径见 SelectedStockRow 同名字段）。
+    # 消费点（默认全关、配 settings 阈值才生效）：open_times→烂板/反复炸板弃；return_5d_pct→高位弃；
+    # first_limit_time→龙回头首封太晚弃。volume_ratio/last_limit_time/return_10d_pct 本期仅透传留痕、不接判定。
+    first_limit_time: Optional[str] = None
+    last_limit_time: Optional[str] = None
+    open_times: Optional[int] = None
+    volume_ratio: Optional[Decimal] = None
+    return_5d_pct: Optional[Decimal] = None
+    return_10d_pct: Optional[Decimal] = None
 
 
 @dataclass

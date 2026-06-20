@@ -45,6 +45,12 @@ def _make_row(
     continuation_prob: Decimal = Decimal("0.62"),
     next_day_premium_prob: Decimal = Decimal("0.55"),
     fail_conditions=None,
+    first_limit_time=None,
+    last_limit_time=None,
+    open_times=None,
+    volume_ratio=None,
+    return_5d_pct=None,
+    return_10d_pct=None,
 ) -> SelectedStockRow:
     """构造一行信号契约（默认主板可交易强势票，带完整价位 / 先验 / 失败条件，便于断言字段一致）。"""
     return SelectedStockRow(
@@ -67,6 +73,12 @@ def _make_row(
         first_board_vol=1_000_000,
         float_mktcap=Decimal("5000000000"),
         fail_conditions=fail_conditions if fail_conditions is not None else ["炸板", "尾盘跳水"],
+        first_limit_time=first_limit_time,
+        last_limit_time=last_limit_time,
+        open_times=open_times,
+        volume_ratio=volume_ratio,
+        return_5d_pct=return_5d_pct,
+        return_10d_pct=return_10d_pct,
     )
 
 
@@ -138,6 +150,82 @@ def test_save_then_fetch_round_trip(tmp_path):
         # 日期口径（ISO 存取）一致
         assert by_code["600000.SH"].target_trade_date == T_BUY
         assert by_code["600000.SH"].trade_date == T_SIGNAL
+    finally:
+        wq.stop()
+
+
+def test_round_trip_preserves_daban_factors(tmp_path):
+    """打板因子 E1：6 个新字段(封板时序 + 位置/强度) save→fetch 无损 round-trip；缺值保 None。"""
+    db, wq = _setup_db(tmp_path)
+    try:
+        src = SqliteSelectedStockSource(db, RecordingLogger())
+        src.save_watchlist(
+            [
+                _make_row(
+                    "600000.SH",
+                    first_limit_time="09:32:05", last_limit_time="13:10:00", open_times=2,
+                    volume_ratio=Decimal("2.3000"), return_5d_pct=Decimal("31.20"),
+                    return_10d_pct=Decimal("-5.40"),
+                ),
+                _make_row("000001.SZ"),  # 6 字段全缺 → 应保 None
+            ]
+        )
+        assert wq.flush(timeout=2.0)
+        got = {r.ts_code: r for r in src.fetch(T_BUY)}
+        a = got["600000.SH"]
+        assert a.first_limit_time == "09:32:05"      # 时刻字符串原样（不解析、不做时区）
+        assert a.last_limit_time == "13:10:00"
+        assert a.open_times == 2                       # int 原样
+        assert a.volume_ratio == Decimal("2.3000")     # Decimal 经 TEXT 存取无精度损失
+        assert a.return_5d_pct == Decimal("31.20")
+        assert a.return_10d_pct == Decimal("-5.40")    # 可为负
+        b = got["000001.SZ"]
+        assert b.first_limit_time is None and b.last_limit_time is None and b.open_times is None
+        assert b.volume_ratio is None and b.return_5d_pct is None and b.return_10d_pct is None
+    finally:
+        wq.stop()
+
+
+def test_old_db_missing_daban_columns_migrated_by_init(tmp_path):
+    """打板因子 E1（旧库兼容·最高优先）：旧 watchlist 表无 6 新列 → init_db 幂等 ALTER ADD 补齐，
+    随后 save+fetch（SELECT *）不抛 IndexError、新字段可无损 round-trip。"""
+    db = str(tmp_path / "old.db")
+    conn = sqlite3.connect(db)
+    # 旧版建表：只到 board_level/tier，无 6 个打板因子列（模拟 1.2.0 之前的库）。
+    conn.execute(
+        "CREATE TABLE watchlist (ts_code TEXT NOT NULL, trade_date TEXT, "
+        "target_trade_date TEXT NOT NULL, leader_strength_score TEXT, role TEXT, strategy TEXT, "
+        "market_state TEXT, tradable_flag INTEGER, continuation_prob TEXT, next_day_premium_prob TEXT, "
+        "boost TEXT, fail_conditions TEXT, signal_close TEXT, limit_up_price TEXT, "
+        "reasonable_open_high_low TEXT, reasonable_open_high_high TEXT, first_board_vol INTEGER, "
+        "float_mktcap TEXT, strategy_family TEXT, setup TEXT, name TEXT, is_st INTEGER, "
+        "board_level INTEGER, tier TEXT, PRIMARY KEY (ts_code, target_trade_date))"
+    )
+    conn.commit()
+    cols0 = {r[1] for r in conn.execute("PRAGMA table_info(watchlist)").fetchall()}
+    assert "open_times" not in cols0  # 迁移前确认旧库无新列
+    conn.close()
+
+    init_db(sqlite3.connect(db))  # 幂等列迁移：对旧表 ALTER TABLE ADD COLUMN × 6
+
+    conn2 = sqlite3.connect(db)
+    cols1 = {r[1] for r in conn2.execute("PRAGMA table_info(watchlist)").fetchall()}
+    for c in (
+        "first_limit_time", "last_limit_time", "open_times",
+        "volume_ratio", "return_5d_pct", "return_10d_pct",
+    ):
+        assert c in cols1  # 6 列已补齐
+    conn2.close()
+
+    # 迁移后 save+fetch（row_to_selected 走 SELECT *）正常、新字段无损 → 证明不抛 IndexError。
+    wq = AsyncWriteQueue(lambda: sqlite3.connect(db), RecordingLogger())
+    wq.start()
+    try:
+        src = SqliteSelectedStockSource(db, RecordingLogger())
+        src.save_watchlist([_make_row("600000.SH", open_times=1, return_5d_pct=Decimal("12.00"))])
+        assert wq.flush(timeout=2.0)
+        got = src.fetch(T_BUY)
+        assert got[0].open_times == 1 and got[0].return_5d_pct == Decimal("12.00")
     finally:
         wq.stop()
 
@@ -264,7 +352,10 @@ def test_loader_integration_reads_from_local_sqlite(tmp_path):
         # 盘前同步：一只可交易主板票 + 一只 tradable_flag=False 的票（应进观察名单）。
         src.save_watchlist(
             [
-                _make_row("600000.SH", market_state="启动", tradable_flag=True),
+                _make_row(
+                    "600000.SH", market_state="启动", tradable_flag=True,
+                    first_limit_time="09:40:00", open_times=1, return_5d_pct=Decimal("18.00"),
+                ),
                 _make_row("000001.SZ", market_state="启动", tradable_flag=False),
             ]
         )
@@ -291,6 +382,15 @@ def test_loader_integration_reads_from_local_sqlite(tmp_path):
         assert entry.price.limit_up_price == Decimal("11.00")
         assert entry.continuation_prob == Decimal("0.62")
         assert entry.signal_trade_date == T_SIGNAL
+        # 打板因子 E1：6 新字段经本机 SQLite 读回 → TradableEntry，并 to_plan_row 透传到 PlanRow（端到端）。
+        assert entry.first_limit_time == "09:40:00"
+        assert entry.open_times == 1
+        assert entry.return_5d_pct == Decimal("18.00")
+        plan = entry.to_plan_row()
+        assert plan.first_limit_time == "09:40:00"
+        assert plan.open_times == 1
+        assert plan.return_5d_pct == Decimal("18.00")
+        assert plan.last_limit_time is None and plan.volume_ratio is None  # 未设字段透传 None
     finally:
         wq.stop()
 

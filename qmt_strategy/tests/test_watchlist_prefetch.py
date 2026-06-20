@@ -96,6 +96,25 @@ def test_item_mapping_non_tradable_and_missing_fields():
     assert row.role is None
     assert row.leader_strength_score is None
     assert row.signal_close is None
+    # 打板因子 E1：老契约不含 6 新字段 → 全 None（策略侧降级不误杀）。
+    assert row.first_limit_time is None and row.last_limit_time is None and row.open_times is None
+    assert row.volume_ratio is None and row.return_5d_pct is None and row.return_10d_pct is None
+
+
+def test_item_mapping_daban_factors():
+    """打板因子 E1：item→SelectedStockRow 映射 6 新字段（时刻直取、open_times→int、三比例→Decimal）。"""
+    item = {
+        "ts_code": "300750.SZ", "trade_date": "2026-06-12", "tradable_flag": "TRADABLE",
+        "first_limit_time": "09:32:05", "last_limit_time": "13:10:00", "open_times": 2,
+        "volume_ratio": "2.30", "return_5d_pct": "31.2", "return_10d_pct": "-5.4",
+    }
+    row = watchlist_item_to_selected(item, date(2026, 6, 13))
+    assert row.first_limit_time == "09:32:05"
+    assert row.last_limit_time == "13:10:00"
+    assert row.open_times == 2
+    assert row.volume_ratio == Decimal("2.30")
+    assert row.return_5d_pct == Decimal("31.2")
+    assert row.return_10d_pct == Decimal("-5.4")  # 可为负
 
 
 def test_prefetch_pulls_by_signal_date_and_saves():

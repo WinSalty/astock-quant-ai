@@ -304,6 +304,13 @@ def selected_to_row(r: SelectedStockRow) -> Dict[str, Any]:
         # 连板维度（doc/18 禁买四板及以上）：board_level=连板高度（int 直存，None→NULL），tier=入选分层（TEXT 直存）。
         "board_level": r.board_level,
         "tier": r.tier,
+        # 打板因子（契约 1.2.0）：时刻 TEXT 直存（HH:MM:SS，不解析）、open_times int 直存、三比例 dec_text 存 TEXT 保精度。
+        "first_limit_time": r.first_limit_time,
+        "last_limit_time": r.last_limit_time,
+        "open_times": r.open_times,
+        "volume_ratio": dec_text(r.volume_ratio),
+        "return_5d_pct": dec_text(r.return_5d_pct),
+        "return_10d_pct": dec_text(r.return_10d_pct),
     }
 
 
@@ -332,4 +339,12 @@ def row_to_selected(row: Any) -> SelectedStockRow:
         # 故绝不能在未跑迁移的库上 SELECT 老列集再喂本方法——保护来自强制迁移，不是 _g 的容错。
         board_level=_g(row, "board_level"),
         tier=_g(row, "tier"),
+        # 打板因子（契约 1.2.0）：与 board_level/tier 同——6 列由 _apply_column_migrations 对旧库幂等补齐，
+        # 故 _g 取列必有值。时刻/open_times 直读（NULL→None），三比例 text_dec 还原 Decimal（NULL→None）。
+        first_limit_time=_g(row, "first_limit_time"),
+        last_limit_time=_g(row, "last_limit_time"),
+        open_times=_g(row, "open_times"),
+        volume_ratio=text_dec(_g(row, "volume_ratio")),
+        return_5d_pct=text_dec(_g(row, "return_5d_pct")),
+        return_10d_pct=text_dec(_g(row, "return_10d_pct")),
     )

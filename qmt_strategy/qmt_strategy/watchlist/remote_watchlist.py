@@ -147,6 +147,14 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
         float_mktcap=_to_decimal(item.get("float_mktcap")),
         strategy_family=item.get("strategy_family"),
         setup=item.get("setup"),
+        # 打板因子（契约 1.2.0）：封板时序 + 位置/强度，透传供执行侧策略消费。缺字段(老契约)→None，策略侧降级不误杀。
+        # 时刻为 HH:MM:SS 文本直取（不解析）；open_times 走 _to_int；三个比例走 _to_decimal（保 None 三态、不臆造）。
+        first_limit_time=item.get("first_limit_time"),
+        last_limit_time=item.get("last_limit_time"),
+        open_times=_to_int(item.get("open_times")),
+        volume_ratio=_to_decimal(item.get("volume_ratio")),
+        return_5d_pct=_to_decimal(item.get("return_5d_pct")),
+        return_10d_pct=_to_decimal(item.get("return_10d_pct")),
     )
 
 
