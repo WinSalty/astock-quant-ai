@@ -647,17 +647,17 @@ def _topped_snap():
 
 
 def test_e2_active_defaults_filter():
-    """E2 默认即生效（业务方决策 2026-06-19）：默认 forbid_open_times_max=1 / high_return_pct_limit=50 /
-    pullback_entry_deadline_hm=10:30。稳封(open_times=0)+缺位置因子的票照买；炸过板/高位的被默认闸过滤；
+    """E2 默认即生效（业务方决策 2026-06-19）：默认 forbid_open_times_max=1 / high_return_pct_limit=40 /
+    pullback_entry_deadline_hm=10:00。稳封(open_times=0)+缺位置因子的票照买；炸过板/高位的被默认闸过滤；
     因子缺失（None）零误杀。"""
     strat = ChaseLimitUpStrategy()
-    s = _settings()  # _settings 直构 Settings()，用 dataclass 默认 1/50/10:30（已生效）
+    s = _settings()  # _settings 直构 Settings()，用 dataclass 默认 1/40/10:00（已生效）
     # 稳封(0 炸板) → 默认 forbid=1 不触发（0>=1 假）→ 买。
     assert strat.decide(make_plan_row(open_times=0), _topped_snap(), s).action == EntryAction.CHASE_LIMIT_UP
     # 炸过板(open_times>=1) → 默认 forbid=1 触发弃。
     assert strat.decide(make_plan_row(open_times=1), _topped_snap(), s).action == EntryAction.SKIP
-    # 高位(return_5d_pct>=50) → 默认 high_return=50 触发弃。
-    assert strat.decide(make_plan_row(return_5d_pct=Decimal("60")), _topped_snap(), s).action == EntryAction.SKIP
+    # 高位(return_5d_pct>=40) → 默认 high_return=40 触发弃（45 取在 40~50 间，能验证默认确是 40 而非旧 50）。
+    assert strat.decide(make_plan_row(return_5d_pct=Decimal("45")), _topped_snap(), s).action == EntryAction.SKIP
     # 因子全缺（make_plan_row 默认 6 因子 None）→ 默认闸全不触发（零误杀）→ 买。
     assert strat.decide(make_plan_row(), _topped_snap(), s).action == EntryAction.CHASE_LIMIT_UP
 

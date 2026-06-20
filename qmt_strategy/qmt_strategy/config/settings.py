@@ -118,8 +118,8 @@ class Settings:
     # 与 plan 因子双守卫（阈值 is not None 且 plan 因子 is not None 才判弃），缺数据/老契约零误杀。
     # 关停某闸：配一个永不触发的大值（见各行）；⚠️ open_times 配 0=`>=0` 恒成立=全弃，属误配，关闭请配大值。
     forbid_open_times_max: Optional[int] = 1          # QMT_FORBID_OPEN_TIMES_MAX：open_times>=本值→弃。默认1=只打稳封(0炸板)；关闭配大值如999（勿配0）
-    high_return_pct_limit: Optional[Decimal] = Decimal("50")  # QMT_HIGH_RETURN_PCT_LIMIT：return_5d_pct>=本值(%)→弃。默认50=近5日涨超50%规避；关闭配大值如9999
-    pullback_entry_deadline_hm: Optional[str] = "10:30"  # QMT_PULLBACK_ENTRY_DEADLINE_HM(HH:MM)：龙回头 first_limit_time>本值→弃。默认10:30；关闭配如23:59
+    high_return_pct_limit: Optional[Decimal] = Decimal("40")  # QMT_HIGH_RETURN_PCT_LIMIT：return_5d_pct>=本值(%)→弃。默认40=近5日涨超40%规避；关闭配大值如9999
+    pullback_entry_deadline_hm: Optional[str] = "10:00"  # QMT_PULLBACK_ENTRY_DEADLINE_HM(HH:MM)：龙回头 first_limit_time>本值→弃。默认10:00；关闭配如23:59
     strategy_enabled: dict = field(default_factory=dict)  # QMT_STRATEGY_<NAME>_ENABLED 汇总
 
     # —— 7.1.5 风控阈值（执行侧硬约束，下单前生效）——
@@ -265,14 +265,14 @@ class Settings:
                 _v if (_v := _as_decimal(g("QMT_SEAL_RATIO_MIN"))) is not None else Decimal("0")
             ),
             # 打板因子消费阈值（E2，默认即生效，env 可覆盖）：is-not-None 守卫——显式配（含极端值关停）优先，
-            # 未配/空串回退起步默认 1 / 50 / "10:30"。注：配 0 是显式值（open_times>=0 全弃，误配自负），不被守卫吞。
+            # 未配/空串回退起步默认 1 / 40 / "10:00"。注：配 0 是显式值（open_times>=0 全弃，误配自负），不被守卫吞。
             forbid_open_times_max=(
                 _v if (_v := _as_int(g("QMT_FORBID_OPEN_TIMES_MAX"))) is not None else 1
             ),
             high_return_pct_limit=(
-                _v if (_v := _as_decimal(g("QMT_HIGH_RETURN_PCT_LIMIT"))) is not None else Decimal("50")
+                _v if (_v := _as_decimal(g("QMT_HIGH_RETURN_PCT_LIMIT"))) is not None else Decimal("40")
             ),
-            pullback_entry_deadline_hm=(g("QMT_PULLBACK_ENTRY_DEADLINE_HM") or "10:30"),
+            pullback_entry_deadline_hm=(g("QMT_PULLBACK_ENTRY_DEADLINE_HM") or "10:00"),
             strategy_enabled=strat,
             max_position_per_stock=_as_decimal(g("QMT_MAX_POSITION_PER_STOCK")),
             max_total_exposure=_as_decimal(g("QMT_MAX_TOTAL_EXPOSURE")),

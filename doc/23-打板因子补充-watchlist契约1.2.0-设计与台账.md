@@ -74,8 +74,8 @@
 | env | 语义 | **默认（起步值）** | 挂载策略 |
 |---|---|---|---|
 | `QMT_FORBID_OPEN_TIMES_MAX` | `open_times >=` 本值 → 弃（反复炸板/烂板） | **`1`**（=只打稳封/0 炸板；⚠️配 `0`=`>=0` 全弃误配；关停配大值如 999） | `chase_limit_up` / `dip_buy_ma` / `leader_pullback` |
-| `QMT_HIGH_RETURN_PCT_LIMIT` | `return_5d_pct >=` 本值(%) → 弃（高位规避，手册首要风险闸） | **`50`**（近 5 日涨超 50% 规避；关停配大值如 9999） | 追买族 `chase_limit_up` / `chase_auction_strong`（放降级 B 前）；低吸/龙回头（回踩战法）不接 |
-| `QMT_PULLBACK_ENTRY_DEADLINE_HM`(HH:MM) | `first_limit_time >` 本值 → 弃（首封太晚、龙头当日封板偏弱） | **`10:30`**（关停配如 `23:59`） | 仅 `leader_pullback` |
+| `QMT_HIGH_RETURN_PCT_LIMIT` | `return_5d_pct >=` 本值(%) → 弃（高位规避，手册首要风险闸） | **`40`**（近 5 日涨超 40% 规避；关停配大值如 9999） | 追买族 `chase_limit_up` / `chase_auction_strong`（放降级 B 前）；低吸/龙回头（回踩战法）不接 |
+| `QMT_PULLBACK_ENTRY_DEADLINE_HM`(HH:MM) | `first_limit_time >` 本值 → 弃（首封太晚、龙头当日封板偏弱） | **`10:00`**（关停配如 `23:59`） | 仅 `leader_pullback` |
 
 统一双守卫（settings 阈值与 plan 因子均非 None 才判弃）缺数据零误杀；`base._parse_hms` 脏/缺时刻 fail-open。`last_limit_time` / `volume_ratio` / `return_10d_pct` 本期**仅透传留痕、不接判定**（`volume_ratio` ≠ 盘中 `auction_vol_ratio`，先不混用）。
 
@@ -93,6 +93,6 @@
 **执行侧（E1/E2）**
 - 全量测试 **733 passed**；单测覆盖：item→Row 映射、SQLite save→fetch 无损 round-trip、旧库幂等迁移（无 IndexError）、SQLite→TradableEntry→PlanRow 端到端透传、E2 默认起步值生效（稳封买 / 炸板弃 / 高位弃 / 缺数据零误杀）、4 策略各消费点、双守卫不误杀、脏/缺时刻 fail-open、高位闸放降级 B 前。
 - 评审：E1（无阻塞）、E2（无阻塞）、整体收口（无阻塞——6 字段跨两仓 9 层字面一致、端到端闭合、量纲口径严格区分）、E2 默认改 active 复审（无阻塞，默认与 from_env 一致、缺数据降级成立、订正 4 策略旧注释）。
-- 提交：`65dd902`（E1 透传链）/ `58fb58b`（E2 策略消费，默认关）/ 默认改起步值 1/50/10:30（业务方决策，本次提交），执行侧 `main`。
+- 提交：`65dd902`（E1 透传链）/ `58fb58b`（E2 策略消费，默认关）/ 默认改起步值（业务方决策）/ 起步值微调至 `1`/`40`/`10:00`，执行侧 `main`。
 
 > 遗留小项（不阻塞）：`resources/sql/03_full_schema_with_comments.sql` 人工参考 DDL 早已漂移（缺 lhb/is_st 等多列），非本次回归；生产建表以 alembic 迁移为准。
