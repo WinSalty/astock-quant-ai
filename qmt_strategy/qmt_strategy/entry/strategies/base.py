@@ -179,7 +179,13 @@ def prior_gate_reason(plan: PlanRow, settings: Settings) -> Optional[str]:
     - leader_strength_score 有值且 < settings.leader_strength_min → 收手；
     - continuation_prob 有值且 < 续板下限 → 收手。
     返回否决原因（命中即 SKIP）；无否决返回 None。
+
+    例外（doc/29 B2）：data_missing=True 是信号侧【约定核心交易指标缺测】的显式 sentinel，须 fail-closed 直接收手
+    ——与「普通降级 null（仅个别先验字段缺、按盘口把关 fail-open）」严格区分。缺测票绝不追买（最保守口径），
+    且 buy_prefilter 闸门已先于本闸门拦截，这里是策略侧冗余防线。
     """
+    if plan.data_missing:
+        return "先验闸门:核心交易指标缺测(data_missing)→放弃买入"
     score = plan.leader_strength_score
     strength_min = settings.leader_strength_min
     if score is not None and strength_min is not None and score < strength_min:

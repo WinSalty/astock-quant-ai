@@ -120,6 +120,40 @@ def test_market_state_ebb_routes_skip_with_trace():
     assert "entry_decision_skip" in logger.events()
 
 
+def test_data_missing_routes_skip():
+    """doc/29 B2：data_missing=True 的计划 → _should_skip 闸门 0(buy_prefilter) 判 SKIP，不产 BUY、不下单、留痕。"""
+    router, log, logger = _router()
+    # 强势顶板快照也压不过缺测闸门：核心指标缺测一律放弃买入。
+    plan = make_plan_row(strategy_family="打板", setup="连板接力", market_state="启动", data_missing=True)
+    snap = _snap(is_limit_up=True, last_price=Decimal("11.00"), seal_to_float_ratio=Decimal("0.05"))
+
+    decision = router.on_auction_snapshot(snap, plan)
+
+    assert decision is not None
+    assert decision.action == EntryAction.SKIP
+    assert decision.limit_price is None and decision.plan_volume is None
+    assert "缺测" in decision.reason
+    assert decision.data_missing is True  # 缺测标记锚到决策，供 order_executor 第 3 层复核拒单
+
+
+def test_prior_gate_reason_data_missing_fail_closed():
+    """doc/29 B2：prior_gate_reason 对 data_missing fail-closed（与普通降级 null 的 fail-open 区分）。"""
+    from qmt_strategy.entry.strategies.base import prior_gate_reason
+
+    settings = _settings()
+    # 缺测 + 即便强度/续板先验齐备且达标 → 仍因 data_missing 收手
+    miss = make_plan_row(
+        data_missing=True, leader_strength_score=Decimal("0.9"), continuation_prob=Decimal("0.8")
+    )
+    reason = prior_gate_reason(miss, settings)
+    assert reason is not None and "缺测" in reason
+    # 非缺测 + 先验达标 → 不收手（fail-open 不变）
+    ok = make_plan_row(
+        data_missing=False, leader_strength_score=Decimal("0.9"), continuation_prob=Decimal("0.8")
+    )
+    assert prior_gate_reason(ok, settings) is None
+
+
 def test_skip_also_traced_when_no_decision_log():
     """未传 decision_log 时，SKIP 仍走 logger 留痕（§4.2 留痕不依赖台账）。"""
     clock = FakeClock(utc_at_east8(T_BUY, 9, 16, 0))

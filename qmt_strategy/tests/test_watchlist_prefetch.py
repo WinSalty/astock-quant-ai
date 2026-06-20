@@ -117,6 +117,37 @@ def test_item_mapping_daban_factors():
     assert row.return_10d_pct == Decimal("-5.4")  # 可为负
 
 
+def test_item_mapping_data_missing_sentinel():
+    """doc/29 B1：tradable_flag=DATA_MISSING → data_missing=True + data_missing_reason 透传；
+    与一般非 TRADABLE(只弃买不强卖) 区分（data_missing 才触发持仓强卖）。"""
+    # 缺测哨兵：data_missing=True + 原因串；tradable_flag 仍映射为 False（非 TRADABLE，弃买）
+    miss = watchlist_item_to_selected(
+        {
+            "ts_code": "300750.SZ", "trade_date": "2026-06-12",
+            "tradable_flag": "DATA_MISSING", "data_missing_reason": "missing:close,open_times",
+        },
+        date(2026, 6, 13),
+    )
+    assert miss.data_missing is True
+    assert miss.data_missing_reason == "missing:close,open_times"
+    assert miss.tradable_flag is False  # 非 TRADABLE → 不可交易（弃买），与 data_missing 正交承载
+
+    # 一般非 TRADABLE（BLOCKED/CAUTION）：data_missing=False（只弃买、不强卖）
+    blocked = watchlist_item_to_selected(
+        {"ts_code": "600000.SH", "trade_date": "2026-06-12", "tradable_flag": "BLOCKED"},
+        date(2026, 6, 13),
+    )
+    assert blocked.data_missing is False
+    assert blocked.data_missing_reason is None
+
+    # TRADABLE：data_missing=False
+    ok = watchlist_item_to_selected(
+        {"ts_code": "600000.SH", "trade_date": "2026-06-12", "tradable_flag": "TRADABLE"},
+        date(2026, 6, 13),
+    )
+    assert ok.data_missing is False
+
+
 def test_prefetch_pulls_by_signal_date_and_saves():
     saved = {}
 

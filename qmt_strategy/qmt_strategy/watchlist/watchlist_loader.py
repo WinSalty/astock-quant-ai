@@ -266,8 +266,9 @@ class WatchlistLoader:
             return
 
         # 2.1) 买入前置过滤层（doc/18 第 1 层）：统一委托 buy_prefilter 跑「禁买」硬规则集——命中任一
-        #      （ST/退市整理 或 四板及以上）即剔出可交易名单、转观察（不下单）。ST 口径不变（显式 is_st=True
-        #      或证券名含 ST/退）；四板及以上按 board_level>=阈值 或 tier==HIGH_BOARD 兜底。
+        #      （ST/退市整理 / 四板及以上 / 数据缺测）即剔出可交易名单、转观察（不下单）。ST 口径不变（显式 is_st=True
+        #      或证券名含 ST/退）；四板及以上按 board_level>=阈值 或 tier==HIGH_BOARD 兜底；数据缺测按 data_missing
+        #      （信号侧 tradable_flag=DATA_MISSING，doc/29 B2）。
         #      「绝不买入」由本层(loader 前置过滤) + entry_router(_should_skip) + order_executor(place) 三层叠加兜底。
         verdict = buy_prefilter.evaluate(
             buy_prefilter.CandidateView(
@@ -276,6 +277,7 @@ class WatchlistLoader:
                 is_st=getattr(row, "is_st", None),
                 board_level=row.board_level,
                 tier=row.tier,
+                data_missing=getattr(row, "data_missing", False),
             ),
             high_board_min_level=self._settings.forbid_board_level_min,
         )
@@ -406,4 +408,7 @@ class WatchlistLoader:
             volume_ratio=row.volume_ratio,
             return_5d_pct=row.return_5d_pct,
             return_10d_pct=row.return_10d_pct,
+            # 缺测标记透传（doc/29 B1）：一路带到 PlanRow 供买入拦截(B2)。口径见 SelectedStockRow 同名字段。
+            data_missing=row.data_missing,
+            data_missing_reason=row.data_missing_reason,
         )

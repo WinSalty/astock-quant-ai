@@ -80,11 +80,14 @@ def make_selected_row(
     fail_conditions=None,
     board_level=None,
     tier=None,
+    data_missing: bool = False,
+    data_missing_reason=None,
 ) -> SelectedStockRow:
     """构造一行信号契约，默认值即「主板可交易强势票」。
 
     board_level/tier 默认 None（无连板维度证据，buy_prefilter 据此放行）；
     测试禁买四板及以上时显式传 board_level>=4 或 tier="HIGH_BOARD"。
+    data_missing 默认 False；测试缺测放弃买入/持仓强卖时显式传 True（doc/29）。
     """
     return SelectedStockRow(
         ts_code=ts_code,
@@ -107,6 +110,8 @@ def make_selected_row(
         fail_conditions=fail_conditions,
         board_level=board_level,
         tier=tier,
+        data_missing=data_missing,
+        data_missing_reason=data_missing_reason,
     )
 
 
@@ -133,6 +138,8 @@ def make_plan_row(
     volume_ratio=None,
     return_5d_pct=None,
     return_10d_pct=None,
+    data_missing: bool = False,
+    data_missing_reason=None,
 ) -> PlanRow:
     return PlanRow(
         ts_code=ts_code,
@@ -158,6 +165,8 @@ def make_plan_row(
         volume_ratio=volume_ratio,
         return_5d_pct=return_5d_pct,
         return_10d_pct=return_10d_pct,
+        data_missing=data_missing,
+        data_missing_reason=data_missing_reason,
     )
 
 

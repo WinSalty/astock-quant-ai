@@ -205,9 +205,10 @@ class EntryRouter:
         说明：「因子全面走弱」不在此全局闸门，已下放到 route() 中仅对强势追买族生效（评审 medium#5）。
         """
         # —— 闸门 0：买入前置过滤层（doc/18 第 2 层，优先级最高）——
-        # 统一委托 buy_prefilter 跑禁买硬规则集（ST/退市整理 + 四板及以上）：命中任一即 SKIP，绝不产 BUY 决策。
-        # ST 口径不变（显式 is_st=True 或证券名含 ST/退）；四板及以上按 board_level>=阈值 或 tier==HIGH_BOARD 兜底。
-        # 与 loader（第 1 层前置过滤）、order_executor.place（第 3 层）叠加，确保 ST 与四板及以上标的零买单。
+        # 统一委托 buy_prefilter 跑禁买硬规则集（ST/退市整理 + 四板及以上 + 数据缺测）：命中任一即 SKIP，绝不产 BUY 决策。
+        # ST 口径不变（显式 is_st=True 或证券名含 ST/退）；四板及以上按 board_level>=阈值 或 tier==HIGH_BOARD 兜底；
+        # 数据缺测按 data_missing(信号侧 tradable_flag=DATA_MISSING)（doc/29 B2）。
+        # 与 loader（第 1 层前置过滤）、order_executor.place（第 3 层）叠加，确保 ST / 四板及以上 / 缺测标的零买单。
         verdict = buy_prefilter.evaluate(
             buy_prefilter.CandidateView(
                 ts_code=plan.ts_code,
@@ -215,6 +216,7 @@ class EntryRouter:
                 is_st=plan.is_st,
                 board_level=plan.board_level,
                 tier=plan.tier,
+                data_missing=plan.data_missing,
             ),
             high_board_min_level=self._settings.forbid_board_level_min,
         )
@@ -334,6 +336,8 @@ class EntryRouter:
             # 禁买四板及以上硬规则第 3 层供数（doc/18）：把连板维度锚到决策上，供 place 经 buy_prefilter 复核四板及以上。
             board_level=plan.board_level,
             tier=plan.tier,
+            # 数据缺测第 3 层供数（doc/29 B2）：把缺测标记锚到决策上，供唯一下单点 place 经 buy_prefilter 复核拒发买单。
+            data_missing=plan.data_missing,
         )
 
     def _snapshot_factors(self, snap: AuctionSnapshot) -> Dict[str, object]:

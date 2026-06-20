@@ -31,6 +31,9 @@ WATCHLIST_PATH = "/api/internal/watchlist"
 
 # 信号侧 tradable_flag 取该值视为「可交易」，其余（谨慎/放弃观察等）一律视为不可交易（只观察）。
 _TRADABLE_VALUE = "TRADABLE"
+# 信号侧 watchlist 1.3.0 缺测哨兵（doc/29）：tradable_flag 取该值表示【约定核心交易指标缺测】——
+# 执行侧据此放弃买入(B2) + 已过 T+1 持仓强卖(B3)。与一般非 TRADABLE(空仓/降级)区分：后者只弃买不强卖。
+_DATA_MISSING_VALUE = "DATA_MISSING"
 
 
 def _to_decimal(v: Any) -> Optional[Decimal]:
@@ -112,6 +115,11 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
     tradable_raw = item.get("tradable_flag")
     # 信号侧为字符串枚举（默认 TRADABLE）：等于 TRADABLE 才算可交易，其余视为只观察。
     tradable = (tradable_raw == _TRADABLE_VALUE) if tradable_raw is not None else None
+    # 缺测哨兵解析（doc/29 B1）：tradable_flag=="DATA_MISSING" → data_missing=True（独立于 tradable=False，
+    # 因 BLOCKED/谨慎观察等也是 tradable=False 但不强卖；只有缺测要强卖，故用专属布尔承载）。
+    # data_missing_reason 记缺哪些核心指标，仅留痕。
+    data_missing = tradable_raw == _DATA_MISSING_VALUE
+    data_missing_reason = item.get("data_missing_reason") if data_missing else None
     return SelectedStockRow(
         ts_code=item.get("ts_code"),
         trade_date=_to_date(item.get("trade_date")),
@@ -155,6 +163,9 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
         volume_ratio=_to_decimal(item.get("volume_ratio")),
         return_5d_pct=_to_decimal(item.get("return_5d_pct")),
         return_10d_pct=_to_decimal(item.get("return_10d_pct")),
+        # 缺测哨兵透传（doc/29 B1）：供买入拦截(B2)与持仓强卖(B3)。老契约无该值 → data_missing=False。
+        data_missing=data_missing,
+        data_missing_reason=data_missing_reason,
     )
 
 

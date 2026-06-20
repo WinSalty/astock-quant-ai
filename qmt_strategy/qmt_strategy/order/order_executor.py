@@ -321,16 +321,18 @@ class OrderExecutor:
             return None
 
         # —— 买入前置过滤层最终硬保证（doc/18 第 3 层，唯一下单点）：决策命中任一禁买硬规则
-        #    （ST/退市整理 或 四板及以上）→ 一律拒发买单。所有买入（含 try_next_best 转次优）都汇聚到本方法，
+        #    （ST/退市整理 / 四板及以上 / 数据缺测）→ 一律拒发买单。所有买入（含 try_next_best 转次优）都汇聚到本方法，
         #    是「绝不买入」的最后一道、也是最强一道闸——即便 loader/entry_router 两层被绕过或漏判，这里仍绝不下单（仅留痕）。
         #    is_st 由 _build_decision 用统一口径算定锚到决策（权威），故 CandidateView 只传 is_st 不传 name 即可；
-        #    四板及以上看 decision.board_level/tier，阈值取 settings.forbid_board_level_min（与前两层同一口径）。
+        #    四板及以上看 decision.board_level/tier；数据缺测看 decision.data_missing（doc/29 B2，_build_decision 从 plan 透传）。
+        #    阈值取 settings.forbid_board_level_min（与前两层同一口径）。
         prefilter_verdict = buy_prefilter.evaluate(
             buy_prefilter.CandidateView(
                 ts_code=decision.ts_code,
                 is_st=getattr(decision, "is_st", None),
                 board_level=getattr(decision, "board_level", None),
                 tier=getattr(decision, "tier", None),
+                data_missing=getattr(decision, "data_missing", False),
             ),
             high_board_min_level=self._settings.forbid_board_level_min,
         )

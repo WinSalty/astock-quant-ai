@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from qmt_strategy.common.buy_prefilter import (
+    RULE_DATA_MISSING,
     RULE_HIGH_BOARD,
     RULE_ST,
     CandidateView,
@@ -134,3 +135,20 @@ def test_evaluate_allows_when_no_board_evidence():
     """board_level 与 tier 均缺失 → 四板规则放行（无证据不拦），非 ST 则整体放行。"""
     v = CandidateView(ts_code="600000.SH", name="某某股份", is_st=False, board_level=None, tier=None)
     assert evaluate(v).allowed is True
+
+
+def test_evaluate_data_missing_forbids_buy():
+    """doc/29 B2：data_missing=True → 禁买（核心交易指标缺测，最保守口径）；False → 不因此拦。"""
+    miss = CandidateView(ts_code="600000.SH", name="某某股份", is_st=False, data_missing=True)
+    verdict = evaluate(miss)
+    assert verdict.allowed is False
+    assert verdict.rule_code == RULE_DATA_MISSING
+    # 非缺测、非 ST、无高板证据 → 放行
+    ok = CandidateView(ts_code="600000.SH", name="某某股份", is_st=False, data_missing=False)
+    assert evaluate(ok).allowed is True
+
+
+def test_evaluate_st_priority_over_data_missing():
+    """同时 ST 与缺测 → 返回 ST（规则集顺序在前，rule_code 报 ST；二者都禁买，方向一致）。"""
+    v = CandidateView(ts_code="600000.SH", name="*ST示例", is_st=True, data_missing=True)
+    assert evaluate(v).rule_code == RULE_ST

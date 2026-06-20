@@ -34,6 +34,8 @@ _TIER_HIGH_BOARD = "HIGH_BOARD"
 # 规则码（留痕 / 决策采集用，便于按口径检索「为何禁买」）。
 RULE_ST = "st"
 RULE_HIGH_BOARD = "high_board"
+# 数据缺测禁买（doc/29 B2）：信号侧判该票【约定核心交易指标缺测】(tradable_flag=DATA_MISSING)，执行侧放弃买入。
+RULE_DATA_MISSING = "data_missing"
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,8 @@ class CandidateView:
     is_st: Optional[bool] = None
     board_level: Optional[int] = None
     tier: Optional[str] = None
+    # 数据缺测标记（doc/29 B2）：信号侧 watchlist tradable_flag=DATA_MISSING 解析而来；命中即禁买。
+    data_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -117,8 +121,21 @@ def _rule_high_board(view: "CandidateView", min_level: int) -> Optional["Prefilt
     return None
 
 
+def _rule_data_missing(view: "CandidateView", _min_level: int) -> Optional["PrefilterVerdict"]:
+    """规则 3：数据缺测即放弃买入（doc/29 B2）。信号侧 watchlist 判该票【约定核心交易指标缺测】
+    （tradable_flag=DATA_MISSING）→ 执行侧绝不买入（最保守口径，宁可错过不买盲）。与 ST/四板同为硬禁买，
+    在 loader/entry_router/order_executor 三层各自构造 CandidateView 时都带上 data_missing，形成三层冗余。"""
+    if view.data_missing:
+        return PrefilterVerdict(
+            allowed=False,
+            rule_code=RULE_DATA_MISSING,
+            reason=f"禁买:核心交易指标缺测(ts_code={view.ts_code} data_missing=True)",
+        )
+    return None
+
+
 # 有序禁买规则集（优先级从高到低）：新增禁买规则在此追加一个纯函数即可，落点唯一。
-_RULES: Tuple[_Rule, ...] = (_rule_st, _rule_high_board)
+_RULES: Tuple[_Rule, ...] = (_rule_st, _rule_high_board, _rule_data_missing)
 
 # 放行裁决单例（不可变、可复用，避免每次放行新建对象）。
 _ALLOWED = PrefilterVerdict(allowed=True)

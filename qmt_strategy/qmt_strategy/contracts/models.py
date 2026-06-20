@@ -91,6 +91,13 @@ class SelectedStockRow:
     volume_ratio: Optional[Decimal] = None
     return_5d_pct: Optional[Decimal] = None
     return_10d_pct: Optional[Decimal] = None
+    # 数据缺测标记（doc/29 B1，对接信号侧 watchlist 1.3.0 契约 tradable_flag="DATA_MISSING"）：
+    # data_missing=True 表示信号侧判定该票【约定核心交易指标缺测】（close/board_level/续板档/封板时序等任一缺）。
+    # 执行侧据此：买入侧放弃买入(B2)；已过 T+1 的持仓单元强制清仓(B3，即便无盘口)。与普通 tradable_flag=False
+    # （空仓/LLM 降级 BLOCKED，只弃买不强卖）严格区分——缺测要强卖，故须显式独立布尔，不能与 BLOCKED 混为一谈。
+    # data_missing_reason 记「缺哪些字段」(missing:col1,col2)，仅留痕/复盘用。
+    data_missing: bool = False
+    data_missing_reason: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +152,9 @@ class TradableEntry:
     volume_ratio: Optional[Decimal] = None
     return_5d_pct: Optional[Decimal] = None
     return_10d_pct: Optional[Decimal] = None
+    # 数据缺测标记透传（doc/29 B1）：一路带到 PlanRow 供买入拦截(B2)；口径见 SelectedStockRow 同名字段。
+    data_missing: bool = False
+    data_missing_reason: Optional[str] = None
 
     def to_plan_row(self) -> "PlanRow":
         """转为 auction/entry 消费的计划行（窄视图）。"""
@@ -180,6 +190,9 @@ class TradableEntry:
             volume_ratio=self.volume_ratio,
             return_5d_pct=self.return_5d_pct,
             return_10d_pct=self.return_10d_pct,
+            # 缺测标记透传给路由层做买入拦截（doc/29 B2）。
+            data_missing=self.data_missing,
+            data_missing_reason=self.data_missing_reason,
         )
 
 
@@ -240,6 +253,10 @@ class PlanRow:
     volume_ratio: Optional[Decimal] = None
     return_5d_pct: Optional[Decimal] = None
     return_10d_pct: Optional[Decimal] = None
+    # 数据缺测标记（doc/29 B2）：data_missing=True → buy_prefilter/entry_router/base.prior_gate_reason 一律 SKIP，
+    # 绝不产 BUY 决策（信号侧已判核心指标缺测）。口径见 SelectedStockRow 同名字段。
+    data_missing: bool = False
+    data_missing_reason: Optional[str] = None
 
 
 @dataclass
@@ -303,6 +320,9 @@ class EntryDecision:
     # 经 buy_prefilter 复核四板及以上——所有买入必过唯一下单点，是绝不买入四板及以上的最终硬保证。
     board_level: Optional[int] = None
     tier: Optional[str] = None
+    # 数据缺测最终闸标志（doc/29 B2 第 3 层冗余）：_build_decision 从 plan 透传；order_executor.place 见此为真即
+    # 拒单——所有买入必过唯一下单点，是「缺测即放弃买入」的最终硬保证（与禁买 ST/四板同层）。
+    data_missing: bool = False
 
 
 @dataclass
@@ -353,6 +373,10 @@ class SignalPrior:
     market_state: Optional[str] = None
     role: Optional[str] = None
     strategy: Optional[str] = None
+    # 数据缺测标记（doc/29 B3）：data_missing=True → sell_decider/_evaluate_and_sell_unit 对已过 T+1 的持仓单元
+    # 强制清仓(CLEAR)，即便无盘口也清（最保守口径）。隔夜不在今日名单的持仓 prior 为 None、不强卖（口径③）。
+    data_missing: bool = False
+    data_missing_reason: Optional[str] = None
 
 
 @dataclass
