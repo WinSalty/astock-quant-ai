@@ -127,6 +127,12 @@ def make_plan_row(
     leader_strength_score: Decimal = Decimal("0.8"),
     board_level=None,
     tier=None,
+    first_limit_time=None,
+    last_limit_time=None,
+    open_times=None,
+    volume_ratio=None,
+    return_5d_pct=None,
+    return_10d_pct=None,
 ) -> PlanRow:
     return PlanRow(
         ts_code=ts_code,
@@ -146,6 +152,12 @@ def make_plan_row(
         leader_strength_score=leader_strength_score,
         board_level=board_level,
         tier=tier,
+        first_limit_time=first_limit_time,
+        last_limit_time=last_limit_time,
+        open_times=open_times,
+        volume_ratio=volume_ratio,
+        return_5d_pct=return_5d_pct,
+        return_10d_pct=return_10d_pct,
     )
 
 

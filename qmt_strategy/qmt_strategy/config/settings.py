@@ -113,6 +113,12 @@ class Settings:
     # 在目标机实测确认 bidVol 量纲(是否需 ×100)并据此标定阈值前，不默认激活——避免量纲偏差把真实强板误杀在
     # 真金买入路径上。实测确认后用 QMT_SEAL_RATIO_MIN 配一个正阈值(如 0.005)启用本护栏。
     seal_ratio_min: Decimal = Decimal("0")            # QMT_SEAL_RATIO_MIN
+    # 打板因子消费阈值（执行侧 E2，消费 watchlist 1.2.0 的封板时序/位置因子）：
+    # 三者默认全 None=关闭——【未配置即不改变任何现有买/弃决策】，须显式配 env 才生效（待回测/实测标定）。
+    # 与 plan 因子双守卫（settings 阈值 is not None 且 plan 因子 is not None 才判弃），缺数据/老契约零误杀。
+    forbid_open_times_max: Optional[int] = None       # QMT_FORBID_OPEN_TIMES_MAX：open_times>=本值→弃(反复炸板/烂板)
+    high_return_pct_limit: Optional[Decimal] = None   # QMT_HIGH_RETURN_PCT_LIMIT：return_5d_pct>=本值→弃(追买族高位规避，%)
+    pullback_entry_deadline_hm: Optional[str] = None  # QMT_PULLBACK_ENTRY_DEADLINE_HM(HH:MM)：龙回头 first_limit_time>本值→弃(首封太晚)
     strategy_enabled: dict = field(default_factory=dict)  # QMT_STRATEGY_<NAME>_ENABLED 汇总
 
     # —— 7.1.5 风控阈值（执行侧硬约束，下单前生效）——
@@ -257,6 +263,10 @@ class Settings:
             seal_ratio_min=(
                 _v if (_v := _as_decimal(g("QMT_SEAL_RATIO_MIN"))) is not None else Decimal("0")
             ),
+            # 打板因子消费阈值（E2，默认 None=关闭）：未配置即 None、不改变现有决策；时刻空串 → None。
+            forbid_open_times_max=_as_int(g("QMT_FORBID_OPEN_TIMES_MAX")),
+            high_return_pct_limit=_as_decimal(g("QMT_HIGH_RETURN_PCT_LIMIT")),
+            pullback_entry_deadline_hm=(g("QMT_PULLBACK_ENTRY_DEADLINE_HM") or None),
             strategy_enabled=strat,
             max_position_per_stock=_as_decimal(g("QMT_MAX_POSITION_PER_STOCK")),
             max_total_exposure=_as_decimal(g("QMT_MAX_TOTAL_EXPOSURE")),

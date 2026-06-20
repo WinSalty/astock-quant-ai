@@ -62,6 +62,18 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
         if gate is not None:
             return StrategyOutcome(action=EntryAction.SKIP, reason=f"CHASE_AUCTION_STRONG弃:{gate}")
 
+        # —— 打板因子 E2（默认关，配阈值才生效；双守卫缺数据零误杀）：高位规避——近 5 日涨幅 >= 阈值 → 弃。——
+        # 放在【降级 B 之前】：使「竞价取不到 tick → 改判开盘后追」的降级路径也受高位闸约束（不绕过）。
+        if (
+            settings.high_return_pct_limit is not None
+            and plan.return_5d_pct is not None
+            and plan.return_5d_pct >= settings.high_return_pct_limit
+        ):
+            return StrategyOutcome(
+                action=EntryAction.SKIP,
+                reason=f"CHASE_AUCTION_STRONG弃:高位 return_5d_pct={plan.return_5d_pct}>={settings.high_return_pct_limit}",
+            )
+
         # —— 降级 B 改判（§4.6 / 评审 medium#4）：竞价整体不可得 → 不下竞价单，退化为开盘后追。——
         # 关键：NO_TICK 是逐帧标记，既可能是降级 B（整体长期不可得），也可能是某一轮瞬时丢帧。
         # 故只有「已到 9:20 决策时点（phase >= AUCTION_LOCKED）仍整体不可得」才确认降级 B、改判 OPENING；

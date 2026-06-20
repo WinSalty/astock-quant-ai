@@ -29,6 +29,28 @@ class ChaseLimitUpStrategy(EntryStrategy):
         if gate is not None:
             return StrategyOutcome(action=EntryAction.SKIP, reason=f"CHASE_LIMIT_UP弃:{gate}")
 
+        # —— 打板因子 E2（默认关，配阈值才生效；settings 阈值与 plan 因子双守卫，缺数据/老契约零误杀）——
+        # 反复炸板(烂板)：open_times >= 阈值 → 弃（封板质量差、追板易接最后一棒）。
+        if (
+            settings.forbid_open_times_max is not None
+            and plan.open_times is not None
+            and plan.open_times >= settings.forbid_open_times_max
+        ):
+            return StrategyOutcome(
+                action=EntryAction.SKIP,
+                reason=f"CHASE_LIMIT_UP弃:反复炸板 open_times={plan.open_times}>={settings.forbid_open_times_max}",
+            )
+        # 高位规避：近 5 日涨幅 >= 阈值 → 弃（空间透支、追高风险，手册首要风险闸）。
+        if (
+            settings.high_return_pct_limit is not None
+            and plan.return_5d_pct is not None
+            and plan.return_5d_pct >= settings.high_return_pct_limit
+        ):
+            return StrategyOutcome(
+                action=EntryAction.SKIP,
+                reason=f"CHASE_LIMIT_UP弃:高位 return_5d_pct={plan.return_5d_pct}>={settings.high_return_pct_limit}",
+            )
+
         # —— 弃条件 1：未顶板（虚拟成交价未达涨停价）→ 无板可打，放弃。——
         if not snap.is_limit_up:
             return StrategyOutcome(

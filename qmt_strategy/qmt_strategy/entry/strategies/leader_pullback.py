@@ -14,7 +14,7 @@ from decimal import Decimal
 from ...config.settings import Settings
 from ...contracts.enums import EntryAction, OrderPhase
 from ...contracts.models import AuctionSnapshot, PlanRow
-from .base import EntryStrategy, StrategyOutcome, register
+from .base import EntryStrategy, StrategyOutcome, _parse_hms, register
 
 # 续板概率「不弱」下限（占位经验阈值，真实落地以实测为准）：低于此值视为续板预期走弱。
 _CONTINUATION_MIN = Decimal("0.3")
@@ -48,6 +48,27 @@ class LeaderPullbackStrategy(EntryStrategy):
             return StrategyOutcome(
                 action=EntryAction.SKIP,
                 reason=f"LEADER_PULLBACK弃:续板概率弱 continuation_prob={cont} < {_CONTINUATION_MIN}",
+            )
+
+        # —— 打板因子 E2（默认关，配阈值才生效；双守卫缺数据零误杀）——
+        # 反复炸板(烂板)：open_times >= 阈值 → 弃。
+        if (
+            settings.forbid_open_times_max is not None
+            and plan.open_times is not None
+            and plan.open_times >= settings.forbid_open_times_max
+        ):
+            return StrategyOutcome(
+                action=EntryAction.SKIP,
+                reason=f"LEADER_PULLBACK弃:反复炸板 open_times={plan.open_times}>={settings.forbid_open_times_max}",
+            )
+        # 首封太晚（龙头当日封板偏弱，回踩承接存疑）：first_limit_time > deadline → 弃。
+        # 脏时刻 fail-open：任一时刻解析为 None（空/格式非法）则不触发弃，绝不因坏数据误杀。
+        _deadline = _parse_hms(settings.pullback_entry_deadline_hm)
+        _first_hms = _parse_hms(plan.first_limit_time)
+        if _deadline is not None and _first_hms is not None and _first_hms > _deadline:
+            return StrategyOutcome(
+                action=EntryAction.SKIP,
+                reason=f"LEADER_PULLBACK弃:首封太晚 first_limit_time={plan.first_limit_time}>{settings.pullback_entry_deadline_hm}",
             )
 
         # —— 买条件：强度高 + 续板不弱 → 限价分批吸。——

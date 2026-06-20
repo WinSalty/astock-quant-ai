@@ -632,3 +632,80 @@ def test_dip_buy_ma_rejects_garbage_low_last_price():
     out = strat.decide(plan, snap, _settings())
     assert out.action == EntryAction.DIP_BUY_MA
     assert out.limit_price == Decimal("10.20")
+
+
+# ===========================================================================
+# 打板因子 E2：策略消费新因子（默认关=零行为变化；配阈值才生效，双守卫不误杀，脏时刻 fail-open）
+# ===========================================================================
+from qmt_strategy.entry.strategies.chase_limit_up import ChaseLimitUpStrategy  # noqa: E402
+from qmt_strategy.entry.strategies.leader_pullback import LeaderPullbackStrategy  # noqa: E402
+
+
+def _topped_snap():
+    """顶板帧：is_limit_up=True、封流比缺（不触发封单闸），使 chase_limit_up 走到买入路径。"""
+    return _snap(is_limit_up=True, last_price=Decimal("11.00"))
+
+
+def test_e2_default_off_no_behavior_change():
+    """E2 核心 Gate：阈值默认全关（None）时，即便 plan 带极端因子值，决策与未接入前一致（仍买）。"""
+    strat = ChaseLimitUpStrategy()
+    plan = make_plan_row(open_times=9, return_5d_pct=Decimal("99"), first_limit_time="14:55:00")
+    out = strat.decide(plan, _topped_snap(), _settings())  # 未配任何 E2 阈值
+    assert out.action == EntryAction.CHASE_LIMIT_UP  # 极端因子值也不触发弃 → 零行为变化
+
+
+def test_e2_chase_limit_up_open_times_abandon():
+    """配 forbid_open_times_max：open_times 达阈值 → 弃（反复炸板）；未达 / 缺值 → 仍买（不误杀）。"""
+    strat = ChaseLimitUpStrategy()
+    s = _settings(forbid_open_times_max=2)
+    out = strat.decide(make_plan_row(open_times=3), _topped_snap(), s)
+    assert out.action == EntryAction.SKIP and "反复炸板" in out.reason
+    assert strat.decide(make_plan_row(open_times=1), _topped_snap(), s).action == EntryAction.CHASE_LIMIT_UP
+    assert strat.decide(make_plan_row(open_times=None), _topped_snap(), s).action == EntryAction.CHASE_LIMIT_UP
+
+
+def test_e2_chase_limit_up_high_return_abandon():
+    """配 high_return_pct_limit：return_5d_pct 达阈值 → 弃（高位）；未达 / 缺值 → 仍买。"""
+    strat = ChaseLimitUpStrategy()
+    s = _settings(high_return_pct_limit=Decimal("20"))
+    out = strat.decide(make_plan_row(return_5d_pct=Decimal("30")), _topped_snap(), s)
+    assert out.action == EntryAction.SKIP and "高位" in out.reason
+    assert strat.decide(make_plan_row(return_5d_pct=None), _topped_snap(), s).action == EntryAction.CHASE_LIMIT_UP
+    assert strat.decide(make_plan_row(return_5d_pct=Decimal("10")), _topped_snap(), s).action == (
+        EntryAction.CHASE_LIMIT_UP
+    )
+
+
+def test_e2_dip_buy_takes_open_times_not_high_return():
+    """低吸：接 open_times 烂板弃，但不接 high_return（低吸取低位、高位非其禁忌）。"""
+    strat = DipBuyMaStrategy()
+    snap = _snap(open_pct=Decimal("-0.005"), centroid_trend=CentroidTrend.UP, last_price=Decimal("9.95"))
+    s = _settings(forbid_open_times_max=2, high_return_pct_limit=Decimal("20"))
+    assert strat.decide(make_plan_row(open_times=3), snap, s).action == EntryAction.SKIP
+    # return_5d_pct=99 但 open_times 未达 → 仍买（高位闸对低吸不生效）。
+    out = strat.decide(make_plan_row(open_times=0, return_5d_pct=Decimal("99")), snap, s)
+    assert out.action == EntryAction.DIP_BUY_MA
+
+
+def test_e2_leader_pullback_first_limit_too_late_and_fail_open():
+    """龙回头：首封晚于 deadline → 弃；脏/缺时刻 fail-open 不触发（不误杀）。"""
+    strat = LeaderPullbackStrategy()
+    snap = _snap(last_price=Decimal("10.50"))
+    s = _settings(pullback_entry_deadline_hm="09:45")
+    out = strat.decide(make_plan_row(first_limit_time="10:30:00"), snap, s)
+    assert out.action == EntryAction.SKIP and "首封太晚" in out.reason
+    assert strat.decide(make_plan_row(first_limit_time="09:31:00"), snap, s).action == (
+        EntryAction.LEADER_PULLBACK
+    )
+    # 脏时刻 / 缺时刻 → fail-open 不弃。
+    assert strat.decide(make_plan_row(first_limit_time="坏数据"), snap, s).action == EntryAction.LEADER_PULLBACK
+    assert strat.decide(make_plan_row(first_limit_time=None), snap, s).action == EntryAction.LEADER_PULLBACK
+
+
+def test_e2_chase_auction_strong_high_return_before_degrade_b():
+    """竞价强开追：高位闸放在降级 B 前——NO_TICK 降级帧也先被高位弃（不绕过改判 OPENING）。"""
+    strat = ChaseAuctionStrongStrategy()
+    s = _settings(high_return_pct_limit=Decimal("20"))
+    degraded = _snap(phase=AuctionPhase.AUCTION_LOCKED, data_quality=[DQ_NO_TICK])
+    out = strat.decide(make_plan_row(return_5d_pct=Decimal("30")), degraded, s)
+    assert out.action == EntryAction.SKIP and "高位" in out.reason
