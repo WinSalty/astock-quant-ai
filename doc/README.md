@@ -93,7 +93,7 @@
 
 代码仓库：执行侧 [github.com/WinSalty/astock-quant-ai](https://github.com/WinSalty/astock-quant-ai)。
 
-> ⚠️ **上线前红线（已从「代码缺失」收口为「生产门控」）：盘中卖出链接线代码已落地（阶段0-C，见上表「盘中卖出」行），但生产门控 `QMT_SELL_PASS_LIVE` 默认关、盘中不自动卖；开门控前（须 T1.2 跨帧数值保真 + 真机实测 + 配单票浮亏止损 `QMT_STOCK_FLOAT_LOSS_LIMIT`）买入即裸奔无止损出口，严禁放量实盘。** 部署侧务必先看 [`待办 §B 上线部署步骤`](待办与上线验证清单.md)——含信号侧跑迁移、执行侧提供交易日清单文件、以及信号侧必须**单独**配 `QMT_INGEST_INTERNAL_TOKEN`（**绝不回落** watchlist token；否则 `/api/internal/qmt/ingest` 恒 503、盘后回流静默断流；**2026-06-18 生产已配**）；评审与修复全貌见 [评审与修复状态概要](评审与修复状态概要.md)。
+> ⚠️ **上线前红线（已从「代码缺失」收口为「生产门控」）：盘中卖出链接线代码已落地（阶段0-C，见上表「盘中卖出」行），但生产门控 `QMT_SELL_PASS_LIVE` 默认关、盘中不自动卖；开门控前（须 T1.2 跨帧数值保真 + 真机实测 + 配单票浮亏止损 `QMT_STOCK_FLOAT_LOSS_LIMIT`）买入即裸奔无止损出口，严禁放量实盘。** 部署侧务必先看 [`待办 §B 上线部署步骤`](待办与上线验证清单.md)——含信号侧跑迁移、执行侧提供交易日清单文件（J-3 起执行侧盘前会自动经 `/api/internal/trade_calendar` 校验/补取本地日历，不足且补取失败则 fail-closed 只守仓不开新仓）、以及内网 token：**doc/29 J-8 起通用 token 打通所有接口**——只配一套 `WATCHLIST_EXPORT_INTERNAL_TOKEN(_FILE)` 即打通名单/日历/回流三接口（`QMT_INGEST_INTERNAL_TOKEN` 未单独配时回落该通用 token，消除漏配致 `/ingest` 恒 503 断流的陷阱；需读写隔离再单配）；评审与修复全貌见 [评审与修复状态概要](评审与修复状态概要.md)。
 
 ---
 
@@ -215,11 +215,11 @@
 | 变量 | 用途 | 默认 / 口径 |
 |---|---|---|
 | `STOCK_AH_DB_URL` | MySQL `stock_ah_ai` 连接串（SQLAlchemy/Alembic） | `mysql+pymysql://root@127.0.0.1:3306/stock_ah_ai?charset=utf8mb4`（**生产必配真实库**） |
-| `WATCHLIST_EXPORT_INTERNAL_TOKEN` / `…_FILE` | 盘前 `GET /api/internal/watchlist` 的 `X-Internal-Token` | 无；**未配即接口恒 503 关闭** |
-| `QMT_INGEST_INTERNAL_TOKEN` / `…_FILE` | 盘后 `POST /api/internal/qmt/ingest` 的 `X-Internal-Token` | 无；**绝不回落读 token（评审三轮 SIG-QMT-06），必须单独配**，否则 `/ingest` 恒 503、回流静默断流 |
+| `WATCHLIST_EXPORT_INTERNAL_TOKEN` / `…_FILE`（**兼作通用内网 token**） | `GET /api/internal/watchlist`（盘前名单）+ `GET /api/internal/trade_calendar`（J-3 日历）的 `X-Internal-Token`；并作 ingest 写接口的回落 token | 无；**未配即接口恒 503 关闭** |
+| `QMT_INGEST_INTERNAL_TOKEN` / `…_FILE` | 盘后 `POST /api/internal/qmt/ingest` 的 `X-Internal-Token` | 无；**未单独配则回落 watchlist 通用 token（doc/29 J-8，通用 token 打通所有接口）**——只配一套 watchlist token 即打通名单/日历/回流三接口；需读写权限隔离的部署再显式单配本项覆盖回落 |
 | `WATCHLIST_EXPORT_IP_WHITELIST` / `QMT_INGEST_IP_WHITELIST` | 两接口来源 IP 白名单（逗号分隔，与 token 叠加） | 空=不启用（**生产建议配置或反代层加白名单**） |
 
-> ⚠️ `QMT_INGEST_INTERNAL_TOKEN(_FILE)` **绝不回落** watchlist 导出 token（`resolve_qmt_ingest_internal_token`，SIG-QMT-06）：读/写 token 必须**分别配置**，否则写接口 503。`backend/.env.example` 注释已同步纠正（2026-06-18）；生产已配（指向与 watchlist 同一 token 文件复用同值，仍是独立配置项）。
+> ✅ **token 口径变更（doc/29 J-8，通用 token 打通所有接口；有意回退 SIG-QMT-06 读写分离）**：`resolve_qmt_ingest_internal_token` 在未单独配回流写 token 时**回落 watchlist 通用 token**，消除「漏配回传 token → `/ingest` 恒 503 静默断流」陷阱。本机内网部署、读写两接口同源可信，安全边界改由**内网 + IP 白名单/反代来源绑定**承担（与 watchlist 导出同口径）。`/api/internal/trade_calendar`（J-3）亦复用同一通用 token。需读写权限隔离时仍可显式配独立 `QMT_INGEST_INTERNAL_TOKEN(_FILE)` 覆盖回落。
 
 **行情 / LLM（选股 pipeline 依赖）**
 
