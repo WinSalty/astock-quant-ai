@@ -169,6 +169,9 @@ def test_prior_gate_reason_continuation_band_boundary_and_config():
     # settings 可配：把下限调到 0.4 → 0.35 中档也被拒（档值表上移时运维改阈值，无需改码）
     strict = Settings.from_env({"QMT_PRIOR_CONTINUATION_MIN": "0.4"})
     assert prior_gate_reason(mid, strict) is not None
+    # 配 0 关闭本续板闸（prob 恒≥0、永不 <0）：is-not-None 守卫使显式 0 不被 `or` 吞成 0.3，低档票也放行。
+    off = Settings.from_env({"QMT_PRIOR_CONTINUATION_MIN": "0"})
+    assert prior_gate_reason(low, off) is None
 
 
 def test_skip_also_traced_when_no_decision_log():

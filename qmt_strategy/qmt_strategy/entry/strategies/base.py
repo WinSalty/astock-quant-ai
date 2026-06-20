@@ -196,7 +196,10 @@ def prior_gate_reason(plan: PlanRow, settings: Settings) -> Optional[str]:
     cont = plan.continuation_prob
     # 续板下限取 settings（doc/29 J-1，可配 QMT_PRIOR_CONTINUATION_MIN）：缺省回落 _PRIOR_CONTINUATION_MIN(0.3)，
     # 即信号侧续板「中/低档分界」——拒「低/极低」档、放行「中/高」档（显式按档位分界，买卖行为与历史 0.3 等价）。
-    cont_min = getattr(settings, "prior_continuation_min", None) or _PRIOR_CONTINUATION_MIN
+    # is-not-None 守卫（与 settings 层同口径）：显式配 0（运维关闭本续板闸：prob 恒≥0、永不 <0）不能被 `or` 当假值
+    # 吞成 0.3，否则安全阀关不掉。
+    _cont_min = getattr(settings, "prior_continuation_min", None)
+    cont_min = _cont_min if _cont_min is not None else _PRIOR_CONTINUATION_MIN
     if cont is not None and cont < cont_min:
         return f"先验闸门:续板概率弱(拒低/极低档) continuation_prob={cont} < {cont_min}"
     return None
