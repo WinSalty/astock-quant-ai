@@ -237,6 +237,9 @@ class Engine:
         self._day_open_equity_date: Optional[date] = None
         # 对账未通过阻断开仓标志（评审二轮 P1#9）：prewarm 从持久标志读入；True 则今日只守仓不开新仓。
         self._reconcile_blocked = False
+        # 交易日历不可用 fail-closed 标志（doc/29 J-3）：prewarm 校验日历无法覆盖到今天（耗尽且补取失败）→ True，
+        # 今日只守仓不开新仓（next_open/T+1 映射失准下绝不盲开）。每个交易日 prewarm 据日历状态重算。
+        self._calendar_unsafe = False
         # 竞价择时关时"仅采集"留痕去抖集合（复审 P2-2）：同一票每帧重复采集会洪泛日志，每票每日只留痕一次。
         self._auction_collect_logged: set = set()
         # 编排层拒单留痕去抖集合（评审 doc/21 E1 复审）：E1 让风控/限价拒单分支每帧解锁重评以容瞬时拒因恢复，
@@ -380,11 +383,23 @@ class Engine:
         # 交易日历覆盖度预警（评审 doc/21 C1）：日历末日距 today 不足若干交易日 → 强告警，提示运维立即外延
         # a_trade_calendar 导出文件。耗尽后 next_open 走 _safe_next_open 的 fail-closed 占位（不丢仓不崩溃，但
         # 占位可卖日不精确）。duck-typing：fake 日历无 trading_days_left 则跳过（不影响离线/单测）。
+        # 日历不可用 fail-closed（doc/29 J-3）：每个交易日据（盘前 calendar_refresh 已尽力补取后的）日历重算。
+        # trading_days_left(today)<=0 → 今天已是/超日历末日、next_open(today) 必越界 → T+1 映射失准，置 unsafe
+        # 阻断开仓（_should_block_open 据此禁开新仓，守仓/卖出不受影响）；<5 仍按既有覆盖度低告警，提示外延日历。
+        self._calendar_unsafe = False
         _days_left_fn = getattr(self._calendar, "trading_days_left", None)
         if callable(_days_left_fn):
             try:
                 _days_left = _days_left_fn(today)
-                if _days_left < 5:  # 少于 5 个交易日运行余量即告警（约一周）
+                if _days_left <= 0:
+                    self._calendar_unsafe = True
+                    self._logger.error(
+                        "engine_calendar_fail_closed",
+                        today=str(today), trading_days_left=_days_left,
+                        note="交易日历已耗尽(无 today 之后交易日)且补取失败,今日 fail-closed 只守仓不开新仓;"
+                        "请立即外延 a_trade_calendar/信号侧 trade_calendar 接口并排查连通",
+                    )
+                elif _days_left < 5:  # 少于 5 个交易日运行余量即告警（约一周）
                     self._logger.error(
                         "engine_calendar_coverage_low",
                         today=str(today), trading_days_left=_days_left,
@@ -620,6 +635,12 @@ class Engine:
         if self._reconcile_blocked:
             if not quiet:
                 self._logger.error("engine_open_blocked_reconcile_unconfirmed", ts_code=ts_code)
+            return True
+        # —— 交易日历不可用 fail-closed（doc/29 J-3）：日历耗尽且盘前补取失败 → T+1 映射失准 → 禁开新仓
+        #    （守仓/卖出不受影响，由 run_sell_pass 照常）。
+        if self._calendar_unsafe:
+            if not quiet:
+                self._logger.error("engine_open_blocked_calendar_unsafe", ts_code=ts_code)
             return True
         # —— 账户回撤闸缺基线 fail-closed（评审 F15）：运维显式启用回撤保护(account_drawdown_limit 非 None)，
         # 但盘前日初权益基线抓取失败(_day_open_equity 为 None) → 整日算不出回撤、回撤熔断形同虚设(fail-open)。

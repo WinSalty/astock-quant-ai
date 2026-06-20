@@ -193,6 +193,17 @@ def test_persistent_risk_block_dedups_留痕_no_flood():
     assert deps.logger.events().count("engine_open_blocked_reconcile_unconfirmed") == 1
 
 
+def test_calendar_unsafe_blocks_open():
+    """doc/29 J-3：交易日历不可用(fail-closed)→ 禁开新仓（守仓/卖出不受影响）。"""
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    eng._calendar_unsafe = True   # 盘前校验：日历耗尽且补取失败
+    eng._router_sink(_strong_auction_snap())
+    assert deps.trader.order_calls == []  # fail-closed：不开新仓
+    assert "engine_open_blocked_calendar_unsafe" in deps.logger.events()
+
+
 def _two_candidate_deps(env=None):
     """两只候选：600036.SH 强度 90、600000.SH 强度 30（用于验证强度加权分配）。"""
     rows = []

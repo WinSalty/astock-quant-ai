@@ -167,6 +167,19 @@ def _load_trade_calendar_days(path: str) -> list:
     return days
 
 
+def _write_trade_calendar_days(path: str, days) -> None:
+    """把全量交易日写回本地清单文件（doc/29 J-3：盘前从信号侧补取后落盘，下次启动可用）。
+
+    与 _load_trade_calendar_days 同格式（每行一个 ISO 日期，首行注释）；升序去重写出。整体覆盖写，
+    使本地文件始终是「内存日历的最新全量快照」。调用方对写失败仅告警不阻断（内存日历本轮已更新）。
+    """
+    ordered = sorted({d for d in days})
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# 交易日历(执行侧本地副本)：J-3 盘前自动补取自信号侧 /api/internal/trade_calendar；每行一个 ISO 日期\n")
+        for d in ordered:
+            fh.write(d.isoformat() + "\n")
+
+
 def _build_calendar(settings: Settings, logger):
     """装配交易日历（评审 P0-E1/3.1：生产禁止静默用周末近似日历）。
 
@@ -409,6 +422,22 @@ def main() -> None:
         prefetcher = WatchlistPrefetcher(signal_client, calendar, stack.save_watchlist, logger)
         watchlist_prefetch = prefetcher.prefetch
 
+    # 盘前交易日历校验/补取（doc/29 J-3）：复用 watchlist 同源 signal_client（同 token）。本地日历不足时拉信号侧
+    # /api/internal/trade_calendar 补取并入【共享 calendar 对象】+ 落回 trade_calendar_file（配了才落盘）。
+    # 缺 signal_client（未配信号侧）→ refresher=None，调度跳过：保持「只用本地静态日历」的原行为，耗尽仍走 engine
+    # 的 trading_days_left fail-closed 兜底（J-3 前的口径不退化）。
+    calendar_refresh = None
+    if signal_client is not None:
+        from ..watchlist.trade_calendar_refresh import TradeCalendarRefresher
+
+        _cal_file = settings.trade_calendar_file
+        _persist_fn = (
+            (lambda days, _p=_cal_file: _write_trade_calendar_days(_p, days)) if _cal_file else None
+        )
+        calendar_refresh = TradeCalendarRefresher(
+            signal_client, calendar, persist_fn=_persist_fn, logger=logger
+        ).ensure_coverage
+
     # —— 启动调度线程：按东八区钟点触发 盘前装载 / 竞价 / 盘中巡检 / 收盘对账 / 盘后同步（设计 §7.5）——
     # 调度细节全在 DailyScheduler；本入口只负责装配与「主线程 run_forever 接收回调」。
     # 卖出链接线（阶段0-C T0.1）+ 生产门控（fail-closed，国金对接核对 B1/H1）：
@@ -434,6 +463,7 @@ def main() -> None:
         close_time=parse_hhmm(settings.close_snapshot_time, dtime(15, 5)),
         sell_books_provider=sell_books_provider,
         watchlist_prefetch=watchlist_prefetch,
+        calendar_refresh=calendar_refresh,
     )
     scheduler.start_thread()
     logger.info("scheduler_started")

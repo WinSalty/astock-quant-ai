@@ -49,6 +49,24 @@ class StaticTradeCalendar:
         """
         return sum(1 for day in self._sorted if day > d)
 
+    def merge_days(self, days: Iterable[date]) -> int:
+        """合并新交易日到本日历（doc/29 J-3）：盘前从信号侧 /api/internal/trade_calendar 补取后调用。
+
+        业务意图：本地静态日历有耗尽风险，J-3 盘前校验不足时拉取信号侧最新开市日并入此集，使 next_open/
+        trading_days_left 立即覆盖到更远（原地更新 _days/_sorted，引用本日历的 engine 同步生效）。幂等：已存在的
+        日期不重复计入。返回实际新增的交易日数（0=全已存在）。
+        """
+        new_days = {d for d in days if d not in self._days}
+        if not new_days:
+            return 0
+        self._days |= new_days
+        self._sorted = sorted(self._days)
+        return len(new_days)
+
+    def open_days(self) -> list:
+        """升序返回全部已知开市日（供 J-3 落本地日历文件持久化）。"""
+        return list(self._sorted)
+
 
 class WeekdayTradeCalendar:
     """仅排除周末的近似日历（不含法定节假日）。仅作无日历数据时的降级兜底。

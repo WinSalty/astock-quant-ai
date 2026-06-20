@@ -77,6 +77,7 @@ class DailyScheduler:
         poll_seconds: float = 15.0,
         sell_books_provider: Optional[Callable[[date], dict]] = None,
         watchlist_prefetch: Optional[Callable[[date], int]] = None,
+        calendar_refresh: Optional[Callable[[date], bool]] = None,
     ) -> None:
         self._engine = engine
         self._guard = guard
@@ -91,6 +92,10 @@ class DailyScheduler:
         # 盘前 watchlist 拉取钩子（doc/07）：PREWARM 时先从信号侧 HTTP 拉当日名单落本机 SQLite，
         # 再让 engine.prewarm 从本机库装载。缺省 None → 跳过（向后兼容：engine 读本机库已有/旧数据）。
         self._watchlist_prefetch = watchlist_prefetch
+        # 盘前交易日历校验/补取钩子（doc/29 J-3）：PREWARM 时先校验本地日历是否覆盖到今天，不足则拉信号侧
+        # /api/internal/trade_calendar 补取并入【与 engine 共享的同一日历对象】+ 落本地文件。须在 engine.prewarm
+        # 之前调用——使 prewarm 据补取后的日历重算覆盖度（仍不足则 engine fail-closed 阻断开仓）。缺省 None → 跳过。
+        self._calendar_refresh = calendar_refresh
         # 每个交易日已触发的「一次性」动作集合：key=date → {Action,...}
         self._fired: Dict[date, Set[Action]] = {}
         self._stopped = False
@@ -186,6 +191,20 @@ class DailyScheduler:
             # 先盘前拉取当日 watchlist 落本机 SQLite（失败不抛、降级无名单，详见 WatchlistPrefetcher），
             # 再让 engine.prewarm 从本机库装载——保证 prewarm 读到的是当日最新名单。
             # engine.prewarm 幂等（日初基线复用 + 持仓以 QMT 为权威重建），连接失败时重建可能不可靠但重跑安全。
+            # 盘前交易日历校验/补取（doc/29 J-3）：先于 watchlist 拉取与 engine.prewarm——使日历补取并入共享对象后，
+            # prewarm 据补取后的覆盖度重算 fail-closed。失败不抛（refresher 内部已兜底，仍不足则 engine fail-closed）。
+            if self._calendar_refresh is not None:
+                try:
+                    ok = self._calendar_refresh(today)
+                    if not ok:
+                        self._logger.error(
+                            "scheduler_calendar_coverage_insufficient", trade_date=str(today),
+                            note="盘前交易日历校验/补取后仍不足，engine 将 fail-closed 只守仓不开新仓",
+                        )
+                except Exception as exc:  # noqa: BLE001 校验/补取已内部兜底，这里再保险一层不拖垮 PREWARM
+                    self._logger.error(
+                        "scheduler_calendar_refresh_error", trade_date=str(today), error=repr(exc)
+                    )
             saved = 0
             if self._watchlist_prefetch is not None:
                 try:
