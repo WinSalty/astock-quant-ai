@@ -154,6 +154,23 @@ def test_prior_gate_reason_data_missing_fail_closed():
     assert prior_gate_reason(ok, settings) is None
 
 
+def test_prior_gate_reason_continuation_band_boundary_and_config():
+    """doc/29 J-1：续板下限=中/低分界(默认 0.3)——低档(≤0.25)拒、中档(≥0.35)放行；可经 settings 配。"""
+    from qmt_strategy.config.settings import Settings
+    from qmt_strategy.entry.strategies.base import prior_gate_reason
+
+    settings = Settings()  # 默认 prior_continuation_min=0.3
+    # 低档代表值 0.25（CHAIN「低」）< 0.3 → 收手
+    low = make_plan_row(continuation_prob=Decimal("0.25"), leader_strength_score=Decimal("0.9"))
+    assert prior_gate_reason(low, settings) is not None
+    # 中档代表值 0.35（FIRST_BOARD「中」）≥ 0.3 → 放行（仅续板项；强度达标）
+    mid = make_plan_row(continuation_prob=Decimal("0.35"), leader_strength_score=Decimal("0.9"))
+    assert prior_gate_reason(mid, settings) is None
+    # settings 可配：把下限调到 0.4 → 0.35 中档也被拒（档值表上移时运维改阈值，无需改码）
+    strict = Settings.from_env({"QMT_PRIOR_CONTINUATION_MIN": "0.4"})
+    assert prior_gate_reason(mid, strict) is not None
+
+
 def test_skip_also_traced_when_no_decision_log():
     """未传 decision_log 时，SKIP 仍走 logger 留痕（§4.2 留痕不依赖台账）。"""
     clock = FakeClock(utc_at_east8(T_BUY, 9, 16, 0))

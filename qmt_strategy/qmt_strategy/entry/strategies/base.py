@@ -138,7 +138,10 @@ def is_auction_degraded(snap: AuctionSnapshot) -> bool:
     return DQ_NO_TICK in (snap.data_quality or [])
 
 
-# 追买类策略的续板概率先验下限（占位经验阈值，真实落地以实测/回测校准为准）。
+# 追买类策略的续板概率先验下限【默认值】（doc/29 J-1）：现已收口为可配置 settings.prior_continuation_min，
+# 本常量仅作 settings 缺省。口径=信号侧续板「中/低档分界」：continuation_prob 由信号侧 _PROB_BAND_TO_DECIMAL 按
+# tier 把高/中/低/极低映射为数值下发，各 tier 中档≥0.35、低档≤0.25，故 0.3 恰拒「低/极低」档、放行「中/高」档
+# （显式按档位分界判定；买卖行为与历史硬编码 0.3 等价）。档值表变动时改 QMT_PRIOR_CONTINUATION_MIN 即可。
 _PRIOR_CONTINUATION_MIN = Decimal("0.3")
 
 
@@ -191,8 +194,11 @@ def prior_gate_reason(plan: PlanRow, settings: Settings) -> Optional[str]:
     if score is not None and strength_min is not None and score < strength_min:
         return f"先验闸门:龙头强度不足 leader_strength_score={score} < leader_strength_min={strength_min}"
     cont = plan.continuation_prob
-    if cont is not None and cont < _PRIOR_CONTINUATION_MIN:
-        return f"先验闸门:续板概率弱 continuation_prob={cont} < {_PRIOR_CONTINUATION_MIN}"
+    # 续板下限取 settings（doc/29 J-1，可配 QMT_PRIOR_CONTINUATION_MIN）：缺省回落 _PRIOR_CONTINUATION_MIN(0.3)，
+    # 即信号侧续板「中/低档分界」——拒「低/极低」档、放行「中/高」档（显式按档位分界，买卖行为与历史 0.3 等价）。
+    cont_min = getattr(settings, "prior_continuation_min", None) or _PRIOR_CONTINUATION_MIN
+    if cont is not None and cont < cont_min:
+        return f"先验闸门:续板概率弱(拒低/极低档) continuation_prob={cont} < {cont_min}"
     return None
 
 

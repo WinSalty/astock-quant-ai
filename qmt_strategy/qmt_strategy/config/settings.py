@@ -124,6 +124,12 @@ class Settings:
     auction_lowbuy_pct_high: Optional[Decimal] = None  # QMT_AUCTION_LOWBUY_PCT_HIGH
     auction_overheat_pct: Optional[Decimal] = None   # QMT_AUCTION_OVERHEAT_PCT：超该幅度警惕
     leader_strength_min: Optional[Decimal] = None    # QMT_LEADER_STRENGTH_MIN：龙头强度分下限
+    # 续板概率先验下限（doc/29 J-1）：追买类策略据此对续板预期弱的票收手。口径=信号侧续板【中/低档分界】——
+    # continuation_prob 经信号侧 _PROB_BAND_TO_DECIMAL 按 tier 把「高/中/低/极低」映射为数值后下发，各 tier 中档
+    # ≥0.35、低档≤0.25，故 0.3 恰为「拒低/极低、放行中/高」的分界（拒 ∈{低,极低} 档，买卖行为与原硬编码 0.3 等价）。
+    # 改为可配置：信号侧档值表若调整(如整体上移)，运维据新中/低分界改 QMT_PRIOR_CONTINUATION_MIN 即可，无需改码，
+    # 避免硬编码 0.3 在档值表变动后失准（doc/29 J-1：显式按档位分界判定）。
+    prior_continuation_min: Decimal = Decimal("0.3")  # QMT_PRIOR_CONTINUATION_MIN
     # 打板跟买的封流比下限（评审二轮 P2#41 + 复审 P2-1）：封流比(封单额/流通市值)有值且低于此值视为封单不稳→弃。
     # 原硬编码 0.0 使该护栏恒不触发(对任何顶板无条件跟买)，现改为【可配置】。
     # 默认 0（关闭）：执行侧 seal_to_float_ratio 依赖 bidVol 的"手/股"量纲(auction_factors.virtual_seal)，
@@ -284,6 +290,11 @@ class Settings:
             auction_lowbuy_pct_high=_as_decimal(g("QMT_AUCTION_LOWBUY_PCT_HIGH")),
             auction_overheat_pct=_as_decimal(g("QMT_AUCTION_OVERHEAT_PCT")),
             leader_strength_min=_as_decimal(g("QMT_LEADER_STRENGTH_MIN")),
+            # is-not-None 守卫（doc/29 J-1）：续板下限默认 0.3（中/低分界），可经 QMT_PRIOR_CONTINUATION_MIN 覆盖。
+            prior_continuation_min=(
+                _v if (_v := _as_decimal(g("QMT_PRIOR_CONTINUATION_MIN"))) is not None
+                else Decimal("0.3")
+            ),
             # 用 is-not-None 守卫（复审 P1-1）：配 0 是"显式关闭"，不能被 `or 默认` 当假值覆盖（安全阀须能关）。
             seal_ratio_min=(
                 _v if (_v := _as_decimal(g("QMT_SEAL_RATIO_MIN"))) is not None else Decimal("0")
