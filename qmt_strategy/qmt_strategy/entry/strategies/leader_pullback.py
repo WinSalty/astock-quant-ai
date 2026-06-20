@@ -50,7 +50,7 @@ class LeaderPullbackStrategy(EntryStrategy):
                 reason=f"LEADER_PULLBACK弃:续板概率弱 continuation_prob={cont} < {_CONTINUATION_MIN}",
             )
 
-        # —— 打板因子 E2（默认关，配阈值才生效；双守卫缺数据零误杀）——
+        # —— 打板因子 E2（默认即生效·起步值，env 可覆盖；双守卫缺数据零误杀）——
         # 反复炸板(烂板)：open_times >= 阈值 → 弃。
         if (
             settings.forbid_open_times_max is not None

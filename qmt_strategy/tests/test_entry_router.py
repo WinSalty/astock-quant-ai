@@ -646,12 +646,20 @@ def _topped_snap():
     return _snap(is_limit_up=True, last_price=Decimal("11.00"))
 
 
-def test_e2_default_off_no_behavior_change():
-    """E2 核心 Gate：阈值默认全关（None）时，即便 plan 带极端因子值，决策与未接入前一致（仍买）。"""
+def test_e2_active_defaults_filter():
+    """E2 默认即生效（业务方决策 2026-06-19）：默认 forbid_open_times_max=1 / high_return_pct_limit=50 /
+    pullback_entry_deadline_hm=10:30。稳封(open_times=0)+缺位置因子的票照买；炸过板/高位的被默认闸过滤；
+    因子缺失（None）零误杀。"""
     strat = ChaseLimitUpStrategy()
-    plan = make_plan_row(open_times=9, return_5d_pct=Decimal("99"), first_limit_time="14:55:00")
-    out = strat.decide(plan, _topped_snap(), _settings())  # 未配任何 E2 阈值
-    assert out.action == EntryAction.CHASE_LIMIT_UP  # 极端因子值也不触发弃 → 零行为变化
+    s = _settings()  # _settings 直构 Settings()，用 dataclass 默认 1/50/10:30（已生效）
+    # 稳封(0 炸板) → 默认 forbid=1 不触发（0>=1 假）→ 买。
+    assert strat.decide(make_plan_row(open_times=0), _topped_snap(), s).action == EntryAction.CHASE_LIMIT_UP
+    # 炸过板(open_times>=1) → 默认 forbid=1 触发弃。
+    assert strat.decide(make_plan_row(open_times=1), _topped_snap(), s).action == EntryAction.SKIP
+    # 高位(return_5d_pct>=50) → 默认 high_return=50 触发弃。
+    assert strat.decide(make_plan_row(return_5d_pct=Decimal("60")), _topped_snap(), s).action == EntryAction.SKIP
+    # 因子全缺（make_plan_row 默认 6 因子 None）→ 默认闸全不触发（零误杀）→ 买。
+    assert strat.decide(make_plan_row(), _topped_snap(), s).action == EntryAction.CHASE_LIMIT_UP
 
 
 def test_e2_chase_limit_up_open_times_abandon():

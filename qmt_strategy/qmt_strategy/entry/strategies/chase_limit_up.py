@@ -29,7 +29,7 @@ class ChaseLimitUpStrategy(EntryStrategy):
         if gate is not None:
             return StrategyOutcome(action=EntryAction.SKIP, reason=f"CHASE_LIMIT_UP弃:{gate}")
 
-        # —— 打板因子 E2（默认关，配阈值才生效；settings 阈值与 plan 因子双守卫，缺数据/老契约零误杀）——
+        # —— 打板因子 E2（默认即生效·起步值，env 可覆盖；settings 阈值与 plan 因子双守卫，缺数据/老契约零误杀）——
         # 反复炸板(烂板)：open_times >= 阈值 → 弃（封板质量差、追板易接最后一棒）。
         if (
             settings.forbid_open_times_max is not None

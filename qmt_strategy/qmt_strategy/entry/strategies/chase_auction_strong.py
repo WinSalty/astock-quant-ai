@@ -62,7 +62,7 @@ class ChaseAuctionStrongStrategy(EntryStrategy):
         if gate is not None:
             return StrategyOutcome(action=EntryAction.SKIP, reason=f"CHASE_AUCTION_STRONG弃:{gate}")
 
-        # —— 打板因子 E2（默认关，配阈值才生效；双守卫缺数据零误杀）：高位规避——近 5 日涨幅 >= 阈值 → 弃。——
+        # —— 打板因子 E2（默认即生效·起步值，env 可覆盖；双守卫缺数据零误杀）：高位规避——近 5 日涨幅 >= 阈值 → 弃。——
         # 放在【降级 B 之前】：使「竞价取不到 tick → 改判开盘后追」的降级路径也受高位闸约束（不绕过）。
         if (
             settings.high_return_pct_limit is not None

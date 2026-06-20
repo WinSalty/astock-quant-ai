@@ -28,7 +28,7 @@ class DipBuyMaStrategy(EntryStrategy):
         gate = prior_gate_reason(plan, settings)
         if gate is not None:
             return StrategyOutcome(action=EntryAction.SKIP, reason=f"DIP_BUY_MA弃:{gate}")
-        # —— 打板因子 E2（默认关，配阈值才生效；双守卫缺数据零误杀）：反复炸板(烂板) → 弃。——
+        # —— 打板因子 E2（默认即生效·起步值，env 可覆盖；双守卫缺数据零误杀）：反复炸板(烂板) → 弃。——
         # 低吸虽不忌高位，但仍不接「反复开板的烂板」（封板质量差）；return_5d_pct 高位闸不接（低吸取低位、高位非其禁忌）。
         if (
             settings.forbid_open_times_max is not None

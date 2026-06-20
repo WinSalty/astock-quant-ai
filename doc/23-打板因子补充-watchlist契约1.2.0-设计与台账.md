@@ -69,13 +69,13 @@
 
 **E1 · 透传链（零行为变化）**：6 字段无损透传到策略可读的 `PlanRow`——`item→SelectedStockRow→本机 SQLite(含旧库幂等 ALTER 迁移)→TradableEntry→to_plan_row→PlanRow` 逐层补齐（照 `board_level/tier` 同款；`contracts/models.py` / `watchlist/remote_watchlist.py` / `storage/schema.py` / `storage/mappers.py` / `watchlist/watchlist_loader.py`）。本点仅透传不接判定，现有逻辑无一读取新字段 = 零行为变化。
 
-**E2 · 策略消费（默认全关，配阈值才生效）**：新增 3 个 `QMT_*` 阈值（默认 None=关闭，未配置即零行为变化，待回测/真机标定后才显式开）：
+**E2 · 策略消费（默认即生效·起步值，env 可覆盖；业务方决策 2026-06-19）**：新增 3 个 `QMT_*` 阈值，**默认就生效**（这三个是**未回测的起步值**，日后按回测/真机标定调整；env 可覆盖，关停配永不触发的大值）：
 
-| env | 语义 | 挂载策略 |
-|---|---|---|
-| `QMT_FORBID_OPEN_TIMES_MAX` | `open_times >=` 本值 → 弃（反复炸板/烂板） | `chase_limit_up` / `dip_buy_ma` / `leader_pullback` |
-| `QMT_HIGH_RETURN_PCT_LIMIT` | `return_5d_pct >=` 本值 → 弃（高位规避，手册首要风险闸） | 追买族 `chase_limit_up` / `chase_auction_strong`（放降级 B 前）；低吸/龙回头（回踩战法）不接 |
-| `QMT_PULLBACK_ENTRY_DEADLINE_HM`(HH:MM) | `first_limit_time >` 本值 → 弃（首封太晚、龙头当日封板偏弱） | 仅 `leader_pullback` |
+| env | 语义 | **默认（起步值）** | 挂载策略 |
+|---|---|---|---|
+| `QMT_FORBID_OPEN_TIMES_MAX` | `open_times >=` 本值 → 弃（反复炸板/烂板） | **`1`**（=只打稳封/0 炸板；⚠️配 `0`=`>=0` 全弃误配；关停配大值如 999） | `chase_limit_up` / `dip_buy_ma` / `leader_pullback` |
+| `QMT_HIGH_RETURN_PCT_LIMIT` | `return_5d_pct >=` 本值(%) → 弃（高位规避，手册首要风险闸） | **`50`**（近 5 日涨超 50% 规避；关停配大值如 9999） | 追买族 `chase_limit_up` / `chase_auction_strong`（放降级 B 前）；低吸/龙回头（回踩战法）不接 |
+| `QMT_PULLBACK_ENTRY_DEADLINE_HM`(HH:MM) | `first_limit_time >` 本值 → 弃（首封太晚、龙头当日封板偏弱） | **`10:30`**（关停配如 `23:59`） | 仅 `leader_pullback` |
 
 统一双守卫（settings 阈值与 plan 因子均非 None 才判弃）缺数据零误杀；`base._parse_hms` 脏/缺时刻 fail-open。`last_limit_time` / `volume_ratio` / `return_10d_pct` 本期**仅透传留痕、不接判定**（`volume_ratio` ≠ 盘中 `auction_vol_ratio`，先不混用）。
 
@@ -91,8 +91,8 @@
 - 提交：`7e75d41`（P0-1）/ `6dd670a`（P1-2）/ `b1955f4`（P1-3），信号侧 feature 分支 `feature/limit-up-watchlist-signal`（已 push）。
 
 **执行侧（E1/E2）**
-- 全量测试 **733 passed**；单测覆盖：item→Row 映射、SQLite save→fetch 无损 round-trip、旧库幂等迁移（无 IndexError）、SQLite→TradableEntry→PlanRow 端到端透传、E2 默认关零行为变化、4 策略各消费点、双守卫不误杀、脏/缺时刻 fail-open、高位闸放降级 B 前。
-- 三轮独立评审：E1（无阻塞）、E2（无阻塞，默认 None=零行为变化经多重验证）、整体收口（无阻塞——6 字段跨两仓 9 层字面一致、端到端闭合、生产默认态零新增风险、量纲口径严格区分）。
-- 提交：`65dd902`（E1 透传链）/ `58fb58b`（E2 策略消费），执行侧 `main`。
+- 全量测试 **733 passed**；单测覆盖：item→Row 映射、SQLite save→fetch 无损 round-trip、旧库幂等迁移（无 IndexError）、SQLite→TradableEntry→PlanRow 端到端透传、E2 默认起步值生效（稳封买 / 炸板弃 / 高位弃 / 缺数据零误杀）、4 策略各消费点、双守卫不误杀、脏/缺时刻 fail-open、高位闸放降级 B 前。
+- 评审：E1（无阻塞）、E2（无阻塞）、整体收口（无阻塞——6 字段跨两仓 9 层字面一致、端到端闭合、量纲口径严格区分）、E2 默认改 active 复审（无阻塞，默认与 from_env 一致、缺数据降级成立、订正 4 策略旧注释）。
+- 提交：`65dd902`（E1 透传链）/ `58fb58b`（E2 策略消费，默认关）/ 默认改起步值 1/50/10:30（业务方决策，本次提交），执行侧 `main`。
 
 > 遗留小项（不阻塞）：`resources/sql/03_full_schema_with_comments.sql` 人工参考 DDL 早已漂移（缺 lhb/is_st 等多列），非本次回归；生产建表以 alembic 迁移为准。
