@@ -343,7 +343,11 @@ def build_real_engine(settings: Settings, logger=None) -> Tuple[Engine, LocalSto
     # 并注入健康探测器供调度周期体检（静默死亡且当轮无 submit 时的兜底发现）。Engine 在 LocalStorage 之后
     # 装配，故二者均在此装配末尾接线。
     stack.set_on_failure(engine.on_storage_failure)
-    engine.set_storage_health_checker(stack.is_healthy)
+    # 周期体检的 latching 永久 fail-closed 只认【持续性致命故障】（执行-4 修正 2026-06-22）：用
+    # is_persistently_failed（线程死/熔断/卡死）而非 is_healthy（含瞬时 degraded）——否则一次无害的瞬时写抖动
+    # 撞上 15 秒一次的体检就会把存储永久置不可用、冻结当天剩余全部开仓直到重启。瞬时 degraded 仍由逐单
+    # 关键落盘检查（可恢复、不 latch）把关。
+    engine.set_storage_health_checker(lambda: not stack.is_persistently_failed())
 
     # —— 连接守护：trader_factory 顺手 set 进 holder；回调用 ABI 适配壳包住引擎 ExecCallback ——
     callback = xt_real.make_trader_callback(engine.callback)    # 触发 xtquant

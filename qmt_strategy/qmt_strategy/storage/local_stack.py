@@ -107,8 +107,12 @@ class LocalStorage:
         self._wq.set_on_failure(on_failure)
 
     def is_healthy(self) -> bool:
-        """写线程健康性（供调度器周期性体检；不健康即应 fail-closed 停开新仓 + 告警，评审二轮 P0#2）。"""
+        """写线程健康性（含瞬时 degraded；供发单前关键落盘等【可恢复的逐单】检查，评审二轮 P0#2）。"""
         return self._wq.is_healthy()
+
+    def is_persistently_failed(self) -> bool:
+        """持续性/致命存储故障（执行-4）：供周期体检的【latching 永久 fail-closed】用，瞬时 degraded 不计。"""
+        return self._wq.is_persistently_failed()
 
     def flush(self, timeout: float = 5.0) -> bool:
         """阻塞至写队列清空（盘后 / 对账前调用，保证读到一致数据）。超时返回 False 供告警。"""

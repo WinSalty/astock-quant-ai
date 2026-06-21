@@ -163,6 +163,24 @@ class AsyncWriteQueue:
             and not self._is_stuck()
         )
 
+    def is_persistently_failed(self) -> bool:
+        """持续性/致命存储故障（供 Engine 周期体检的【latching 永久 fail-closed】用，执行-4 修正 2026-06-22）。
+
+        只在【确定性持久故障】为真：未启动 / 写线程死亡 / 建连或连续 commit 失败已熔断(_failed) / 看门狗判卡死。
+        【刻意不含】单次写瞬时失败造成的 sticky degraded(_write_degraded / _last_write_ok)——那是瞬时抖动（如一笔
+        无关紧要的镜像写撞 5 秒锁超时），会随后续写自然恢复；旧实现让周期体检 latch 的 is_healthy() 把这种瞬时
+        degraded 也当永久不健康，只要 15 秒一次的体检恰好采样到 degraded 窗口，就把引擎存储永久置不可用、冻结
+        当天剩余全部开仓直到人工重启。瞬时 degraded 仍由 is_healthy()=False 反映，供【发单前关键落盘】等可恢复的
+        逐单检查使用——逐单 fail-closed 只挡当前这笔、随写恢复自动放行，不 latch。
+        """
+        return (
+            not self._started
+            or self._failed.is_set()
+            or self._thread is None
+            or not self._thread.is_alive()
+            or self._is_stuck()
+        )
+
     def _is_stuck(self) -> bool:
         """写线程卡死判定（评审 F09）：启用看门狗(stuck_seconds>0) 且有积压(pending>0) 且连续 stuck_seconds
         无任务推进 → 视为卡死。idle(无积压)时不判卡死(空闲无推进属正常)。"""

@@ -270,3 +270,38 @@ def test_write_queue_health_is_sticky_across_intermittent_failures():
     finally:
         q.stop()
         q.stop()
+
+
+def test_transient_degraded_is_not_persistent_failure():
+    """执行-4：单次写瞬时失败造成的 sticky degraded → is_healthy()=False（逐单可恢复检查用），但
+    is_persistently_failed()=False（周期体检 latching 永久 fail-closed 不应被瞬时抖动触发，不冻结当天开仓）。"""
+    state = {"fail_next": False}
+
+    class _FlakyConn:
+        def commit(self):
+            if state["fail_next"]:
+                raise OSError("intermittent")
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    q = AsyncWriteQueue(lambda: _FlakyConn(), RecordingLogger(), name="t", fail_after=3)
+    q.start()
+    try:
+        # 一次瞬时失败 → degraded：is_healthy False，但未达连续熔断阈值 → 非持续性故障。
+        state["fail_next"] = True
+        q.submit(lambda conn: None)
+        q.flush(1.0)
+        state["fail_next"] = False
+        assert q.is_healthy() is False              # 瞬时 degraded 仍报不健康（逐单检查用）
+        assert q.is_persistently_failed() is False  # 但不是持续性故障 → 周期体检不 latch 永久冻结
+        # 连续达 fail_after 次失败 → 熔断 _failed → 持续性故障为真。
+        state["fail_next"] = True
+        for _ in range(3):
+            q.submit(lambda conn: None)
+        q.flush(1.0)
+        assert q.is_persistently_failed() is True
+    finally:
+        q.stop()
+        q.stop()
