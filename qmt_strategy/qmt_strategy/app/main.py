@@ -301,7 +301,8 @@ class Engine:
             self._logger.warn("engine_storage_health_tick_error", error=str(exc))
 
     def set_storage_health_checker(self, checker: Callable[[], bool]) -> None:
-        """注入存储健康探测器（返回 True=健康）。由 run.py 接线到 stack.is_healthy。"""
+        """注入存储健康探测器（返回 True=健康）。由 run.py 接线为 `not stack.is_persistently_failed()`
+        （执行-4/R10：周期 latch 只认持续性/间歇丢数据故障，瞬时 degraded 不永久冻结）。"""
         self._storage_health_checker = checker
 
     # ------------------------------------------------------------------

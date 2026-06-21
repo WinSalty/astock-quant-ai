@@ -123,9 +123,10 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
     tradable_raw = item.get("tradable_flag")
     # 信号侧为字符串枚举（默认 TRADABLE）：等于 TRADABLE 才算可交易，其余视为只观察。
     tradable = (tradable_raw == _TRADABLE_VALUE) if tradable_raw is not None else None
-    # 缺测哨兵解析（doc/29 B1）：tradable_flag=="DATA_MISSING" → data_missing=True（独立于 tradable=False，
-    # 因 BLOCKED/谨慎观察等也是 tradable=False 但不强卖；只有缺测要强卖，故用专属布尔承载）。
-    # data_missing_reason 记缺哪些核心指标，仅留痕。
+    # 缺测哨兵解析（doc/29 B1）：tradable_flag=="DATA_MISSING" → data_missing=True，用专属布尔承载。
+    # 用独立布尔的真实理由（2026-06-22 纠正）：买入侧对缺测要 fail-closed 收手，须与「普通先验字段缺→fail-open
+    # 按盘口把关」区分（见 base.prior_gate_reason / models.py 同名字段）；而非旧注释所写「只有缺测要强卖」——
+    # B3 持仓强卖已下线，缺测只在买入侧拦截、不强卖。data_missing_reason 记缺哪些核心指标，仅留痕。
     data_missing = tradable_raw == _DATA_MISSING_VALUE
     data_missing_reason = item.get("data_missing_reason") if data_missing else None
     return SelectedStockRow(

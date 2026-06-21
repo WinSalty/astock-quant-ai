@@ -330,14 +330,17 @@ class InMemoryLocalLedger:
             # 状态收口：只对【活跃态】(PLANNED/SUBMITTED/PART_TRADED) 按券商权威量 vs 计划量推进；终态
             # (TRADED/PART_CANCELLED/CANCELLED/REJECTED) 一律不改状态——filled 值已上修(成交是事实)，但 CANCELLED/
             # REJECTED 的「成交-aware 终态」由 reconcile_fills_from_detail 收口为 PART_CANCELLED，收口不在此越权改终态。
-            # CANCELLING（撤单中，执行-8 修正 2026-06-22）：撤单已发、等回执的买单若券商快照显示撤单前已部分成交，
-            # 旧实现漏把它列入「不改状态」集，会把它从 CANCELLING 错改回 PART_TRADED，超时巡检遂当在途单对同一委托
-            # 再发一次撤单（券商安全拒、后续已撤回报收口为 PART_CANCELLED，能自愈但产生无用重复撤单与状态来回）。
-            # 这里保留 CANCELLING 状态（filled 仍按上方上修），等真正的撤单回执来收口终态。
+            # CANCELLING（撤单中，执行-8）：撤单已发、等回执的买单若券商快照显示撤单前已部分成交，旧实现漏把它列入
+            # 「不改状态」集，会把它从 CANCELLING 错改回 PART_TRADED，超时巡检遂对同一委托再发一次撤单。保留其状态、
+            # 仅上修 filled，等真正撤单回执收口。
+            # ERROR（执行-R11 修正 2026-06-22）：同步下单失败/废单拒单已置 ERROR(本不计预算/不进巡检)；若券商对该
+            # 同一 order_id 的脏/滞后快照报 traded_volume>0，旧实现会把 ERROR 复活成 PART_TRADED/TRADED——把一笔已判
+            # 失败的单重新拉回在途/已成、计入 committed 预算并重进 TTL/撤单巡检。这里把 ERROR 一并纳入不改状态集
+            # (filled 仍可上修存档)，不复活失败单。
             if e.state not in (
                 OrderState.TRADED, OrderState.PART_CANCELLED,
                 OrderState.CANCELLED, OrderState.REJECTED,
-                OrderState.CANCELLING,
+                OrderState.CANCELLING, OrderState.ERROR,
             ):
                 if e.plan_volume and broker_vol >= e.plan_volume:
                     e.state = OrderState.TRADED

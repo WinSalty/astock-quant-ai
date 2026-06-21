@@ -39,6 +39,13 @@ def test_qmt_ts_to_db_normalizes_ms_and_us_units():
     assert qmt_ts_to_db(sec * 1_000_000)[1] == expect  # 微秒
 
 
+def test_qmt_ts_to_db_out_of_range_returns_none():
+    """执行-R11：非常规位数脏值(如 14 位/1e13~1e15 中段)归一后落到远期年份 → 合理区间兜底判脏返回 (None,None)，
+    不写「看似合法的错误远期时间」污染对账/排序。"""
+    # 14 位(~1.7e13)：被当毫秒 /1e3 后 ~1.7e10 秒 → 公元 2500+，超 [2000,2100] → None
+    assert qmt_ts_to_db(17_180_000_000_000) == (None, None)
+
+
 def test_east8_time_and_date_from_utc():
     # UTC 01:16 == 东八区 09:16
     utc = datetime(2026, 6, 12, 1, 16, 0)

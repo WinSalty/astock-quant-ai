@@ -41,6 +41,11 @@ def qmt_ts_to_db(ts: Optional[int]) -> Tuple[Optional[datetime], Optional[dateti
         east8 = datetime.fromtimestamp(sec, tz=SHANGHAI)
     except (OverflowError, OSError, ValueError):
         return None, None
+    # 合理区间兜底（执行-R11 修正 2026-06-22）：归一只覆盖秒/毫秒/微秒三种规整位数；若是 14 位或 1e13~1e15 中段等
+    # 非常规位数脏值，会被当毫秒只 /1e3 而落到公元 2500+ 远期、变成「看似合法的错误时间」比静默 NULL 更难察觉。
+    # 这里对换算结果年份做兜底：落在 [2000,2100] 外即判脏值返回 (None,None)，不写远期时间污染对账/排序。
+    if not (2000 <= east8.year <= 2100):
+        return None, None
     utc_naive = east8.astimezone(UTC).replace(tzinfo=None)
     east8_naive = east8.replace(tzinfo=None)
     return utc_naive, east8_naive

@@ -6,9 +6,12 @@
 自定（§5.3 末 / §5.7）。
 
 融合原则（§5.3.1「先验定基调、盘口定扳机」）：
-- 先验强（continuation_prob 高、未命中 fail_conditions / SIGNAL_DRIVEN）→ 基调倾向续持（HOLD），
-  但盘口一旦命中 fail_conditions / 破位 / 炸板 → 实时盘口一票否决，转减 / 清。
+- 先验强（continuation_prob 高 / SIGNAL_DRIVEN）→ 基调倾向续持（HOLD），但实时盘口一旦量价背离 / 弱开 /
+  破位 / 炸板 → 实时盘口一票否决，转减 / 清。
 - 先验弱或缺失（prior 为空、TECH_EXIT）→ 基调倾向了结，纯盘口驱动，破位即出（保守安全默认）。
+- 口径变更（执行-2，2026-06-22）：实时卖出扳机【只认实时盘口 OrderBook 字段】，已下线「按 fail_conditions
+  文本关键词触发实时减/清」——fail_conditions 是 LLM 写的前瞻条件，不能按词面出现就当现在已命中（详见
+  decide_auction/decide_intraday 内注释）。
 
 不可推翻的口径（与 doc/03 §5.3 一致）：
 - 守 T+1 短路（§5.3.4）：unit.state == LOCKED_T1 → 连决策都不进入实质分支，直接返回 HOLD
@@ -92,11 +95,10 @@ class SellDecider:
         """次日竞价定夺：信号先验 + xtdata 实时竞价盘口 → HOLD / REDUCE / CLEAR。
 
         业务意图（§5.3.2 决策表）：
-        - 高开强且量价匹配（open_pct 落合理高开区间、未背离）且 prior 强且未命中 fail_conditions
-          → 续持（HOLD，进入分时定夺 5.3.3）。
-        - 高开但量价背离（book.price_volume_diverge 或命中 fail_conditions 背离类）→ 竞价/开盘减或清，
-          reason='竞价背离'。
-        - 平开 / 低开走弱（open_pct 弱 或命中 fail_conditions 弱开类）→ 开盘减或清，reason='弱开'。
+        - 高开强且量价匹配（open_pct 落合理高开区间、未背离）且 prior 强 → 续持（HOLD，进入分时定夺 5.3.3）。
+        - 高开但量价背离（book.price_volume_diverge）→ 竞价/开盘减或清，reason='竞价背离'。
+        - 平开 / 低开走弱（open_pct 弱）→ 开盘减或清，reason='弱开'。
+        （执行-2：实时扳机只认上述实时盘口字段，不再按 fail_conditions 文本关键词触发。）
 
         前置短路（守 T+1 + 风控，优先级最高，安全默认在前）：
         - unit.state == LOCKED_T1 → 不可卖，返回 HOLD（连实质分支都不进，§5.3.4）。
@@ -157,7 +159,7 @@ class SellDecider:
                 phase="auction",
             )
 
-        # —— 续持分支：高开强且量价匹配且先验强且未命中 fail → HOLD（进分时）——
+        # —— 续持分支：高开强且量价匹配且先验强 → HOLD（进分时）——（执行-2：不再叠加 fail_conditions 文本判定）
         # 业务意图：先验定基调——只有先验强 + 盘口高开未背离才续持；先验弱 / 缺失即便高开也不主动续持，
         # 保守落了结（安全默认：先验缺失 + 不确定，不做主动续持，§5.4.3）。
         if prior_strong and self._is_strong_open_matched(book):
@@ -249,7 +251,7 @@ class SellDecider:
             )
 
         # —— 兜底：未命中任何明确扳机 ——
-        # 先验强（SIGNAL_DRIVEN、continuation_prob 高、未命中 fail）→ 维持续持（HOLD）；
+        # 先验强（SIGNAL_DRIVEN、continuation_prob 高）→ 维持续持（HOLD）；（执行-2：实时扳机已只认盘口）
         # 先验弱 / 缺失（TECH_EXIT）→ 纯盘口驱动、不确定则保守了结（破位即出已在上面判过，
         # 此处为未破位的弱势震荡，按尾盘了结口径减 / 清，宁可出不恋战，§5.4.3 安全默认）。
         if prior_strong:
