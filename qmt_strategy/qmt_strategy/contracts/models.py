@@ -91,10 +91,13 @@ class SelectedStockRow:
     volume_ratio: Optional[Decimal] = None
     return_5d_pct: Optional[Decimal] = None
     return_10d_pct: Optional[Decimal] = None
-    # 数据缺测标记（doc/29 B1，对接信号侧 watchlist 1.3.0 契约 tradable_flag="DATA_MISSING"）：
-    # data_missing=True 表示信号侧判定该票【约定核心交易指标缺测】（close/board_level/续板档/封板时序等任一缺）。
-    # 执行侧据此：买入侧放弃买入(B2)；已过 T+1 的持仓单元强制清仓(B3，即便无盘口)。与普通 tradable_flag=False
-    # （空仓/LLM 降级 BLOCKED，只弃买不强卖）严格区分——缺测要强卖，故须显式独立布尔，不能与 BLOCKED 混为一谈。
+    # 数据缺测标记（doc/29 B1，对接信号侧 watchlist 契约 tradable_flag="DATA_MISSING"）：
+    # data_missing=True 表示信号侧判定该票【约定核心交易指标(真正重要的行情数据)缺测】（close/board_level/
+    # 封流比及分母/量能比及分母/位置收益/封板时序等任一缺；续板档 continuation_prob 已于 2026-06-22 移出核心
+    # 缺测集，属 LLM 软先验、缺它不判缺测）。执行侧据此：买入侧放弃买入(B2)。
+    # 口径变更（2026-06-21）：B3「缺测持仓强卖」已下线——缺测【不再强卖】已有持仓，卖出完全交由执行侧实时盘口
+    # 扳机裁决；缺测只在买入侧拦截。与普通 tradable_flag=False（空仓/LLM 降级 BLOCKED）同为不可买，方向一致。
+    # data_missing 仍保留为显式独立布尔：买入侧 fail-closed 收手须与「普通先验字段缺→fail-open 按盘口把关」区分。
     # data_missing_reason 记「缺哪些字段」(missing:col1,col2)，仅留痕/复盘用。
     data_missing: bool = False
     data_missing_reason: Optional[str] = None

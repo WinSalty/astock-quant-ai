@@ -170,6 +170,77 @@ def test_prefetch_pulls_by_signal_date_and_saves():
     assert saved["rows"][0].target_trade_date == date(2026, 6, 13)
 
 
+class _RespClient:
+    """返回任意自定义信封的假客户端（用于信封/契约异常用例）。"""
+
+    def __init__(self, resp):
+        self._resp = resp
+
+    def get_json(self, path, params=None):
+        return self._resp
+
+    def post_json(self, path, payload):
+        raise AssertionError("prefetch 不应调用 post_json")
+
+
+def _pf(client, save_fn):
+    return WatchlistPrefetcher(client, _FakeCalendar(prev=date(2026, 6, 12)), save_fn, _FakeLogger())
+
+
+def test_item_mapping_rejects_nan_inf_strength():
+    """两系-2：强度分/数值字段为 NaN/Infinity 时按缺失(None)，不放行毒化值进可买清单。"""
+    row = watchlist_item_to_selected(
+        {"ts_code": "300750.SZ", "trade_date": "2026-06-12", "tradable_flag": "TRADABLE",
+         "leader_strength_score": "NaN", "float_mktcap": "Infinity", "close": "-inf"},
+        date(2026, 6, 13),
+    )
+    assert row.leader_strength_score is None
+    assert row.float_mktcap is None
+    assert row.signal_close is None
+
+
+def test_prefetch_items_not_list_is_real_failure():
+    """两系-3：信封是 dict 但 items 非数组（给成对象）→ 真失败(-1)，不当合法空仓。"""
+    called = {"n": 0}
+    def save_fn(rows):
+        called["n"] += 1
+        return len(rows)
+    client = _RespClient({"items": {"300750.SZ": {"ts_code": "300750.SZ"}}})
+    assert _pf(client, save_fn).prefetch(date(2026, 6, 13)) == -1
+    assert called["n"] == 0  # 不落库
+
+
+def test_prefetch_target_date_mismatch_fail_closed_no_save():
+    """两系-4：信号侧 target_trade_date 与 today 不一致 → fail-closed(-1)，不拿错配日期名单落库。"""
+    called = {"n": 0}
+    def save_fn(rows):
+        called["n"] += 1
+        return len(rows)
+    client = _RespClient({
+        "target_trade_date": "2026-06-16",  # ≠ today(2026-06-13)
+        "items": [{"ts_code": "300750.SZ", "trade_date": "2026-06-12", "tradable_flag": "TRADABLE"}],
+    })
+    assert _pf(client, save_fn).prefetch(date(2026, 6, 13)) == -1
+    assert called["n"] == 0
+
+
+def test_prefetch_all_items_fail_mapping_is_real_failure():
+    """两系-5：items 非空但元素整体非对象（全解析失败）→ 真失败(-1)，不伪装成空仓日。"""
+    called = {"n": 0}
+    def save_fn(rows):
+        called["n"] += 1
+        return len(rows)
+    client = _RespClient({"items": ["600000.SH", "300750.SZ"]})  # 元素是字符串而非对象
+    assert _pf(client, save_fn).prefetch(date(2026, 6, 13)) == -1
+    assert called["n"] == 0
+
+
+def test_prefetch_genuinely_empty_items_is_zero():
+    """对照：items 真为空 → 合法空仓日返回 0（不删旧名单、不重试）。"""
+    client = _RespClient({"items": []})
+    assert _pf(client, lambda rows: len(rows)).prefetch(date(2026, 6, 13)) == 0
+
+
 def test_prefetch_http_failure_degrades_no_save():
     calls = {"n": 0}
 

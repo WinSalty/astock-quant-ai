@@ -31,8 +31,9 @@ WATCHLIST_PATH = "/api/internal/watchlist"
 
 # 信号侧 tradable_flag 取该值视为「可交易」，其余（谨慎/放弃观察等）一律视为不可交易（只观察）。
 _TRADABLE_VALUE = "TRADABLE"
-# 信号侧 watchlist 1.3.0 缺测哨兵（doc/29）：tradable_flag 取该值表示【约定核心交易指标缺测】——
-# 执行侧据此放弃买入(B2) + 已过 T+1 持仓强卖(B3)。与一般非 TRADABLE(空仓/降级)区分：后者只弃买不强卖。
+# 信号侧 watchlist 缺测哨兵（doc/29）：tradable_flag 取该值表示【约定核心交易指标(真正重要的行情数据)缺测】——
+# 执行侧据此【放弃买入该票】(B2)。注（2026-06-22）：B3「缺测持仓强卖」已下线，缺测只在买入侧拦截、不强卖持仓
+# （卖出完全交由执行侧实时盘口扳机）；与一般非 TRADABLE(空仓/降级)同为不可买，方向一致。
 _DATA_MISSING_VALUE = "DATA_MISSING"
 
 
@@ -47,9 +48,16 @@ def _to_decimal(v: Any) -> Optional[Decimal]:
     if s == "":
         return None
     try:
-        return Decimal(s)
+        d = Decimal(s)
     except (InvalidOperation, ValueError):
         return None
+    # 拒绝非有限值（两系-2 修正 2026-06-22）：Decimal("NaN")/Decimal("Infinity") 是【合法】Decimal、不抛异常，
+    # 若放行，信号侧某天把强度分/续板概率/流通市值算成 NaN/Inf 会一路穿透进可买清单，到盘前「按强度分钱」
+    # 求最小值/排序/比大小时当场抛错、被最外层调度吞成日志，导致当天盘前装载反复在坏分票上崩、整日装不上、
+    # 完全开不了新仓且几乎无声。这里把非有限值按缺失(None)处理（不臆造数值），坏分票不污染权重计算。
+    if not d.is_finite():
+        return None
+    return d
 
 
 def _to_int(v: Any) -> Optional[int]:
@@ -231,17 +239,33 @@ class WatchlistPrefetcher:
                 "watchlist_prefetch_rows_skipped",
                 today=str(today), signal_date=str(signal_t), skipped=skipped,
             )
-        # 买入日一致性校验（评审二轮 P2#64/P3#80）：执行侧落库统一对齐 target_trade_date=today（按 prev_open(today)
-        # 拉的，构造上即今天买入），但信号侧响应顶层 target_trade_date 应等于 today；不一致说明两侧交易日历不同步
-        # （执行侧日历缺节假日等），原实现无条件覆盖会静默错配买入日。这里强告警暴露（仍按 today 落库，不静默吞）。
+        # 买入日一致性校验（评审二轮 P2#64/P3#80 + 两系-4 修正 2026-06-22）：执行侧按 prev_open(today) 拉、落库
+        # 统一对齐 target_trade_date=today，但信号侧响应顶层 target_trade_date 应等于 today；不一致说明两侧交易
+        # 日历不同步（执行侧日历缺节假日等），此时这批名单其实是【另一天】的。原实现只 warn 仍按 today 落库 →
+        # 会拿错配日期名单在当天真金下单。改为 fail-closed：不落这批错配名单、返回真失败（loader 据空名单降级只
+        # 守仓不开新仓），并强告警暴露日历不同步，绝不静默错配买入日。
         resp_target = _to_date((resp or {}).get("target_trade_date"))
         if resp_target is not None and resp_target != today:
             self._logger.warn(
-                "watchlist_prefetch_target_date_mismatch",
+                "watchlist_prefetch_target_date_mismatch_fail_closed",
                 today=str(today), signal_target=str(resp_target), signal_date=str(signal_t),
-                note="两侧交易日历可能不同步，请核对执行侧 QMT_TRADE_CALENDAR_FILE 是否与信号侧 a_trade_calendar 同源",
+                note="两侧交易日历不同步,拒用错配日期名单(只守仓不开新仓);核对执行侧 QMT_TRADE_CALENDAR_FILE 是否与信号侧 a_trade_calendar 同源",
             )
-        items = (resp or {}).get("items") or []
+            return -1
+
+        items = (resp or {}).get("items")
+        if items is None:
+            items = []
+        # items 结构校验（两系-3 修正 2026-06-22）：信封是 dict 但 items 不是数组（给成对象/字符串等）属契约破坏，
+        # 旧实现 `or []` 挡不住非空非数组、随后逐元素迭代得到字符串再 .get 报错被逐条吞 → rows 空 → 误判合法空仓。
+        # 这里显式判非数组为真失败重试，不静默当空仓日。
+        if not isinstance(items, list):
+            self._logger.warn(
+                "watchlist_prefetch_items_not_list",
+                today=str(today), signal_date=str(signal_t), items_type=type(items).__name__,
+            )
+            return -1
+
         rows: List[SelectedStockRow] = []
         for it in items:
             try:
@@ -249,12 +273,22 @@ class WatchlistPrefetcher:
             except Exception as exc:  # noqa: BLE001 单条脏数据不影响整批，丢弃该条并告警
                 self._logger.warn(
                     "watchlist_prefetch_item_skipped",
-                    ts_code=(it or {}).get("ts_code"), reason=repr(exc),
+                    ts_code=(it or {}).get("ts_code") if isinstance(it, dict) else None, reason=repr(exc),
                 )
                 continue
 
+        # 全批映射失败（两系-5 修正 2026-06-22）：items 非空却一条都没解析成功 = 系统性脏数据/契约错配（元素整体
+        # 不是预期对象等），绝不能伪装成「今天没票的空仓日」静默定稿。按真失败重试 + 强告警，使该重试/该告警的
+        # 严重对接故障不被吞成空仓。
+        if items and not rows:
+            self._logger.warn(
+                "watchlist_prefetch_all_items_failed",
+                today=str(today), signal_date=str(signal_t), item_count=len(items),
+            )
+            return -1
+
         if not rows:
-            # 空清单是合法结果（当日尚无 READY 报告/无候选）：不删本机旧名单（save_watchlist 空入参返回0）。
+            # 真·空清单（items 本就为空：当日尚无 READY 报告/无候选）：合法空仓，不删本机旧名单。
             self._logger.info(
                 "watchlist_prefetch_empty", today=str(today), signal_date=str(signal_t)
             )
