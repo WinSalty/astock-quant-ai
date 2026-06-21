@@ -373,10 +373,10 @@ class SignalPrior:
     market_state: Optional[str] = None
     role: Optional[str] = None
     strategy: Optional[str] = None
-    # 数据缺测标记（doc/29 B3）：data_missing=True → sell_decider/_evaluate_and_sell_unit 对已过 T+1 的持仓单元
-    # 强制清仓(CLEAR)，即便无盘口也清（最保守口径）。隔夜不在今日名单的持仓 prior 为 None、不强卖（口径③）。
-    data_missing: bool = False
-    data_missing_reason: Optional[str] = None
+    # 说明（口径变更 2026-06-21）：原 doc/29 B3「缺测持仓强卖」字段（data_missing/data_missing_reason）已下线——
+    # 卖出决策完全交由执行侧 xtdata 实时盘口（炸板/破位/烂板/止损等盘口扳机），不再因信号侧缺测标记强制清仓。
+    # 缺测仅在【买入侧】生效（SelectedStockRow/PlanRow/EntryDecision.data_missing → 放弃买入，doc/29 B2 保留），
+    # 故 SignalPrior（卖出先验视图）不再携带缺测字段。
 
 
 @dataclass

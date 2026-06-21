@@ -312,7 +312,8 @@ def selected_to_row(r: SelectedStockRow) -> Dict[str, Any]:
         "return_5d_pct": dec_text(r.return_5d_pct),
         "return_10d_pct": dec_text(r.return_10d_pct),
         # 数据缺测标记（doc/29 B1；评审 Stage B 修复）：data_missing 落 0/1（bool_int），data_missing_reason TEXT 直存。
-        # 必须无损 round-trip，否则盘前 save→盘中 fetch 丢成 False，B2 _rule_data_missing 永不命中、B3 缺测强卖失效。
+        # 必须无损 round-trip，否则盘前 save→盘中 fetch 丢成 False，B2 _rule_data_missing 永不命中（买入拦截失效）。
+        # （口径变更 2026-06-21：B3 持仓强卖已下线，该字段现仅服务买入侧拦截。）
         "data_missing": bool_int(r.data_missing),
         "data_missing_reason": r.data_missing_reason,
     }

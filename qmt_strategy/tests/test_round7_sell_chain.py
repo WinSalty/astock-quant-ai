@@ -321,23 +321,12 @@ def test_prior_provider_maps_row_to_signal_prior():
     assert prior.continuation_prob == Decimal("0.70")
     assert prior.role == "龙头" and prior.strategy == "打板"
     assert prior.fail_conditions == ["放量炸板"]
-    # 默认（无缺测）行：data_missing=False
-    assert prior.data_missing is False
+    # 口径变更（2026-06-21）：SignalPrior 不再携带缺测字段（B3 持仓强卖已下线，卖出交由实时盘口）。
+    assert not hasattr(prior, "data_missing")
 
 
-def test_prior_provider_carries_data_missing_for_b3():
-    """评审 Stage B 修复：生产唯一的 SignalPrior 装配点(_build_prior_provider)须把 SelectedStockRow.data_missing
-    透传进 SignalPrior，否则 B3「缺测持仓强卖」三处分支在实盘恒为死代码。回归此前断链。"""
-    from qmt_strategy.app.run import _build_prior_provider
-
-    row = _selected_row()
-    row.data_missing = True
-    row.data_missing_reason = "missing:close,open_times"
-    provider = _build_prior_provider(_FakeStack(_FakeWatchlistSource([row])), RecordingLogger())
-    prior = provider(CODE, T_BUY)
-    assert prior is not None
-    assert prior.data_missing is True  # 不再恒 False → B3 缺测强卖在实盘真正生效
-    assert prior.data_missing_reason == "missing:close,open_times"
+# 口径变更（2026-06-21）：原 test_prior_provider_carries_data_missing_for_b3 随 B3 下线移除——
+# 缺测标记不再透传进卖出先验 SignalPrior，仅在买入侧（SelectedStockRow→buy_prefilter）拦截。
 
 
 def test_prior_provider_none_for_missing_and_caches_per_day():

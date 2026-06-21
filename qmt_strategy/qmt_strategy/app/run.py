@@ -256,12 +256,9 @@ def _build_prior_provider(stack: LocalStorage, logger):
                     market_state=r.market_state,
                     role=r.role,
                     strategy=r.strategy,
-                    # 缺测标记搬进先验（doc/29 B3；评审 Stage B #1 修复）：这是生产唯一的 SignalPrior 装配点，
-                    # 漏传则 prior.data_missing 恒 False → sell_decider/main 三处「缺测强制清仓」分支在实盘全为死代码、
-                    # 缺测持仓被裸扛。今日名单中该票若被信号侧判缺测，其已过 T+1 的持仓须强卖；隔夜不在名单 prior=None
-                    # 不强卖（口径③）。
-                    data_missing=getattr(r, "data_missing", False),
-                    data_missing_reason=getattr(r, "data_missing_reason", None),
+                    # 口径变更（2026-06-21）：原此处把信号侧缺测标记搬进 SignalPrior 供 B3「缺测持仓强卖」，
+                    # 现 B3 已下线——卖出完全交由执行侧 xtdata 实时盘口扳机裁决，先验不再携带缺测字段。
+                    # 缺测仅在买入侧拦截（SelectedStockRow.data_missing → buy_prefilter/entry_router 放弃买入，B2 保留）。
                 )
             cache["day"] = today
             cache["by_code"] = by_code

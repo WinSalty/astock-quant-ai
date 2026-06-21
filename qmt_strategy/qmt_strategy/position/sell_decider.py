@@ -117,12 +117,8 @@ class SellDecider:
         if guard is not None:
             return guard
 
-        # —— 缺测强制清仓（doc/29 B3）：信号侧判该票【约定核心交易指标缺测】(prior.data_missing)→ 强制清仓 CLEAR，
-        # 【先于下方「盘口缺失→HOLD」早退】——缺测票即便竞价盘口缺失也清（最保守口径，宁可错清不裸扛缺数据风险）。
-        # 守 T+1 / FREEZE 已在 _pre_guard 处理（物理/通道约束优先）；隔夜不在今日名单的持仓 prior=None→不强卖（口径③）。
-        if prior is not None and getattr(prior, "data_missing", False):
-            return self._clear(unit, reason="缺测强制清仓", phase="auction")
-
+        # 口径变更（2026-06-21）：原 doc/29 B3「缺测强制清仓」分支已下线——卖出决策完全交由下方 xtdata
+        # 实时盘口扳机（封板续持/量价背离/弱开/破位/炸板/烂板）裁决，不再因信号侧缺测标记强清持仓。
         prior_strong = self._is_prior_strong(unit, prior)
 
         # —— 盘口缺失安全默认（评审三轮 EXEC-position-08）：盘口竞价信息整体缺失（open_pct 为 None 且各结构
@@ -210,11 +206,8 @@ class SellDecider:
         if guard is not None:
             return guard
 
-        # —— 缺测强制清仓（doc/29 B3）：prior.data_missing → CLEAR，先于下方盘口扳机/弱势了结分支。
-        # 守 T+1 / FREEZE 已在 _pre_guard 处理；隔夜不在今日名单 prior=None→不强卖（口径③）。
-        if prior is not None and getattr(prior, "data_missing", False):
-            return self._clear(unit, reason="缺测强制清仓", phase="intraday")
-
+        # 口径变更（2026-06-21）：原 doc/29 B3「缺测强制清仓」分支已下线——分时卖出完全交由下方 xtdata
+        # 实时盘口扳机（破位/炸板/烂板/冲高止盈/尾盘了结）裁决，不再因信号侧缺测标记强清持仓。
         prior_strong = self._is_prior_strong(unit, prior)
 
         # —— 一票否决组（破位 / 炸板 / 烂板，盘口硬扳机，先验再强也出）——

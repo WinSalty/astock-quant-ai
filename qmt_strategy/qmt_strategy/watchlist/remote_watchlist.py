@@ -163,7 +163,8 @@ def watchlist_item_to_selected(item: dict, target_trade_date: date) -> SelectedS
         volume_ratio=_to_decimal(item.get("volume_ratio")),
         return_5d_pct=_to_decimal(item.get("return_5d_pct")),
         return_10d_pct=_to_decimal(item.get("return_10d_pct")),
-        # 缺测哨兵透传（doc/29 B1）：供买入拦截(B2)与持仓强卖(B3)。老契约无该值 → data_missing=False。
+        # 缺测哨兵透传（doc/29 B1）：供买入拦截(B2)放弃买入。老契约无该值 → data_missing=False。
+        # （口径变更 2026-06-21：原 B3 持仓强卖已下线，缺测标记仅用于买入侧拦截。）
         data_missing=data_missing,
         data_missing_reason=data_missing_reason,
     )

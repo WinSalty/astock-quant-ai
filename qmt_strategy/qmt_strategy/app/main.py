@@ -1173,21 +1173,9 @@ class Engine:
             prior = None
         book = books.get(unit.ts_code)
         if book is None:
-            # 缺测强制清仓（doc/29 B3）：信号侧判该票核心交易指标缺测(prior.data_missing) → 即便无盘口也强清。
-            # 本分支专司「无盘口」场景——下面 sell_decider 在 book is None 时根本不会被调用，故在此提前强清
-            # （经 _place_sell 无 book 时回退成本价挂单；守 T+1 由 sellable_units + _place_sell 状态闸保证）。
-            # 有盘口时缺测由 sell_decider 的缺测分支统一裁决（见 decide_auction/decide_intraday）。
-            if prior is not None and getattr(prior, "data_missing", False):
-                self._logger.warn(
-                    "engine_sell_data_missing_clear",
-                    ts_code=unit.ts_code,
-                    reason=getattr(prior, "data_missing_reason", None),
-                    note="核心交易指标缺测，无盘口仍强制清仓(doc/29 B3)",
-                )
-                return self._place_sell(
-                    unit, SellActionType.CLEAR, None, "缺测强制清仓(无盘口)", None, today
-                )
-            # 无执行侧盘口且非缺测：安全默认不主动卖（§5.4.3，没有可信盘口不做实时卖出决策）。
+            # 无执行侧盘口：安全默认不主动卖（§5.4.3，没有可信盘口不做实时卖出决策）。
+            # 口径变更（2026-06-21）：原 doc/29 B3「缺测无盘口仍强清」分支已下线——卖出完全依赖实时盘口扳机，
+            # 无可信盘口即不卖，不再因信号侧缺测标记在无盘口下强制清仓。
             return False
         # 单票浮亏止损（评审二轮 P2#39）：浮亏击穿 stock_float_loss_limit → 强制清仓，优先于常规卖出决策。
         # 注意口径：单票止损是"该卖"的触发器（应主动卖出），不能喂进 risk.gate 当 FREEZE（那会反而冻结卖出 =
