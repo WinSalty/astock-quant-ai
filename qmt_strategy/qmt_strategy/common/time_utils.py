@@ -26,8 +26,19 @@ def qmt_ts_to_db(ts: Optional[int]) -> Tuple[Optional[datetime], Optional[dateti
     """
     if not ts:
         return None, None
+    sec = int(ts)
+    # 单位归一（执行-19 修正 2026-06-22）：QMT 约定秒级，但不同 xtquant 版本可能返回毫秒(13位)/微秒(16位)。
+    # 旧实现一律按秒解释 → fromtimestamp 对毫秒值算出公元五万多年而抛 OverflowError，被下方 except 静默吞成
+    # (None,None)，使 traded_time/order_time 及 *_east8 整列无声变 NULL、按时间排序/对账失真且无任何提示。
+    # 这里按数量级把明显非秒的时间戳降为秒——各单位量级互不重叠（当代秒级≈1.7e9，毫秒≈1.7e12，微秒≈1.7e15），
+    # 属确定性的单位换算、非臆造默认值；换算后仍越界才落 (None,None)。真机实际单位仍须按待办清单核实固化。
+    _abs = abs(sec)
+    if _abs >= 1_000_000_000_000_000:      # >=1e15：微秒级 → /1e6
+        sec = sec // 1_000_000
+    elif _abs >= 100_000_000_000:          # >=1e11：毫秒级 → /1e3（秒级当代约 1.7e9，落不到此区）
+        sec = sec // 1_000
     try:
-        east8 = datetime.fromtimestamp(int(ts), tz=SHANGHAI)
+        east8 = datetime.fromtimestamp(sec, tz=SHANGHAI)
     except (OverflowError, OSError, ValueError):
         return None, None
     utc_naive = east8.astimezone(UTC).replace(tzinfo=None)

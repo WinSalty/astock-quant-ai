@@ -28,6 +28,17 @@ def test_qmt_ts_to_db_none_zero_returns_pair_none():
     assert qmt_ts_to_db(0) == (None, None)
 
 
+def test_qmt_ts_to_db_normalizes_ms_and_us_units():
+    """执行-19：毫秒(13位)/微秒(16位)时间戳按量级归一为秒，得到与秒级同一时刻，
+    不再因被当秒解释而 OverflowError 静默落 (None, None)（整列时间无声变 NULL）。"""
+    east8 = datetime(2026, 6, 12, 13, 31, 2, tzinfo=SHANGHAI)
+    sec = int(east8.timestamp())
+    expect = datetime(2026, 6, 12, 13, 31, 2)
+    assert qmt_ts_to_db(sec)[1] == expect          # 秒
+    assert qmt_ts_to_db(sec * 1_000)[1] == expect  # 毫秒
+    assert qmt_ts_to_db(sec * 1_000_000)[1] == expect  # 微秒
+
+
 def test_east8_time_and_date_from_utc():
     # UTC 01:16 == 东八区 09:16
     utc = datetime(2026, 6, 12, 1, 16, 0)

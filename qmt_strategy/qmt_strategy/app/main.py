@@ -448,16 +448,25 @@ class Engine:
         )
         return ctx
 
-    @staticmethod
-    def _extract_market_state(ctx: WatchlistContext) -> Optional[str]:
-        """从上下文条目透传字段取当日 market_state（可交易优先，其次观察名单）。"""
-        for entry in ctx.tradable.values():
-            if entry.market_state is not None:
-                return entry.market_state
-        for entry in ctx.watch_only:
-            if entry.market_state is not None:
-                return entry.market_state
-        return None
+    def _extract_market_state(self, ctx: WatchlistContext) -> Optional[str]:
+        """从上下文条目透传字段取当日全局 market_state（用于开仓闸）。
+
+        取最保守（执行-18 修正 2026-06-22）：信号侧正常保证同一天所有票 market_state 同值，但若信号侧 bug 给得
+        不一致（本该全「空仓/谨慎参与」却混进一只错标「参与」），旧实现「取第一只带值的票」会因遍历顺序不同而
+        可能取到那只更宽松的值、漏放本应禁开仓那天的买入。这里改为：只要任一条目命中禁开集
+        (settings.market_state_block)，就返回该禁开值（最保守，宁可少开不误开）；全部一致或都不在禁开集时返回首个。
+        """
+        block_set = set(self._settings.market_state_block or [])
+        first: Optional[str] = None
+        for entry in list(ctx.tradable.values()) + list(ctx.watch_only):
+            ms = entry.market_state
+            if ms is None:
+                continue
+            if first is None:
+                first = ms
+            if ms in block_set:
+                return ms  # 命中禁开集即取最保守，单只错标「参与」不能放开整日开仓闸
+        return first
 
     # ------------------------------------------------------------------
     # 账户级风控输入（评审 P0-B2：喂给 risk.gate，使账户回撤击穿真正触发 FREEZE）

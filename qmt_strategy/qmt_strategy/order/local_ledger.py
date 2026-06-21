@@ -330,9 +330,14 @@ class InMemoryLocalLedger:
             # 状态收口：只对【活跃态】(PLANNED/SUBMITTED/PART_TRADED) 按券商权威量 vs 计划量推进；终态
             # (TRADED/PART_CANCELLED/CANCELLED/REJECTED) 一律不改状态——filled 值已上修(成交是事实)，但 CANCELLED/
             # REJECTED 的「成交-aware 终态」由 reconcile_fills_from_detail 收口为 PART_CANCELLED，收口不在此越权改终态。
+            # CANCELLING（撤单中，执行-8 修正 2026-06-22）：撤单已发、等回执的买单若券商快照显示撤单前已部分成交，
+            # 旧实现漏把它列入「不改状态」集，会把它从 CANCELLING 错改回 PART_TRADED，超时巡检遂当在途单对同一委托
+            # 再发一次撤单（券商安全拒、后续已撤回报收口为 PART_CANCELLED，能自愈但产生无用重复撤单与状态来回）。
+            # 这里保留 CANCELLING 状态（filled 仍按上方上修），等真正的撤单回执来收口终态。
             if e.state not in (
                 OrderState.TRADED, OrderState.PART_CANCELLED,
                 OrderState.CANCELLED, OrderState.REJECTED,
+                OrderState.CANCELLING,
             ):
                 if e.plan_volume and broker_vol >= e.plan_volume:
                     e.state = OrderState.TRADED

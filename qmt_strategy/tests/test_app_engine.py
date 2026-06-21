@@ -159,6 +159,24 @@ def test_empty_position_state_blocks_open():
     assert deps.trader.order_calls == []                # 空仓禁开新仓
 
 
+def test_global_market_state_takes_most_conservative_when_entries_disagree():
+    """执行-18：同日各票 market_state 不一致时取最保守(命中禁开集)值，单只错标「参与」不放开整日开仓闸。"""
+    rows = [
+        make_selected_row(
+            ts_code="600036.SH", signal_close=Decimal("10.00"), limit_up_price=Decimal("11.00"),
+            market_state="参与", tradable_flag=True,
+        ),
+        make_selected_row(
+            ts_code="600000.SH", signal_close=Decimal("10.00"), limit_up_price=Decimal("11.00"),
+            market_state="空仓", tradable_flag=True,
+        ),
+    ]
+    deps = _deps(source_rows=rows)
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    assert eng._market_state == "空仓"  # 命中禁开集取最保守，不取遍历到的首个「参与」
+
+
 def test_transient_risk_block_releases_lock_allows_later_buy():
     """评审 doc/21 E1：单帧瞬时风控拒单（行情中断）应解锁幂等，使条件恢复后的后续帧能重评下单（破 fail-then-stuck）。
 
