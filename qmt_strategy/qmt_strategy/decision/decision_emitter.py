@@ -78,6 +78,12 @@ class DecisionEmitter:
         # 仅统计用（非交易关键）：入队成功数 / 满丢数。
         self._emitted = 0
         self._dropped = 0
+        # 可观测限频（执行-21 修正 2026-06-22）：满队列丢弃与 sink 持续失败若全静默/每批刷屏都不利运维。
+        # 决策日志是事后归因「某票为何没买/没卖」的唯一依据，大面积静默丢失须可见；sink 持续失败又不能每批刷屏。
+        self._drop_log_every = 200          # 每累计丢弃 N 条告警一次（边沿触发，不刷屏）
+        self._dropped_last_logged = 0
+        self._flush_fail_streak = 0         # sink 连续失败次数
+        self._flush_fail_log_every = 50     # 首次失败必告警，其后每 N 次再告警一次（限频）
 
     # ==================================================================
     # 生命周期
@@ -157,6 +163,17 @@ class DecisionEmitter:
         except queue.Full:
             # 满即丢：绝不阻塞调用线程（区别于交易侧无界不丢的 AsyncWriteQueue）。
             self._dropped += 1
+            # 限频告警（执行-21）：每累计丢弃 _drop_log_every 条 warn 一次，使「决策日志大面积静默丢失」可见
+            # （归因依据丢失须运维知情），又不逐条刷屏。
+            if self._dropped - self._dropped_last_logged >= self._drop_log_every:
+                self._dropped_last_logged = self._dropped
+                try:
+                    self._logger.warn(
+                        "decision_emitter_drops_accumulating",
+                        account_id=self._account_id, dropped=self._dropped, queued=self._q.qsize(),
+                    )
+                except Exception:  # noqa: BLE001 告警失败不影响交易
+                    pass
         except Exception:  # noqa: BLE001 构造/入队任何异常都吞掉，交易优先
             pass
 
@@ -258,8 +275,16 @@ class DecisionEmitter:
             return
         try:
             sink(batch)
+            self._flush_fail_streak = 0  # 成功即清零连续失败计数
         except Exception as exc:  # noqa: BLE001 回流失败绝不影响交易/对账
-            try:
-                self._logger.warn("decision_emitter_flush_failed", count=len(batch), error=repr(exc))
-            except Exception:  # noqa: BLE001
-                pass
+            # 限频告警（执行-21）：首次失败必告警，其后每 _flush_fail_log_every 次再告警一次（带连续失败计数），
+            # 避免回流通道持续不可用时每批刷屏；同时不再「不计次」——失败次数随告警上报供运维判断严重度。
+            self._flush_fail_streak += 1
+            if self._flush_fail_streak == 1 or self._flush_fail_streak % self._flush_fail_log_every == 0:
+                try:
+                    self._logger.warn(
+                        "decision_emitter_flush_failed",
+                        count=len(batch), consecutive_failures=self._flush_fail_streak, error=repr(exc),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
