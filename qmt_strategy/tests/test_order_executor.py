@@ -555,12 +555,16 @@ def test_sell_sync_failure_does_not_consume_order_quota(clock_0916):
                 return -1
             return super().order_stock(account, stock_code, order_type, *a, **k)
 
-    ex = _executor(FailSellTrader(), clock_0916, settings=Settings(max_orders_per_day=1))
+    led = InMemoryLocalLedger()
+    ex = _executor(FailSellTrader(), clock_0916, ledger=led, settings=Settings(max_orders_per_day=1))
     # 两次失败卖单（均同步拒）→ 不应吃掉唯一的下单配额
     assert ex.place_sell("600036.SH", T_BUY, T_SIGNAL, 1000, Decimal("10.5"), "x") is None
     assert ex.place_sell("600036.SH", T_BUY, T_SIGNAL, 1000, Decimal("10.5"), "x") is None
     # 配额仍可用：买入成功（旧实现下失败卖单会各 +1 占满 max=1 → 买入被拦）
     assert ex.place(_decision(ts_code="600000.SH")) is not None
+    # 执行-R8：重启重建口径须与 live 一致——失败卖单(ERROR)不计配额，只计成功买入这 1 笔。
+    ex.rebuild_runtime_state()
+    assert ex._orders_count_by_date.get(T_BUY, 0) == 1  # 不含 2 笔 ERROR 卖单（旧 rebuild 会算成 3）
 
 
 def test_place_sell_kill_switch_blocks(clock_0916):

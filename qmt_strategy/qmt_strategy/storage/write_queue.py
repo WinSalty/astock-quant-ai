@@ -63,6 +63,10 @@ class AsyncWriteQueue:
         # 成交/状态写已被 rollback 丢弃（write-behind 不重投）→ 台账与券商不一致却无人察觉。
         self._write_degraded = False     # sticky：任一写失败置 True
         self._healthy_streak = 0         # 连续成功计数，达 _fail_after 才解除 degraded
+        # 累计写失败数（执行-R10 修正 2026-06-22）：永不因成功清零，用于区分「单次瞬时抖动」与「持续/间歇丢数据」。
+        # 周期体检的 latching 永久 fail-closed 在「当前仍 degraded 且累计失败已达 _fail_after」时触发——既不被一次
+        # 无害瞬时 blip 冻结(执行-4 诉求)，又能堵住「失败/成功交替」式间歇丢数据(E-4 诉求，此前被本轮折中漏掉)。
+        self._total_fail = 0
         # on_failure：存储不可用时的告警钩子（写线程已死/建连失败）。供上层触发停盘/运维告警,不抛错(不影响交易)。
         self._on_failure = on_failure
         self._q: "queue.Queue[WriteTask]" = queue.Queue()
@@ -166,12 +170,14 @@ class AsyncWriteQueue:
     def is_persistently_failed(self) -> bool:
         """持续性/致命存储故障（供 Engine 周期体检的【latching 永久 fail-closed】用，执行-4 修正 2026-06-22）。
 
-        只在【确定性持久故障】为真：未启动 / 写线程死亡 / 建连或连续 commit 失败已熔断(_failed) / 看门狗判卡死。
-        【刻意不含】单次写瞬时失败造成的 sticky degraded(_write_degraded / _last_write_ok)——那是瞬时抖动（如一笔
-        无关紧要的镜像写撞 5 秒锁超时），会随后续写自然恢复；旧实现让周期体检 latch 的 is_healthy() 把这种瞬时
-        degraded 也当永久不健康，只要 15 秒一次的体检恰好采样到 degraded 窗口，就把引擎存储永久置不可用、冻结
-        当天剩余全部开仓直到人工重启。瞬时 degraded 仍由 is_healthy()=False 反映，供【发单前关键落盘】等可恢复的
-        逐单检查使用——逐单 fail-closed 只挡当前这笔、随写恢复自动放行，不 latch。
+        以下任一为真即【确定性/持续性故障】：未启动 / 写线程死亡 / 建连或连续 commit 失败已熔断(_failed) /
+        看门狗判卡死 / **当前仍 degraded 且累计失败已达 _fail_after**（持续或间歇丢数据，执行-R10 补）。
+        【刻意不含】单次写瞬时失败造成、且累计失败未达阈值的 sticky degraded——那是瞬时抖动（如一笔无关紧要的
+        镜像写撞 5 秒锁超时），不应让 15 秒一次的体检把它 latch 成永久不可用、冻结当天剩余开仓(执行-4 诉求)。
+        但「失败、成功、失败、成功…」式间歇丢数据会让 _write_degraded 持续为真、_total_fail 不断累加，达 _fail_after
+        即在此 latch fail-closed（堵住 E-4 漏洞：本轮把全部 degraded 一并移出周期 latch 过粗，这里按累计失败补回）。
+        瞬时 degraded 仍由 is_healthy()=False 反映，供【发单前关键落盘】等可恢复的逐单检查使用——逐单只挡当前这笔、
+        随写恢复自动放行，不 latch。
         """
         return (
             not self._started
@@ -179,6 +185,7 @@ class AsyncWriteQueue:
             or self._thread is None
             or not self._thread.is_alive()
             or self._is_stuck()
+            or (self._write_degraded and self._total_fail >= self._fail_after)
         )
 
     def _is_stuck(self) -> bool:
@@ -240,6 +247,7 @@ class AsyncWriteQueue:
                 # 持续 I/O 故障熔断（评审三轮 EXEC-storage-03）：连续 commit 失败计数；置最近写失败；达阈值
                 # 即 _failed.set()+on_failure，让 is_healthy 转 False、上层 fail-closed（区分瞬时锁等待与持续故障）。
                 self._consecutive_fail += 1
+                self._total_fail += 1  # 累计失败（执行-R10）：永不清零，供周期体检判「持续/间歇丢数据」
                 self._last_write_ok = False
                 # E-4：任一写失败即 sticky 置 degraded + 清零成功连击；is_healthy 据此持续 False 直到持续恢复。
                 self._write_degraded = True

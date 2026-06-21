@@ -550,6 +550,10 @@ class Engine:
             records.append(rec)
         n = self._position.rebuild_from_broker_positions(records, today)
         self._logger.info("engine_positions_rebuilt", count=n, queried=len(records))
+        # 重建成功即清持仓脱节旗（执行-R9 修正 2026-06-22）：集中在此清旗，使所有调用方(prewarm/重连补采/
+        # 收盘批次/run_sell_pass/开仓路径懒恢复)只要成功用券商权威持仓重建过，就解除 fail-closed、恢复开仓——
+        # 不再把清旗绑死在生产默认门控下根本不被调用的 run_sell_pass 上（否则一次回写异常即永久冻结开仓至重启）。
+        self._position_desync = False
         return True
 
     def _capture_day_open_equity(self, today: date) -> None:
@@ -652,12 +656,15 @@ class Engine:
             if not quiet:
                 self._logger.error("engine_open_blocked_reconcile_unconfirmed", ts_code=ts_code)
             return True
-        # —— 持仓回写脱节 fail-closed（执行-7）：已知有成交没进持仓状态机，内存持仓不可信 → 禁开新仓，
-        #    待下一轮卖出巡检用券商权威持仓重建补回后清旗再恢复（守仓/卖出不受影响）——
+        # —— 持仓回写脱节 fail-closed（执行-7 + 执行-R9 修正 2026-06-22）：已知有成交没进持仓状态机、内存持仓
+        #    不可信 → 禁开新仓。【开仓路径懒恢复】：在此就地用券商权威持仓重建一次（_rebuild 成功即在其内部清旗），
+        #    成功则本笔不再拦、放行后续闸门；失败仍拦。这样恢复不依赖生产默认门控下根本不跑的 run_sell_pass，
+        #    在竞价/盘中任一开仓尝试时即自愈（重建仅在脱节态触发、成功后清旗，后续帧不再付出 broker 查询代价）。
         if self._position_desync:
-            if not quiet:
-                self._logger.error("engine_open_blocked_position_desync", ts_code=ts_code)
-            return True
+            if not self._rebuild_positions_from_broker(self._today_provider()):
+                if not quiet:
+                    self._logger.error("engine_open_blocked_position_desync", ts_code=ts_code)
+                return True
         # —— 交易日历不可用 fail-closed（doc/29 J-3）：日历耗尽且盘前补取失败 → T+1 映射失准 → 禁开新仓
         #    （守仓/卖出不受影响，由 run_sell_pass 照常）。
         if self._calendar_unsafe:
@@ -1162,12 +1169,12 @@ class Engine:
         # 本轮不做卖出决策，仅等午后复牌再评（盘口只读快照不受影响）。
         if is_lunch_break(self._clock.now_utc()):
             return []
-        # 持仓脱节恢复（执行-7）：上一笔成交回写持仓失败置了脱节旗 → 在主线程先用券商权威持仓重建状态机，
-        # 把丢失的单元补回（恢复其卖出/止损覆盖），重建后清旗、恢复开仓。重建内部查询失败不抛断、保留旗位等下轮再试。
+        # 持仓脱节恢复（执行-7）：上一笔成交回写持仓失败置了脱节旗 → 用券商权威持仓重建状态机把丢失单元补回
+        # （恢复其卖出/止损覆盖）；_rebuild 成功即在其内部清旗、恢复开仓，失败保留旗位等下轮/开仓路径懒恢复再试。
+        # 注：这只是卖出链开启时的额外恢复点；生产默认门控关时本方法不被调用，恢复主要靠开仓路径懒恢复(见 _open_blocked)。
         if self._position_desync:
             self._logger.warn("engine_position_desync_rebuild", today=str(today))
-            if self._rebuild_positions_from_broker(today):
-                self._position_desync = False  # 重建成功才清旗、恢复开仓；失败保留旗位下轮再试
+            self._rebuild_positions_from_broker(today)
         sold: List[str] = []
         for unit in self._position.sellable_units(today):
             # 单票评估/下单异常隔离（评审复审 P1 / 二轮 #90）：任一单只票的盘口/决策/下单异常只跳过该票，

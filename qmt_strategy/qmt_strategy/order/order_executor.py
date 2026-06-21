@@ -217,8 +217,10 @@ class OrderExecutor:
         ttl_rebuilt = 0
         counter: Dict[Any, int] = {}
         for e in self._ledger.all():
-            # 计数器：凡"已越过 PLANNED"（真实发出过 order_stock，含同步失败 ERROR）的单都占当日下单次数配额。
-            if e.state != OrderState.PLANNED:
+            # 计数器：只计「已被券商真正受理」的提交单（执行-R8 修正 2026-06-22）——即 state 非 PLANNED 且非 ERROR。
+            # 排除 ERROR(同步下单失败、无活单)与 PLANNED(尚未发出)：与 live 侧「成功才 +1」口径一致，避免同一笔
+            # 同步失败单 live 不占配额、重启重建却凭空多吃一个名额、误拦买入。
+            if e.state not in (OrderState.PLANNED, OrderState.ERROR):
                 counter[e.target_trade_date] = counter.get(e.target_trade_date, 0) + 1
             # TTL：仅对在途且有 order_id 的单重建截止（PLANNED 无 order_id 无从撤；终态无需 TTL）。
             if e.state in in_flight and e.order_id is not None and e.biz_order_no not in self._ttl_deadline:
@@ -537,12 +539,6 @@ class OrderExecutor:
             self._report_conn(False)
             raise
 
-        # 单日下单次数 +1（评审 P0-B3）：真实发出 order_stock 即占配额（含同步失败，下同），
-        # 防止转次优链 / 重复推送导致超频下单；幂等命中不会走到这里，故不重复计。
-        self._orders_count_by_date[decision.target_trade_date] = (
-            self._orders_count_by_date.get(decision.target_trade_date, 0) + 1
-        )
-
         # —— 同步下单失败（order_stock 返回 <0 / None）：标 ERROR，绝不置 SUBMITTED（评审 medium#9）。——
         # 业务意图：XtTraderLike.order_stock 约定 <0 为同步失败；若仍置 SUBMITTED，对账会把它误判为
         # 「漏单凭空消失」（missing_report），污染 §6.10 告警语义。这里落 ERROR 终态 + 留痕 + 转次优。
@@ -578,6 +574,13 @@ class OrderExecutor:
         # —— 回填 order_id + 推进到 SUBMITTED（已发 order_stock，待回报）——
         # 注意：到此为止状态最多 SUBMITTED；REPORTED/TRADED 由外部回报推进（§4.4(4)）。
         self._report_conn(True)  # 同步下单成功 = 通道可用，反馈健康（清零 heartbeat 失败计数）
+        # 单日下单次数 +1（评审 P0-B3 + 执行-R8 修正 2026-06-22）：只在【券商真正受理(order_id 有效)】时计数，
+        # 与卖出侧同口径、且与重启重建口径一致（rebuild_runtime_state 只计「非 PLANNED 且非 ERROR」的真实提交单）。
+        # 旧实现在 order_stock 返回后无论成败先 +1，使同步失败(ERROR)的单 live 占配额、而重启重建又把同一 ERROR
+        # 行计入——本身已重复；改为成功才计后两侧统一。同步失败不产生活单、不占配额；持续失败由连接 FREEZE 刹车。
+        self._orders_count_by_date[decision.target_trade_date] = (
+            self._orders_count_by_date.get(decision.target_trade_date, 0) + 1
+        )
         self._ledger.update(biz_no, order_id=order_id, state=OrderState.SUBMITTED, updated_at=self._clock.now_utc())
         # 发单成功后【同步落盘 order_id】（评审二轮 P1#7）：原实现 order_id 仅异步镜像，崩溃窗口会产生
         # "券商有单、台账只认 PLANNED（无 order_id）"的孤儿单——重启后无法按 order_id 关联回报/撤单，

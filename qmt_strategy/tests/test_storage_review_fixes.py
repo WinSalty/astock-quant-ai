@@ -305,3 +305,36 @@ def test_transient_degraded_is_not_persistent_failure():
     finally:
         q.stop()
         q.stop()
+
+
+def test_intermittent_alternating_loss_is_persistent_failure():
+    """执行-R10：「失败、成功、失败、成功…」间歇丢数据——连续失败数永攒不到熔断阈值(_failed 不 set)，
+    但 _write_degraded 持续为真、累计失败达 _fail_after → is_persistently_failed()=True，周期体检 latch fail-closed
+    （堵住 E-4 漏洞：本轮把全部 degraded 移出周期 latch 过粗，按累计失败补回）。"""
+    state = {"fail_next": False}
+
+    class _FlakyConn:
+        def commit(self):
+            if state["fail_next"]:
+                raise OSError("intermittent")
+        def rollback(self):
+            pass
+        def close(self):
+            pass
+
+    q = AsyncWriteQueue(lambda: _FlakyConn(), RecordingLogger(), name="t", fail_after=3)
+    q.start()
+    try:
+        # 失败/成功交替 3 个失败：每次成功把连续失败清零→_failed 永不 set，但 degraded 持续、_total_fail 累加到 3。
+        for _ in range(3):
+            state["fail_next"] = True
+            q.submit(lambda conn: None)
+            q.flush(1.0)
+            state["fail_next"] = False
+            q.submit(lambda conn: None)
+            q.flush(1.0)
+        assert q._failed.is_set() is False          # 连续失败从未达阈值 → 未走 _failed 熔断
+        assert q.is_persistently_failed() is True    # 但间歇丢数据(degraded+累计失败达阈值)被 latch
+    finally:
+        q.stop()
+        q.stop()

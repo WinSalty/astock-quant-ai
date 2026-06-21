@@ -423,8 +423,10 @@ def test_buy_fill_writes_position_then_sellable_next_day_and_no_double_sell():
 # main._evaluate_and_sell_unit 的 book is None 分支与 test_run_sell_pass_* 系列）。
 
 
-def test_buy_writeback_failure_sets_desync_blocks_open_and_recovers():
-    """执行-7：买入成交回写持仓抛异常 → 置持仓脱节旗 + 禁开新仓；下一轮卖出巡检用券商持仓重建后清旗。"""
+def test_buy_writeback_failure_sets_desync_and_recovers_on_open_path():
+    """执行-7 + 执行-R9：买入成交回写持仓抛异常 → 置持仓脱节旗。
+    恢复【不依赖 run_sell_pass】（生产默认门控下它根本不被调用）：开仓路径懒恢复——券商持仓查询失败时仍 fail-closed
+    禁开仓，查询成功时就地重建+清旗、放行。"""
     from qmt_strategy.contracts.xt_objects import FakeXtTrade
 
     deps = _deps()
@@ -440,11 +442,20 @@ def test_buy_writeback_failure_sets_desync_blocks_open_and_recovers():
         traded_price=11.00, traded_volume=1000, order_type=23,
     )
     eng.callback.on_stock_trade(fill)
-    # 成交未进持仓状态机，但绝不静默：置脱节 fail-closed 旗 + 禁开新仓。
-    assert eng._position_desync is True
+    assert eng._position_desync is True  # 成交未进持仓状态机 → 置脱节旗
+
+    # 券商持仓查询失败时：开仓路径懒恢复重建失败 → 仍 fail-closed 禁开仓、旗保留。
+    def _q_boom(*a, **k):
+        raise RuntimeError("券商持仓查询超时")
+
+    orig_q = deps.trader.query_stock_positions
+    deps.trader.query_stock_positions = _q_boom  # type: ignore[assignment]
     assert eng._open_blocked_by_risk("600036.SH", quiet=True) is True
-    # 下一轮卖出巡检用券商权威持仓重建（fake 返回空 → 重建成功）→ 清旗、恢复开仓。
-    eng.run_sell_pass(T_BUY, books={})
+    assert eng._position_desync is True
+
+    # 券商持仓查询恢复后：开仓路径懒恢复就地重建成功 → 清旗、不再因脱节拦截（不调用 run_sell_pass）。
+    deps.trader.query_stock_positions = orig_q  # type: ignore[assignment]
+    eng._open_blocked_by_risk("600036.SH", quiet=True)
     assert eng._position_desync is False
 
 
