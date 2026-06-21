@@ -714,10 +714,6 @@ class OrderExecutor:
         except Exception:  # noqa: BLE001 下单通道异常先反馈不健康再上抛
             self._report_conn(False)
             raise
-        # 单日下单次数 +1（评审 P0-B3）：卖单同样占下单次数配额（含同步失败）。
-        self._orders_count_by_date[target_trade_date] = (
-            self._orders_count_by_date.get(target_trade_date, 0) + 1
-        )
 
         if order_id is None or order_id < 0:
             self._report_conn(False)
@@ -736,6 +732,14 @@ class OrderExecutor:
             return None
 
         self._report_conn(True)  # 卖单同步下单成功 = 通道可用
+        # 单日下单次数 +1：只在【真正被券商受理(order_id 有效)】时计数（执行-1 修正 2026-06-22）。
+        # 旧实现在 order_stock 返回后无论成败都先 +1，再判失败返回——一只持续卖不出的票(跌停/拒单)每轮卖出巡检
+        # 都失败一次却仍吃掉一个配额，而买卖共用 QMT_MAX_ORDERS_PER_DAY，会把全天下单配额耗光、连累买入侧被
+        # 「超单日上限」拦住买不进。同步失败不产生活单、不应占配额；对持续失败的刹车由连接健康承担：每次失败
+        # 已 _report_conn(False)，连续失败达 QMT_TRADE_CONN_HEARTBEAT_FAIL_THRESHOLD 即 FREEZE 停发新单。
+        self._orders_count_by_date[target_trade_date] = (
+            self._orders_count_by_date.get(target_trade_date, 0) + 1
+        )
         self._ledger.update(biz_no, order_id=order_id, state=OrderState.SUBMITTED, updated_at=self._clock.now_utc())
         # 卖单同样同步落盘 order_id（评审二轮 P1#7）：保证"券商有单"先于台账只认 PLANNED 的孤儿窗口被堵。
         self._sync_persist_before_order()

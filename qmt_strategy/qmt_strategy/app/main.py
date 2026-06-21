@@ -240,6 +240,12 @@ class Engine:
         # 交易日历不可用 fail-closed 标志（doc/29 J-3）：prewarm 校验日历无法覆盖到今天（耗尽且补取失败）→ True，
         # 今日只守仓不开新仓（next_open/T+1 映射失准下绝不盲开）。每个交易日 prewarm 据日历状态重算。
         self._calendar_unsafe = False
+        # 持仓回写脱节 fail-closed 标志（执行-7，2026-06-22）：成交回报回写持仓状态机偶发抛异常时，该笔成交
+        # 已入台账/镜像却没进持仓状态机 → 内存持仓与真实持仓脱节（典型：买入成交丢失 → 该票永不进卖出巡检、
+        # 止损/破位失效裸奔扛单）。置 True 后：① 禁开新仓（已知丢了一笔成交、状态不可信，绝不再加仓）；
+        # ② 下一轮卖出巡检先用券商权威持仓重建状态机，把丢失单元补回、恢复后清旗。回调线程置位、主线程读取
+        # 与重建（bool 读写在 GIL 下原子，足够）。
+        self._position_desync = False
         # 竞价择时关时"仅采集"留痕去抖集合（复审 P2-2）：同一票每帧重复采集会洪泛日志，每票每日只留痕一次。
         self._auction_collect_logged: set = set()
         # 编排层拒单留痕去抖集合（评审 doc/21 E1 复审）：E1 让风控/限价拒单分支每帧解锁重评以容瞬时拒因恢复，
@@ -509,8 +515,8 @@ class Engine:
 
         self._position.reconcile_stuck_selling(today, _query)
 
-    def _rebuild_positions_from_broker(self, today: date) -> None:
-        """盘前 / 重连后用 QMT 权威持仓重建 / 校准持仓状态机（评审二轮 P0#6/#29/#30/#38）。
+    def _rebuild_positions_from_broker(self, today: date) -> bool:
+        """盘前 / 重连后用 QMT 权威持仓重建 / 校准持仓状态机（评审二轮 P0#6/#29/#30/#38）。返回是否成功。
 
         业务意图：持仓状态机纯内存，进程重启清空；断线期间建仓只补采落库不回写持仓——二者都会导致隔夜
         T+1 持仓永不进卖出决策（裸奔扛单）。这里查 QMT query_stock_positions（权威全集）→ 归一 →
@@ -521,7 +527,7 @@ class Engine:
             raws = self._deps.trader.query_stock_positions(self._deps.account)
         except Exception as exc:  # noqa: BLE001 查询失败不阻断盘前装载，但强告警（漏卖风险）
             self._logger.error("engine_position_rebuild_query_failed", error=str(exc))
-            return
+            return False
         records = []
         for p in raws or []:
             try:
@@ -535,6 +541,7 @@ class Engine:
             records.append(rec)
         n = self._position.rebuild_from_broker_positions(records, today)
         self._logger.info("engine_positions_rebuilt", count=n, queried=len(records))
+        return True
 
     def _capture_day_open_equity(self, today: date) -> None:
         """抓取日初总资产作回撤基线（prewarm 调用），并持久化供同日重启复用（评审 P0-B2 + 二轮 P1#19）。
@@ -635,6 +642,12 @@ class Engine:
         if self._reconcile_blocked:
             if not quiet:
                 self._logger.error("engine_open_blocked_reconcile_unconfirmed", ts_code=ts_code)
+            return True
+        # —— 持仓回写脱节 fail-closed（执行-7）：已知有成交没进持仓状态机，内存持仓不可信 → 禁开新仓，
+        #    待下一轮卖出巡检用券商权威持仓重建补回后清旗再恢复（守仓/卖出不受影响）——
+        if self._position_desync:
+            if not quiet:
+                self._logger.error("engine_open_blocked_position_desync", ts_code=ts_code)
             return True
         # —— 交易日历不可用 fail-closed（doc/29 J-3）：日历耗尽且盘前补取失败 → T+1 映射失准 → 禁开新仓
         #    （守仓/卖出不受影响，由 run_sell_pass 照常）。
@@ -884,12 +897,20 @@ class Engine:
                     account_id=self._account_id, ts_code=ts_code, traded_id=traded_id,
                     note="成交方向不可判定(order_type 未命中映射表)，拒绝改持仓，需核对 normalize 映射表",
                 )
-        except Exception as exc:  # noqa: BLE001 回写失败不得吞掉成交落库/台账事实，仅告警
+        except Exception as exc:  # noqa: BLE001 回写失败不得吞掉成交落库/台账事实，但绝不静默放任
+            # 执行-7 修正（2026-06-22）：旧实现这里只记一条日志就放过——一笔成交（尤其买入）没进持仓状态机，
+            # 该票永不进卖出巡检、止损/破位失效裸奔扛单，且台账/镜像看着一切正常、极难发现。改为升级为
+            # CRITICAL 告警 + 置持仓脱节 fail-closed 标志：禁开新仓，并由下一轮卖出巡检用券商权威持仓重建把
+            # 丢失单元补回（不在回调线程跨线程改持仓，交主线程 run_sell_pass 处理，避免并发改持仓）。
+            self._position_desync = True
             self._logger.error(
-                "position_writeback_failed",
+                "position_writeback_failed_fail_closed",
                 account_id=self._account_id,
                 ts_code=getattr(rec, "ts_code", None),
+                side=str(getattr(rec, "trade_side", None)),
+                traded_id=getattr(rec, "traded_id", None),
                 error=str(exc),
+                note="成交未能回写持仓状态机,已置持仓脱节 fail-closed(禁开新仓+下轮券商持仓重建补回),需人工关注",
             )
 
     def _revert_sell_unit(self, ts_code: str) -> None:
@@ -1132,6 +1153,12 @@ class Engine:
         # 本轮不做卖出决策，仅等午后复牌再评（盘口只读快照不受影响）。
         if is_lunch_break(self._clock.now_utc()):
             return []
+        # 持仓脱节恢复（执行-7）：上一笔成交回写持仓失败置了脱节旗 → 在主线程先用券商权威持仓重建状态机，
+        # 把丢失的单元补回（恢复其卖出/止损覆盖），重建后清旗、恢复开仓。重建内部查询失败不抛断、保留旗位等下轮再试。
+        if self._position_desync:
+            self._logger.warn("engine_position_desync_rebuild", today=str(today))
+            if self._rebuild_positions_from_broker(today):
+                self._position_desync = False  # 重建成功才清旗、恢复开仓；失败保留旗位下轮再试
         sold: List[str] = []
         for unit in self._position.sellable_units(today):
             # 单票评估/下单异常隔离（评审复审 P1 / 二轮 #90）：任一单只票的盘口/决策/下单异常只跳过该票，

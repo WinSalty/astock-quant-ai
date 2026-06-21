@@ -252,11 +252,24 @@ def test_auction_diverge_weak_prior_clears(decider: SellDecider) -> None:
     assert action.reason == "竞价背离"
 
 
-def test_auction_fail_condition_diverge_keyword_reduces(decider: SellDecider) -> None:
-    # fail_conditions 命中背离类关键词（即便盘口 diverge=False）→ 同样作废续持转减/清。
+def test_auction_fail_condition_keyword_does_not_force_sell_on_strong_book(
+    decider: SellDecider,
+) -> None:
+    # 执行-2 修正：fail_conditions 是前瞻条件文本，不能仅凭词面命中就实时减/清。盘口高开未背离(强)时，
+    # 即便 fail_conditions 含「量价背离/弱」等字，也按实时盘口续持，不被文本误触发卖出。
     unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
-    prior = _prior(continuation_prob=Decimal("0.8"), fail_conditions=["竞价量价背离"])
+    prior = _prior(continuation_prob=Decimal("0.8"), fail_conditions=["竞价量价背离", "竞价弱于均价"])
     book = _book(open_pct=Decimal("0.05"), price_volume_diverge=False)
+    action = decider.decide_auction(unit, prior, book)
+    assert action.action is SellActionType.HOLD
+    assert action.reason == "竞价高开续持"
+
+
+def test_auction_real_book_diverge_still_reduces(decider: SellDecider) -> None:
+    # 对照：实时盘口真背离(price_volume_diverge=True) → 仍按盘口一票否决转减/清（盘口扳机不受影响）。
+    unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
+    prior = _prior(continuation_prob=Decimal("0.8"), fail_conditions=[])
+    book = _book(open_pct=Decimal("0.05"), price_volume_diverge=True)
     action = decider.decide_auction(unit, prior, book)
     assert action.reason == "竞价背离"
     assert action.action in (SellActionType.REDUCE, SellActionType.CLEAR)
@@ -344,13 +357,13 @@ def test_auction_strong_open_matched_holds(decider: SellDecider) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 补充：竞价 fail_conditions 命中弱开类关键词 → 弱开减/清
+# 执行-2 修正：盘口真弱开(open_pct<=0)才判弱开；fail_conditions 文本不再单独触发弱开
 # ---------------------------------------------------------------------------
-def test_auction_fail_condition_weak_open_keyword(decider: SellDecider) -> None:
+def test_auction_real_weak_open_reduces(decider: SellDecider) -> None:
     unit = _unit(mode=PositionMode.SIGNAL_DRIVEN)
-    # 盘口高开（open_pct>0 不弱），但 fail_conditions 命中「竞价弱于预期」弱开类 → 仍判弱开。
-    prior = _prior(continuation_prob=Decimal("0.8"), fail_conditions=["竞价弱于均价"])
-    book = _book(open_pct=Decimal("0.03"), price_volume_diverge=False)
+    # 实时盘口平开/低开（open_pct<=0）→ 弱开减/清（盘口扳机，正常生效）。
+    prior = _prior(continuation_prob=Decimal("0.8"), fail_conditions=[])
+    book = _book(open_pct=Decimal("0.0"), price_volume_diverge=False)
     action = decider.decide_auction(unit, prior, book)
     assert action.reason == "弱开"
 

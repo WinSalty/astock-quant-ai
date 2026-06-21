@@ -405,6 +405,31 @@ def test_buy_fill_writes_position_then_sellable_next_day_and_no_double_sell():
 # main._evaluate_and_sell_unit 的 book is None 分支与 test_run_sell_pass_* 系列）。
 
 
+def test_buy_writeback_failure_sets_desync_blocks_open_and_recovers():
+    """执行-7：买入成交回写持仓抛异常 → 置持仓脱节旗 + 禁开新仓；下一轮卖出巡检用券商持仓重建后清旗。"""
+    from qmt_strategy.contracts.xt_objects import FakeXtTrade
+
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    # 让买入回写持仓偶发抛异常（模拟锁内成本计算/日历等意外）。
+    def _boom(*a, **k):
+        raise RuntimeError("偶发回写异常")
+
+    eng._position.mark_position_on_fill = _boom  # type: ignore[assignment]
+    fill = FakeXtTrade(
+        account_id="acc1", stock_code="600036.SH", traded_id="TRX", order_id=1,
+        traded_price=11.00, traded_volume=1000, order_type=23,
+    )
+    eng.callback.on_stock_trade(fill)
+    # 成交未进持仓状态机，但绝不静默：置脱节 fail-closed 旗 + 禁开新仓。
+    assert eng._position_desync is True
+    assert eng._open_blocked_by_risk("600036.SH", quiet=True) is True
+    # 下一轮卖出巡检用券商权威持仓重建（fake 返回空 → 重建成功）→ 清旗、恢复开仓。
+    eng.run_sell_pass(T_BUY, books={})
+    assert eng._position_desync is False
+
+
 def test_run_sell_pass_skips_during_lunch():
     """评审 P1#11：午休(11:30–13:00)整轮跳过卖出决策，不向停牌时段下卖单。"""
     from qmt_strategy.common.time_utils import FakeClock

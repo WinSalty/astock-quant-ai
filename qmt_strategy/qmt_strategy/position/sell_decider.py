@@ -45,15 +45,10 @@ from qmt_strategy.contracts.protocols import Clock, StructLogger
 # 故以构造参数注入、给一个偏保守的默认值（0.6），便于单测固定阈值、真实落地再按战法覆写。
 _DEFAULT_CONTINUATION_HIGH = Decimal("0.6")
 
-# —— fail_conditions 关键词分类表（结构化失败条件 → 盘口比对类别）——
-# 业务意图：信号侧 fail_conditions 是结构化字符串（如「竞价弱于X% / 炸板未回封 / 题材退潮 / 量价背离」），
-# 本模块只做「类别命中」判断（命中即作废续持），不解析具体阈值（阈值在执行侧盘口信号里已加工成 bool）。
-# 背离类：竞价高开但量价不匹配（虚高 / 骤缩），对应 book.price_volume_diverge。
-_FAIL_KW_DIVERGE = ("背离", "量价", "虚高", "骤缩", "缩量")
-# 弱开类：平开 / 低开 / 竞价走弱，对应 open_pct 弱。
-_FAIL_KW_WEAK_OPEN = ("弱", "低开", "平开", "退潮", "走弱")
-# 破位 / 炸板类：盘中破位、炸板未回封等，对应 below_support / broke_board。
-_FAIL_KW_BREAK = ("破位", "破", "炸板", "开板", "封不", "回封")
+# 注（执行-2，2026-06-22）：原有「fail_conditions 关键词分类表 + _hit_fail 关键词匹配」已下线——信号侧
+# fail_conditions 是 LLM 写的前瞻条件（自然语言），不能按词面出现就当作实时已命中。实时卖出一律以实时盘口
+# OrderBook 字段（price_volume_diverge / open_pct / broke_board / below_support / volume_surge / open_times 等）
+# 为权威判据，这些字段已在盘口层把「背离/弱开/破位/炸板」等加工成 bool/数值，无需也不应再按 fail 文本触发。
 
 
 class SellDecider:
@@ -138,9 +133,14 @@ class SellDecider:
                 unit, book, prior_strong=prior_strong, reason_hold="竞价封板续持", phase="auction"
             )
 
-        # —— 扳机一：量价背离（盘口背离 或 命中 fail_conditions 背离类）→ 一票否决续持 ——
+        # —— 扳机一：量价背离（实时盘口背离）→ 一票否决续持 ——
         # 业务意图：高开但量能虚高 / 骤缩，封板预期落空，即便先验强也转减 / 清（盘口一票否决，§5.3.1）。
-        if book.price_volume_diverge or self._hit_fail(prior, _FAIL_KW_DIVERGE):
+        # 口径修正（执行-2，2026-06-22）：实时卖出扳机只认【实时盘口 OrderBook】信号，不再用关键词扫描信号侧
+        # fail_conditions 文本。fail_conditions 是 LLM 写的「未来满足什么就别续持」的前瞻条件（自然语言），不是
+        # 「现在已经弱了」的当前状态；旧实现把文本里出现「弱/退潮/缩量/量价」等字就当成实时已命中，会把当天高开
+        # 很强、未背离未炸板的票在竞价误判减/清、卖飞强势仓。这些条件本就由下方盘口字段(price_volume_diverge /
+        # is_weak_open / broke_board / below_support 等)在实时层面权威评估，无需也不应再按文本关键词触发。
+        if book.price_volume_diverge:
             return self._reduce_or_clear(
                 unit,
                 prior_strong=prior_strong,
@@ -148,8 +148,8 @@ class SellDecider:
                 phase="auction",
             )
 
-        # —— 扳机二：平开 / 低开走弱（open_pct 弱 或 命中 fail_conditions 弱开类）→ 开盘减 / 清 ——
-        if self._is_weak_open(book) or self._hit_fail(prior, _FAIL_KW_WEAK_OPEN):
+        # —— 扳机二：平开 / 低开走弱（实时盘口 open_pct 弱）→ 开盘减 / 清 ——
+        if self._is_weak_open(book):
             return self._reduce_or_clear(
                 unit,
                 prior_strong=prior_strong,
@@ -312,24 +312,6 @@ class SellDecider:
             return False
         # Decimal 直接比较（禁 float），达到「高」阈值即视为强先验。
         return cp >= self._continuation_high
-
-    def _hit_fail(self, prior: Optional[SignalPrior], keywords: tuple) -> bool:
-        """fail_conditions 是否命中某一类别（按关键词匹配结构化失败条件）。
-
-        业务意图（§5.3.1）：信号侧 fail_conditions 给出「什么情况作废续持」的结构化判据；
-        本模块只判「类别命中」——任一条目命中该类别任一关键词即视为命中（命中即作废续持）。
-        边界：prior 为空 / fail_conditions 为空 → 无失败条件，返回 False（不凭空作废续持）。
-        """
-        if prior is None or not prior.fail_conditions:
-            return False
-        for cond in prior.fail_conditions:
-            if cond is None:
-                continue
-            text = str(cond)
-            for kw in keywords:
-                if kw in text:
-                    return True
-        return False
 
     # ==================================================================
     # 盘口形态判定（只读 OrderBook，§5.8 盘口来源）

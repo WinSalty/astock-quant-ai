@@ -547,6 +547,22 @@ def test_sync_failure_keeps_order_id_none_no_index_pollution(clock_0916):
     assert ledger.get(biz).state == OrderState.ERROR
 
 
+def test_sell_sync_failure_does_not_consume_order_quota(clock_0916):
+    """执行-1：同步被拒的卖单不占单日下单配额，避免持续卖不出（跌停/拒单）耗光配额连累买入。"""
+    class FailSellTrader(FakeTrader):
+        def order_stock(self, account, stock_code, order_type, *a, **k):
+            if order_type == 24:  # 卖出方向同步拒单
+                return -1
+            return super().order_stock(account, stock_code, order_type, *a, **k)
+
+    ex = _executor(FailSellTrader(), clock_0916, settings=Settings(max_orders_per_day=1))
+    # 两次失败卖单（均同步拒）→ 不应吃掉唯一的下单配额
+    assert ex.place_sell("600036.SH", T_BUY, T_SIGNAL, 1000, Decimal("10.5"), "x") is None
+    assert ex.place_sell("600036.SH", T_BUY, T_SIGNAL, 1000, Decimal("10.5"), "x") is None
+    # 配额仍可用：买入成功（旧实现下失败卖单会各 +1 占满 max=1 → 买入被拦）
+    assert ex.place(_decision(ts_code="600000.SH")) is not None
+
+
 def test_place_sell_kill_switch_blocks(clock_0916):
     """kill_switch=True → place_sell 不下单、返回 None。"""
     trader = FakeTrader()
