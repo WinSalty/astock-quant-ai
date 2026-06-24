@@ -69,7 +69,7 @@ from ..risk.risk import Risk
 from ..auction.auction_poller import AuctionPoller
 from ..watchlist.watchlist_loader import WatchlistLoader
 
-# QMT order_stock 卖出方向常量（占位，实测以 xtconstant.STOCK_SELL 为准，与 order_executor 同口径）。
+# QMT order_stock 卖出方向常量（已实测确认 xtconstant.STOCK_SELL=24，xtquant_250516, 2026-06-24，与 order_executor 同口径）。
 XT_ORDER_TYPE_SELL = 24
 XT_PRICE_TYPE_FIX = 11
 

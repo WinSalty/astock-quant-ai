@@ -86,22 +86,23 @@ def _to_int(v: Any) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
-# 默认方向 / 状态解析器（数值映射「待目标机实测」，详见下方注释）
+# 默认方向 / 状态解析器（数值映射已实测确认 xtquant_250516, 2026-06-24，详见下方注释）
 # ---------------------------------------------------------------------------
 
-# 【待实测】QMT/xtquant 的 order_type 数值含义随版本/券商存在差异，下表为一套「合理默认假设」，
-#          目标机落地前须用 vars(obj)/dir(obj) 实测后再固化（§6.5 实测口径）。
-#          常见约定：23=股票买入、24=股票卖出；同时兼容已是标准字符串 "BUY"/"SELL" 的直传。
+# 【已实测确认 xtquant_250516, 2026-06-24】QMT/xtquant 的 order_type：23=股票买入、24=股票卖出
+#          （生产 vars(xtconstant) 核对 STOCK_BUY=23 / STOCK_SELL=24，与下表一致）；
+#          同时兼容已是标准字符串 "BUY"/"SELL" 的直传。
 _ORDER_TYPE_BUY = {23}
 _ORDER_TYPE_SELL = {24}
 
-# 【待实测】offset_flag 数值：常见 48='0' 开仓 / 49='1' 平仓（ASCII '0'/'1'），股票无开平仓概念，
-#          故 offset_flag 仅作旁证、原值落库；方向最终以 order_type 为准。本表仅在 order_type
-#          无法判定时作兜底参考，默认不依赖它判方向。
+# 【已实测确认 xtquant_250516, 2026-06-24】offset_flag：48 开仓 / 49 平仓（xtconstant OFFSET_FLAG_OPEN=48 /
+#          OFFSET_FLAG_CLOSE=49 核对一致）；股票无开平仓概念，故 offset_flag 仅作旁证、原值落库；
+#          方向最终以 order_type 为准。本表仅在 order_type 无法判定时作兜底参考，默认不依赖它判方向。
 
-# 【待实测】QMT order_status 数值 → OrderStatus 枚举。xtconstant 常见取值（随版本核对）：
+# 【已实测确认 xtquant_250516, 2026-06-24】QMT order_status 数值 → OrderStatus 枚举，生产 vars(xtconstant) 核对：
 #          48 未报 / 49 待报 / 50 已报 / 51 已报待撤 / 52 部成待撤 / 53 部撤 / 54 已撤 /
-#          55 部成 / 56 已成 / 57 废单。本表为合理默认，目标机实测后固化（§6.3 状态映射）。
+#          55 部成 / 56 已成 / 57 废单（三终态 54/56/57 无偏移），与下表一致（§6.3 状态映射）。
+#          注：255 ORDER_UNKNOWN 见下方块，常量确存；其「是否可能为活单」仍待真实盘中观测（待办 §A9②）。
 _STATUS_NUM_MAP = {
     48: OrderStatus.REPORTED,      # 未报：尚未到交易所，归入「已报」语义的前态，落 REPORTED 留痕
     49: OrderStatus.REPORTED,      # 待报
@@ -149,7 +150,7 @@ def default_side_resolver(order_type: Any, offset_flag: Any) -> TradeSide:
     业务意图：把 QMT order_type/offset_flag 映射为标准 TradeSide。
     口径优先级：
       1) order_type 已是标准字符串 "BUY"/"SELL" → 直传（兼容上游已规整）；
-      2) order_type 命中数值映射表（买 23 / 卖 24，【待实测】）→ 对应方向；
+      2) order_type 命中数值映射表（买 23 / 卖 24，已实测确认 xtquant_250516, 2026-06-24）→ 对应方向；
       3) 兜底：无法判定时返回 UNKNOWN（评审三轮 EXEC-DW-09），**绝不臆造为 BUY**——默认 BUY 会把方向不明的
          卖出成交误判为买入凭空建仓、算反持仓与资金流向。返回 UNKNOWN 由 _apply_trade_to_position 拒绝改持仓
          + 强告警，便于实测期快速发现映射表缺口。
@@ -160,7 +161,7 @@ def default_side_resolver(order_type: Any, offset_flag: Any) -> TradeSide:
         key = order_type.strip().upper()
         if key in _SIDE_STR_MAP:
             return _SIDE_STR_MAP[key]
-    # 2) 数值映射（待目标机实测固化）
+    # 2) 数值映射（已实测确认 xtquant_250516, 2026-06-24：23=买 / 24=卖）
     ot = _to_int(order_type)
     if ot is not None:
         if ot in _ORDER_TYPE_BUY:
@@ -177,7 +178,7 @@ def default_status_resolver(order_status: Any) -> OrderStatus:
     业务意图：把 QMT order_status 数值/字符串映射为 OrderStatus 枚举。
     口径优先级：
       1) 已是标准字符串（REPORTED/PART_TRADED/TRADED/CANCELLED/REJECTED/ERROR）→ 直传；
-      2) 命中数值映射表（_STATUS_NUM_MAP，【待实测】）→ 对应枚举；
+      2) 命中数值映射表（_STATUS_NUM_MAP，已实测确认 xtquant_250516, 2026-06-24）→ 对应枚举；
       3) 兜底：无法判定时落 REPORTED（在途留痕，不臆造终态），避免把未知态误当已成/已撤。
     边界：None / 非法值走兜底，不抛错。
     """
@@ -186,7 +187,7 @@ def default_status_resolver(order_status: Any) -> OrderStatus:
         key = order_status.strip().upper()
         if key in _STATUS_STR_MAP:
             return _STATUS_STR_MAP[key]
-    # 2) 数值映射（待目标机实测固化）
+    # 2) 数值映射（已实测确认 xtquant_250516, 2026-06-24：48..57 + 255 与 _STATUS_NUM_MAP 一致）
     st = _to_int(order_status)
     if st is not None and st in _STATUS_NUM_MAP:
         return _STATUS_NUM_MAP[st]

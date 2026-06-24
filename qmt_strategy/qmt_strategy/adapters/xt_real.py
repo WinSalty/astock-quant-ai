@@ -8,13 +8,20 @@
 - 在缺 xtquant 的机器上调用任何工厂会抛【清晰的 RuntimeError】，提示「请在目标机实测后运行」，
   而非深层难懂的 ImportError。
 
-==================== 待实测清单（到目标 Windows 机用 vars(obj)/dir(obj)/print 核对后固化）====================
-- xtconstant 各值：STOCK_BUY / STOCK_SELL / FIX_PRICE(限价) 及 order_status 数值映射
-  （目前 order_executor.XT_ORDER_TYPE_BUY=23 / XT_PRICE_TYPE_FIX=11、normalize._STATUS_NUM_MAP 均为占位）；
-- order_stock 真实参数顺序与含义；StockAccount 构造签名（account_id[, account_type]）；
-- 回报对象 XtTrade/XtOrder/XtAsset/XtPosition/XtOrderError/XtCancelError 的字段名（normalize 用 getattr 容错，但需核对）；
-- XtQuantTraderCallback 实际回调方法名/签名（版本差异）；
-- xtdata.get_full_tick 返回字典的键名（lastPrice/lastClose/volume/bidVol/bidPrice... 见 auction_factors）。
+==================== 实测确认状态（生产 Windows miniQMT 只读核对，xtquant_250516, 2026-06-24）====================
+【已实测确认·与代码一致，无需改取值】
+- xtconstant：STOCK_BUY=23 / STOCK_SELL=24 / FIX_PRICE=11；order_status 48..57 + 255 映射
+  （order_executor.XT_ORDER_TYPE_BUY/SELL/FIX、normalize._STATUS_NUM_MAP 全部对上）；
+- order_stock 参数顺序：(account, stock_code, order_type, order_volume, price_type, price, strategy_name='', order_remark='')；
+- StockAccount 构造：StockAccount(account_id, account_type='STOCK')（account_type 为字符串、默认 'STOCK'=纯现货；两融须传 'CREDIT'）；
+- 回报对象 XtTrade/XtOrder/XtAsset/XtPosition/XtCancelError 字段名（normalize 用 getattr 容错，核心字段全在；
+  XtOrder 无 error_id/error_msg→走 status_msg、XtPosition 无 float_profit→走 profit_rate、
+  XtOrderError 仅 order_id/error_id/error_msg/strategy_name/order_remark→靠 order_id 反查，均 getattr 兜底）；
+- XtQuantTraderCallback 回调方法名/签名：7 个 on_* 全部吻合；
+- xtdata.get_full_tick 键名（lastPrice/lastClose/volume/bidVol/bidPrice... 见 auction_factors）+ 五档为 list(best 在[0]) + volume 量纲=手。
+【仍待真实下单 / 竞价窗才能观测（见待办 §A，按零交易红线未做）】
+- A4 竞价窗(9:15-9:25) bidVol 可得性；A8 order_stock 同步失败返回值(=-1)；
+  A9 cancel 对已成/不存在单的行为 + 状态 255 是否活单；A10 券商侧 order_remark 截断。
 =============================================================================================================
 """
 
@@ -75,7 +82,7 @@ class RealXtTrader:
         self, account: Any, stock_code: str, order_type: int, order_volume: int,
         price_type: int, price: float, strategy_name: str = "", order_remark: str = "",
     ) -> int:
-        # TODO(实测)：确认真实 order_stock 参数顺序，与 xtconstant.STOCK_BUY / FIX_PRICE 取值。
+        # 已实测确认（xtquant_250516, 2026-06-24）：order_stock 参数顺序与下方调用一致；xtconstant.STOCK_BUY=23 / STOCK_SELL=24 / FIX_PRICE=11。
         return self._t.order_stock(
             account, stock_code, order_type, order_volume, price_type, price, strategy_name, order_remark
         )
@@ -180,7 +187,8 @@ def make_stock_account(account_id: str) -> Any:
     _require_xtquant()
     from xtquant.xttype import StockAccount  # 惰性 import
 
-    # TODO(实测)：StockAccount 构造参数（account_id[, account_type]）以目标机 xtquant 版本为准。
+    # 已实测确认（xtquant_250516, 2026-06-24）：StockAccount(account_id, account_type='STOCK')，单参即纯现货；
+    # account_type 为字符串、默认 'STOCK'，两融账户须显式传 'CREDIT'。
     return StockAccount(account_id)
 
 
@@ -194,7 +202,7 @@ def make_trader_callback(exec_callback: Any) -> Any:
     from xtquant.xttrader import XtQuantTraderCallback  # 惰性 import
 
     class _RealCallback(XtQuantTraderCallback):
-        # TODO(实测)：核对 XtQuantTraderCallback 实际回调方法名/签名（不同版本可能有差异）。
+        # 已实测确认（xtquant_250516, 2026-06-24）：下列 7 个 on_* 方法名/签名与 XtQuantTraderCallback 一致。
         def on_stock_trade(self, trade):
             exec_callback.on_stock_trade(trade)
 
@@ -223,7 +231,8 @@ def import_xtdata() -> Any:
     """返回真实 xtdata 模块（其 get_full_tick / subscribe_quote 即 XtDataLike）。
 
     用法：``XtdataTickSource(import_xtdata())`` 注入给 AuctionPoller。
-    TODO(实测)：核对 xtdata.get_full_tick(code_list) 签名与返回字典键名。
+    已实测确认（xtquant_250516, 2026-06-24）：get_full_tick(code_list) 返回 {code: tick dict}，键名
+    lastPrice/lastClose/volume/bidVol/bidPrice... 与 auction_factors 取值一致。
     """
     _require_xtquant()
     from xtquant import xtdata  # 惰性 import

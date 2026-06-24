@@ -53,7 +53,7 @@ def _best_level(value: object) -> object:
     原实现把它当标量直接喂 _to_decimal → Decimal(str(list)) 抛 InvalidOperation 被吞→None，导致一字/
     竞价封板（bidVol 实为大数组）时虚拟封单恒为 0。这里统一取 best 档：list/tuple 取首元素、标量原样、
     空/None 返回 None。
-    实测口径：目标机用 vars(tick) 核对 get_full_tick 实际键名与五档结构后固化（键名仍为占位）。
+    已实测确认（生产 get_full_tick, xtquant_250516, 2026-06-24）：bidVol/bidPrice/askVol/askPrice 确为五档 list、best 在 [0]（买价降序、卖价升序证实），键名与本模块取值一致。
     """
     if isinstance(value, (list, tuple)):
         return value[0] if value else None

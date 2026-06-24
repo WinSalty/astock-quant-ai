@@ -34,12 +34,12 @@ from ..contracts.models import EntryDecision, LedgerEntry
 from ..contracts.protocols import Clock, LocalLedger, StructLogger, XtTraderLike
 
 # QMT order_stock 入参整型常量。
-# 业务说明：真实 xtconstant 取值须在实盘 Windows miniQMT 用 vars(xtconstant) 实测确认（§6.0），
-# 此处按设计文档建议先用占位值（STOCK_BUY=23 为常见取值，FIX_PRICE 限价=11 为常见取值），
-# 落地前以实测为准；本类只通过这两个常量与 trader 交互，改动只需调这里。
-XT_ORDER_TYPE_BUY = 23          # 买入方向（占位，实测以 xtconstant.STOCK_BUY 为准）
-XT_ORDER_TYPE_SELL = 24         # 卖出方向（占位，实测以 xtconstant.STOCK_SELL 为准）
-XT_PRICE_TYPE_FIX = 11          # 限价委托（占位，实测以 xtconstant.FIX_PRICE 为准）
+# 业务说明：取值已在生产 Windows miniQMT 用 vars(xtconstant) 只读实测确认（xtquant_250516, 2026-06-24）：
+# STOCK_BUY=23 / STOCK_SELL=24 / FIX_PRICE=11，与此处完全一致；本类只通过这三个常量与 trader 交互，
+# 若将来 xtquant 版本变更，改动只需调这里。
+XT_ORDER_TYPE_BUY = 23          # 买入方向（已实测确认 xtconstant.STOCK_BUY=23，xtquant_250516, 2026-06-24）
+XT_ORDER_TYPE_SELL = 24         # 卖出方向（已实测确认 xtconstant.STOCK_SELL=24，xtquant_250516, 2026-06-24）
+XT_PRICE_TYPE_FIX = 11          # 限价委托（已实测确认 xtconstant.FIX_PRICE=11，xtquant_250516, 2026-06-24）
 
 # 一字 / 秒封场景下的「整手」单位：A 股最小买入单位 100 股。
 _BOARD_LOT = 100
