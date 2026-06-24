@@ -89,7 +89,7 @@
 | 调度器 + xtquant 适配器模板 + 真实入口骨架 | ✅ 已落地（待目标机填 `TODO(实测)`）；交易日历已改 fail-closed（部署须知见 [待办 §B](待办与上线验证清单.md)） |
 | 信号侧 HTTP 双接口 + `qmt_*` 表/迁移 + 客户端 | ✅ 已落地；评审补回流信封一致校验、watchlist 竞价两因子供数（见状态概要） |
 | 信号侧生产部署 + 内网 token + 复盘看板 | ✅ 已上线（2026-06-14 首部署；2026-06-18 增量同步：信号侧代码/迁移=最新(0057)、**ingest 写 token 已补配（两接口全开）**；执行侧 Windows 已 ff 到 main 最新 `21efdcb`+**风控两闸已配**，仍仅差 miniQMT，见 [待办 §G](待办与上线验证清单.md)） |
-| 实盘对接（miniQMT/xtquant + 调度任务计划 + 实测） | 🟡 **2026-06-18 晚 模拟上线配置完成（交易通道保持关）**：miniQMT 已装+登录（`userdata_mini=C:\qmtrun\userdata_mini` 纯英文）、`xtquant-250516.1.1` 接入 venv、`run_qmt.bat` 已填 `QMT_ACCOUNT_ID`/`QMT_MINI_PATH`；实测（只读零下单）xtdata 取真实快照 + xttrader connect rc=0/账户确认 + `build_real_engine` collect-only 装配 OK。**剩**：交易日手动 collect-only 实地观察 → 计划任务注册 → §A 真机固化 → go/no-go 后才开 `KILL_SWITCH`。详见 [待办 §G](待办与上线验证清单.md) + 运维手册 §F |
+| 实盘对接（miniQMT/xtquant + 调度任务计划 + 实测） | 🟡 **2026-06-18 晚 模拟上线配置完成（交易通道保持关）**：miniQMT 已装+登录（`userdata_mini=C:\qmtrun\userdata_mini` 纯英文）、`xtquant-250516.1.1` 接入 venv、`run_qmt.bat` 已填 `QMT_ACCOUNT_ID`/`QMT_MINI_PATH`；实测（只读零下单）xtdata 取真实快照 + xttrader connect rc=0/账户确认 + `build_real_engine` collect-only 装配 OK。**2026-06-24 §A 只读口径已实测确认**（A1–A7/A10 在生产 `xtquant_250516` 与代码占位值完全一致、全程零下单，见 [待办 §A](待办与上线验证清单.md) 与 [doc/33](33-生产部署核对与QMT执行侧口径实测确认-20260624.md)）。**剩**：交易日手动 collect-only 实地观察 → 计划任务注册 → §A 残留项（A4 竞价窗 / A8 / A9 / A10 截断）随首批真实委托核对 → go/no-go 后才开 `KILL_SWITCH`。详见 [待办 §G](待办与上线验证清单.md) + 运维手册 §F |
 
 代码仓库：执行侧 [github.com/WinSalty/astock-quant-ai](https://github.com/WinSalty/astock-quant-ai)。
 
