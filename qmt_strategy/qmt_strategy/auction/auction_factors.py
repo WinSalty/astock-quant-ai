@@ -54,6 +54,13 @@ def _best_level(value: object) -> object:
     竞价封板（bidVol 实为大数组）时虚拟封单恒为 0。这里统一取 best 档：list/tuple 取首元素、标量原样、
     空/None 返回 None。
     已实测确认（生产 get_full_tick, xtquant_250516, 2026-06-24）：bidVol/bidPrice/askVol/askPrice 确为五档 list、best 在 [0]（买价降序、卖价升序证实），键名与本模块取值一致。
+    ⚠️ 集合竞价段口径补充（2026-06-26 竞价窗 9:19/9:21 两快照实测，待负责人决策）：连续竞价时段 [0]=真买一/卖一（五档真实
+    递价），_best_level 取 [0] 正确；但**集合竞价(9:15-9:25)时段 get_full_tick 布局不同**——bidPrice[0]=askPrice[0]=lastPrice
+    =虚拟开盘价、[1..4] 价位为 0 占位；bidVol[0]==askVol[0]=虚拟匹配量（14 票含非涨停票全对称证实），**净未匹配残余落
+    level[1]**（价位槽=0，随买/卖强弱出现在对应侧）。故竞价段对涨停封板票，**真实虚拟封单是买侧残余 bidVol[1] 而非
+    bidVol[0]（=匹配量）**——本 _best_level 取 [0] 在竞价段会把封单误读成匹配量（如 600228：bidVol[0]=878 vs 买侧残余
+    bidVol[1]=293262，差 ~300 倍）。竞价段虚拟封单口径须先按 待办 §A/§0 决策再启用竞价择时（当前 AUCTION_TIMING_ENABLED
+    =false 未启用，virtual_seal 竞价段结果不被消费，无在线影响；连续竞价封板检测不受影响）。
     """
     if isinstance(value, (list, tuple)):
         return value[0] if value else None
