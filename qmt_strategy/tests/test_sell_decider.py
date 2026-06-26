@@ -533,3 +533,15 @@ def test_auction_missing_open_pct_but_sealed_not_treated_missing(decider: SellDe
     book = _book(is_sealed=True, seal_to_float_ratio=Decimal("0.05"))
     action = decider.decide_auction(unit, _prior(continuation_prob=Decimal("0.8")), book)
     assert action.reason != "盘口缺失,安全默认不卖"
+
+
+def test_auction_missing_book_with_valid_last_price_holds_not_clear(decider: SellDecider) -> None:
+    """评审修复 SELL-1：build_sell_books 会丢弃 last_price=None 的票，故传进 decide_* 的盘口 last_price 必非 None。
+    原 _is_book_missing 多绑 `last_price is None` 一项 → 恒不触发（死守卫）。现价有效但仅缺昨收(open_pct=None)、
+    无任何结构性卖出信号、先验弱的票，旧实现会落「弱开」CLEAR 卖飞；修复后命中缺失守卫 → 安全默认 HOLD。"""
+    unit = _unit(mode=PositionMode.TECH_EXIT)
+    # 现价有效（非 None，模拟真实入参）、open_pct None（缺昨收）、全结构布尔 False、open_times 0、先验弱(None)。
+    book = _book(last_price=Decimal("10.50"), open_pct=None)
+    action = decider.decide_auction(unit, None, book)
+    assert action.action is SellActionType.HOLD
+    assert action.reason == "盘口缺失,安全默认不卖"

@@ -56,6 +56,10 @@ def build_upsert(table: str) -> Tuple[str, List[str]]:
             sets.append(f"{c}=excluded.{c}")
     if has_synced:
         sets.append("synced=0")  # 数据变更 → 重新标记待同步（再同步对远端幂等，安全）
+        # 乐观锁版本号自增（评审修复 SYNC-1）：每次 upsert（含盘后同步窗内迟到回报覆盖本行）都把 row_version+1。
+        # 盘后 mark_synced 以「SELECT 时读到的 row_version」做 CAS 守卫——若读后该行被改写过（版本已变），
+        # mark_synced 命中 0 行、不会把「未推到远端的最新数据」误标为已同步（原仅 synced=0 守卫挡不住 0→0 的重写）。
+        sets.append(f"row_version = {table}.row_version + 1")
 
     sql = (
         f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders}) "

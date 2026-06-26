@@ -92,6 +92,9 @@ class SqliteQmtRepository:
         - 只打 cancel_failed/error_*，绝不动 order_status（撤单失败不改变委托既有终态语义）；
         - error_id / error_msg 用 COALESCE，传 None 时保留库内既有值（不被空覆盖）；
         - synced=0 重新标记「待同步回远端」（变更需重新同步，对远端幂等安全）；
+        - row_version 自增（评审修复 SYNC-1 / A1）：本路径与 build_upsert 同为「重置 synced=0」的写入者，必须一并
+          自增版本号，否则盘后 sync 的 CAS 守卫（synced=0 AND row_version=读时版本）会因 0→0、版本未变而误命中，
+          把这条迟到撤单失败带回的 cancel_failed/error_* 误标 synced=1、永不再推远端（远端长期停在撤单失败前旧态）；
         - 同样经写队列入队，绝不在调用线程执行 UPDATE。
 
         跨日防误标（评审 medium#5）：QMT order_id 按交易日重置可跨日复用，而唯一键含 trade_date。
@@ -100,7 +103,8 @@ class SqliteQmtRepository:
         """
         sql = (
             "UPDATE qmt_order SET cancel_failed=1, "
-            "error_id=COALESCE(?, error_id), error_msg=COALESCE(?, error_msg), synced=0 "
+            "error_id=COALESCE(?, error_id), error_msg=COALESCE(?, error_msg), synced=0, "
+            "row_version = row_version + 1 "  # SYNC-1/A1：与 build_upsert 同步自增，避免 0→0 重写绕过 mark_synced 的 CAS
             "WHERE account_id=? AND order_id=? AND trade_date=("
             "  SELECT MAX(trade_date) FROM qmt_order WHERE account_id=? AND order_id=?)"
         )

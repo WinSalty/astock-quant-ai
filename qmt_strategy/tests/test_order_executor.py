@@ -1020,3 +1020,42 @@ def test_buy_missing_plan_volume_fail_closed(clock_0916):
     assert biz is None                      # fail-closed 拒单
     assert trader.order_calls == []         # 未真正下单
     assert "order_missing_plan_volume_fail_closed" in logger.events()
+
+
+# ---------------------------------------------------------------------------
+# 评审修复 ORD-1/ORD-2：TTL 撤单后重读权威台账态——撤单期间已成交则不降级、不转次优
+# ---------------------------------------------------------------------------
+def test_ttl_cancel_reread_terminal_no_downgrade_no_next_best(clock_0916):
+    """撤单与成交回报跨线程并发：撤单瞬间该买单被迟到全额成交推进到 TRADED。on_ttl_expired 撤单后重读权威台账，
+    发现已 TRADED → ① 不据陈旧 filled==0 转次优(ORD-1，否则在已成仓之上再建次优仓重复建仓)；
+    ② 不裸 update 置 CANCELLING 降级已成终态(ORD-2，否则收盘对账态非 TRADED、对已无活动委托单反复重撤)。"""
+    ledger = InMemoryLocalLedger()
+
+    class FillOnCancelTrader(FakeTrader):
+        """模拟撤单/成交券商侧竞态：cancel 调用瞬间该单被另一线程的成交回报全额成交（add_fill→TRADED）。"""
+
+        def __init__(self, ledger, **kw):
+            super().__init__(**kw)
+            self._ledger = ledger
+            self._fired = False
+
+        def cancel_order_stock(self, account, order_id):
+            if not self._fired:
+                self._fired = True
+                # 全额成交（主决策 plan_volume=1000）→ 台账推进 TRADED，模拟成交回报先于撤单收口落地。
+                self._ledger.add_fill(order_id, "race-fill", 1000, Decimal("11.00"))
+            return super().cancel_order_stock(account, order_id)
+
+    trader = FillOnCancelTrader(ledger)
+    ex = _executor(trader, clock_0916, ledger=ledger)
+    nb = _decision(ts_code="000001.SZ")             # 次优候选（与主标的不同票）
+    biz = ex.place(_decision(next_best=(nb,)))      # 主标的 → SUBMITTED、order_id 分配、filled 0
+    n_orders_before = len(trader.order_calls)       # =1（仅主标的下单）
+
+    ex.on_ttl_expired(biz)
+
+    # ORD-2：撤单期间已成交 → 重读 TRADED，绝不被无终态守卫的 update 降级为 CANCELLING。
+    assert ledger.get(biz).state is OrderState.TRADED
+    # ORD-1：据权威 filled>0（已成）不转次优，绝不为次优 000001.SZ 再下单。
+    assert len(trader.order_calls) == n_orders_before
+    assert all(c["stock_code"] != "000001.SZ" for c in trader.order_calls)

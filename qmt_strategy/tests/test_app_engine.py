@@ -14,9 +14,9 @@ from qmt_strategy.app.main import EngineDeps, build_engine
 from qmt_strategy.common.logger import RecordingLogger
 from qmt_strategy.common.time_utils import FakeClock
 from qmt_strategy.config.settings import Settings
-from qmt_strategy.contracts.enums import AuctionPhase, CentroidTrend, EntryAction
-from qmt_strategy.contracts.models import AuctionSnapshot
-from qmt_strategy.contracts.xt_objects import FakeStockAccount, FakeXtAsset
+from qmt_strategy.contracts.enums import AuctionPhase, CentroidTrend, EntryAction, PositionState
+from qmt_strategy.contracts.models import AuctionSnapshot, PositionUnit
+from qmt_strategy.contracts.xt_objects import FakeStockAccount, FakeXtAsset, FakeXtOrder
 from qmt_strategy.data_writer.repository import InMemoryQmtRepository
 from qmt_strategy.watchlist.sources import CallableSelectedStockSource
 from tests.conftest import T_BUY, T_SIGNAL, make_selected_row, utc_at_east8
@@ -592,3 +592,61 @@ def test_on_reconnect_backfill_reconciles_stuck_selling_after_rebuild():
     eng.on_reconnect_backfill()
     assert [x[0] for x in order] == ["rebuild", "reconcile"]   # 补调了卡死 SELLING 对账，且在 rebuild 之后
     assert order[0][1] == order[1][1]                          # 同一交易日
+
+
+# ---------------------------------------------------------------------------
+# 评审修复 ROUTE-1：竞价择时关时，CHASE_AUCTION_STRONG 定盘段(OPENING) 一并关停、不实盘下单
+# ---------------------------------------------------------------------------
+def _strong_settled_snap():
+    """强开越竞越强、处于定盘段(SETTLED,≥9:25)的快照：CHASE_AUCTION_STRONG 应判买、order_phase=OPENING。"""
+    return AuctionSnapshot(
+        ts_code="600036.SH", phase=AuctionPhase.SETTLED, ts=utc_at_east8(T_BUY, 9, 25, 30),
+        open_pct=Decimal("0.10"), auction_vol_ratio=Decimal("0.5"), auction_centroid=Decimal("10.50"),
+        centroid_trend=CentroidTrend.UP, is_limit_up=False, last_price=Decimal("10.50"),
+        pre_close=Decimal("10.00"),
+    )
+
+
+def test_chase_strong_settled_opening_gated_when_timing_disabled():
+    """竞价择时关(默认) → CHASE_AUCTION_STRONG 在定盘段以 OPENING 身份也被门控、不下单（修复前此处会真金建仓 1 笔）。"""
+    deps = _deps()  # auction_timing_enabled 默认 False
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    eng._router_sink(_strong_settled_snap())
+    assert deps.trader.order_calls == []
+
+
+def test_chase_strong_settled_opening_places_when_timing_enabled():
+    """对照：竞价择时开 → 同一定盘段 OPENING 强开决策正常下单（证明门控是唯一拦截点，定盘段链路本身可达 place）。"""
+    deps = _deps({"QMT_AUCTION_TIMING_ENABLED": "true"})
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    eng._router_sink(_strong_settled_snap())
+    assert len(deps.trader.order_calls) == 1
+    code, _otype, vol = deps.trader.order_calls[0]
+    assert code == "600036.SH" and vol > 0
+
+
+# ---------------------------------------------------------------------------
+# 评审修复 state_by_code：同票『已成卖单 + 已撤卖单』并存时，成交优先于撤单、卡死对账不误复位
+# ---------------------------------------------------------------------------
+def test_reconcile_stuck_selling_filled_not_overridden_by_cancelled():
+    """同票当日一张已成(56)卖单 + 一张已撤(54)卖单：聚合不让撤单盖掉成交 → SELLING 单元不被复位（否则对已卖出
+    标的复位回 HOLDING 重挂卖单=废单/超卖/白占配额）。修复前撤废错一律覆盖 → 误判零成交撤单复位。"""
+    deps = _deps()
+    eng = build_engine(deps)
+    eng.prewarm(T_BUY)
+    # 造一个跨日卡死的 SELLING 单元（隔夜可卖、卖出回执断线丢失，本地仍卡 SELLING）
+    eng._position._units[("acc1", "600036.SH")] = PositionUnit(
+        account_id="acc1", ts_code="600036.SH", volume=1000, can_use_volume=1000,
+        avg_cost=Decimal("10.00"), earliest_sellable_date=T_BUY,
+        state=PositionState.SELLING, buy_date=T_BUY,
+    )
+    # 券商委托：同票一张已成(56=TRADED→FILLED) + 一张已撤(54=CANCELLED) 卖单(order_type=24)
+    deps.trader.query_stock_orders = lambda account: [
+        FakeXtOrder(stock_code="600036.SH", order_type=24, order_status=56),
+        FakeXtOrder(stock_code="600036.SH", order_type=24, order_status=54),
+    ]
+    eng._reconcile_stuck_selling(T_BUY)
+    # 成交优先于撤单 → 不复位，单元仍 SELLING（修复前会被误复位为 HOLDING）
+    assert eng._position.get_unit("acc1", "600036.SH").state is PositionState.SELLING

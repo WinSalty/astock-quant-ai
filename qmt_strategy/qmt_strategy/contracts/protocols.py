@@ -232,6 +232,11 @@ class LocalLedger(Protocol):
 
     def update(self, biz_order_no: str, **fields: Any) -> None: ...
 
+    def mark_cancelling(self, biz_order_no: str, *, updated_at: Any) -> bool:
+        """带终态守卫的「在途 → CANCELLING」原子转换（评审修复 ORD-2）。仅可撤在途态才转并返回 True，
+        已成/终态返回 False（不降级、调用方据此不转次优）。实现须保证「判终态 + 置 CANCELLING」与成交回报同临界区。"""
+        ...
+
     def sync_status(self, order_id: int, state: OrderState, msg: Optional[str] = None) -> None: ...
 
     def add_fill(

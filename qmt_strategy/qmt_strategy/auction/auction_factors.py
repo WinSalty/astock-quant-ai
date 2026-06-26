@@ -131,22 +131,45 @@ def auction_centroid(
     weighted_sum = Decimal("0")  # Σ(price_i × Δvol_i)
     total_delta = Decimal("0")   # Σ(Δvol_i)
     last_price: Optional[Decimal] = None  # 末帧价，用于判趋势
-
-    for i in range(1, len(frames)):
-        prev_v = _to_decimal(frames[i - 1].get("volume"))
+    # 单调基准口径（评审修复 AUC-2，对抗复核校准）：累计量 volume 物理上单调不减，故只把「超过历史最高累计量
+    # baseline 的部分」当作真实新增成交量计权。原实现按【严格相邻两帧】算 Δvol，遇某帧 volume 瞬时回退（行情抖动 /
+    # 降级补帧脏值）时只跳过当帧、却把回退小值留作下一帧基准 → 下一帧 Δvol = 正常累计量 − 回退小值 被人为放大成
+    # 虚假巨量增量、以超大权重灌进重心，污染整段 centroid_trend。改用单调基准（回退帧不下调基准）即根除该放大。
+    # 口径差异声明（避免「与原实现完全等价」的误读）：
+    #   - 对【严格单调递增且每帧都有量】的正常序列，本实现与原严格相邻差分给出相同结果；
+    #   - 对【非单调（回退/glitch）】序列，本实现只认超过历史最高累计量的增量（更贴合累计量单调性），与原朴素
+    #     相邻差分【有意不同】——这是修正而非回归（例如 100→200→150→400：本实现末帧 Δ=400−200=200，原实现
+    #     Δ=400−150=250 被回退值放大；又如 200→150→180：本实现判 None/FLAT 不在脏数据上臆造趋势）；
+    #   - 对【缺量帧（volume 为 None，tick 在场但量字段缺，§3.7 降级 B）】：断链（基准复位 None），不跨越未知间隙
+    #     桥接出增量——避免把缺量两侧累计量直接相减、以单帧价计权污染重心；与原实现「缺量帧断开增量链」一致。
+    #   - 对【价缺帧（volume 真增但 lastPrice 缺）】：该段量增不计权、但基准仍前推消费掉（之后不补算）——与原实现
+    #     一致（无价无从加权）；连续多帧价缺时这部分量对重心零贡献，属已知口径而非补算遗漏。
+    #   - 成交量加权固有性质（评审复核 B4）：早段大增量会主导重心、后续小增量影响弱（如 0→1万手@20→+100手@5，
+    #     重心≈贴近 20）；这是「量加权中心」的定义本身、有意口径，非缺陷。
+    baseline: Optional[Decimal] = None
+    n = len(frames)
+    for i in range(n):
         cur_v = _to_decimal(frames[i].get("volume"))
         price_i = _to_decimal(frames[i].get("lastPrice"))
         # 末帧价取序列最后一帧的 lastPrice（可能为 None，留待后续判断）。
-        if i == len(frames) - 1:
+        if i == n - 1:
             last_price = price_i
-        # 累计量增量：任一帧缺 volume 或为负增量（数据异常/重置）则跳过该帧权重。
-        if prev_v is None or cur_v is None or price_i is None:
+        if cur_v is None:
+            baseline = None  # 缺量帧断链：复位基准，下一有量帧重新起算，不跨未知间隙桥接增量（与原实现一致）
             continue
-        delta = cur_v - prev_v
+        if baseline is None:
+            baseline = cur_v  # 首个有量帧（或缺量断链后的首个有量帧）作基准，无前序增量
+            continue
+        delta = cur_v - baseline
         if delta <= 0:
+            # 累计量未增 / 回退（脏值 / 重置）：不计权重；关键——基准【不】下调到回退值，否则其后第一帧
+            # Δvol 会被放大（AUC-2）。基准保持在上一更高值。
             continue
-        weighted_sum += price_i * delta
-        total_delta += delta
+        # 真正的正增量：仅在有价时计入权重，并把基准前推到当前累计量（消费这段增量，避免被下一帧重复计入）。
+        if price_i is not None:
+            weighted_sum += price_i * delta
+            total_delta += delta
+        baseline = cur_v
 
     # 全程无正增量（竞价量拿不到 / 量未变）→ 重心无法定义。
     if total_delta == 0:

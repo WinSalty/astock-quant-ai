@@ -130,6 +130,27 @@ class InMemoryLocalLedger:
         # order_id 可能由 None 变为下单返回值，或被修正：重建该 entry 的 order_id 反查格。
         self._index_order_id(e)
 
+    def mark_cancelling(self, biz_order_no: str, *, updated_at: Any) -> bool:
+        """带终态守卫的「在途 → CANCELLING」原子转换（评审修复 ORD-2 / A3）。
+
+        业务意图：on_ttl_expired 撤单后要把单元置 CANCELLING，但成交回报跑在另一线程、可能恰在「读到非终态」与
+        「写入 CANCELLING」之间把该单 add_fill 收口为 TRADED。普通 update 是无守卫裸 setattr，会把已成单降级覆盖回
+        CANCELLING（H-1 类危害：收盘对账态非 TRADED、对已无活动委托单反复重撤）。本方法把「判终态 + 置 CANCELLING」
+        收进同一临界区（PersistentLocalLedger 以 self._lock 包裹本方法、add_fill 同锁），消除该读写竞态。
+
+        口径：仅当当前态属【可撤在途】(SUBMITTED/REPORTED/PART_TRADED) 才转 CANCELLING 并返回 True；
+        其余（已 TRADED/PART_CANCELLED 收口、已 CANCELLED/REJECTED/ERROR 终态、或上一轮遗留的 CANCELLING）一律
+        【不改状态】返回 False，由调用方据此不降级、不转次优。台账无该单亦返回 False。
+        """
+        e = self._by_biz.get(biz_order_no)
+        if e is None:
+            return False
+        if e.state not in (OrderState.SUBMITTED, OrderState.REPORTED, OrderState.PART_TRADED):
+            return False
+        e.state = OrderState.CANCELLING
+        e.updated_at = updated_at
+        return True
+
     def sync_status(self, order_id: int, state: OrderState, msg: Optional[str] = None) -> None:
         """按 order_id 同步委托状态（on_stock_order 驱动）。台账无该 order_id 则忽略（防越权改写）。
 
@@ -218,9 +239,14 @@ class InMemoryLocalLedger:
         # 但状态保持 PART_CANCELLED 终态，绝不被重新推回 PART_TRADED 而复活 TTL 重撤循环。
         if e.state not in (OrderState.TRADED, OrderState.PART_CANCELLED):
             if e.plan_volume and new_vol >= e.plan_volume:
+                # 全成：即便处于 CANCELLING（撤单在途），全额成交后撤单必被券商以「已成」拒绝，收口 TRADED 正确。
                 e.state = OrderState.TRADED
-            elif new_vol > 0:
+            elif new_vol > 0 and e.state != OrderState.CANCELLING:
                 e.state = OrderState.PART_TRADED
+            # CANCELLING 单的【部分】成交（评审复核二轮 MEDIUM）：累计 filled/均价（成交是真实事实），但状态保持
+            # CANCELLING——绝不回退到 PART_TRADED。否则该单重新落入 on_ttl_expired 可撤集合(SUBMITTED/REPORTED/
+            # PART_TRADED) → 每个宽限期对同一委托重复发撤单（doc/21 B1「无界重复撤单」的另一触发路径）。撤单回执
+            # 到达后由 sync_status 据 CANCELLED+filled>0 收口为 PART_CANCELLED 终态。
         # 返回新计入的明细，供持久层落 local_order_fill（仅本次真正去重通过的成交）。
         return (biz, dedup_key, vol, traded_price)
 

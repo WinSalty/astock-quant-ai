@@ -230,6 +230,19 @@ class PersistentLocalLedger:
             self._mem.update(biz_order_no, **fields)
             self._mirror(self._mem.get(biz_order_no))
 
+    def mark_cancelling(self, biz_order_no: str, *, updated_at: Any) -> bool:
+        """带终态守卫的「在途 → CANCELLING」原子转换（评审修复 ORD-2 / A3）。
+
+        在 self._lock 临界区内做内存层的「判终态 + 置 CANCELLING」，与 add_fill / sync_status 同锁——
+        消除 on_ttl_expired「重读判非终态 → 写 CANCELLING」之间被并发成交回报降级已成单的读写竞态。
+        转换成功才镜像落盘；返回是否真正转入 CANCELLING（False=已终态/未知单，调用方据此不降级、不转次优）。
+        """
+        with self._lock:
+            ok = self._mem.mark_cancelling(biz_order_no, updated_at=updated_at)
+            if ok:
+                self._mirror(self._mem.get(biz_order_no))
+            return ok
+
     def sync_status(self, order_id: int, state: OrderState, msg: Optional[str] = None) -> None:
         """按 order_id 同步委托状态：内存收口后镜像。
 

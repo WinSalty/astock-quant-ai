@@ -585,3 +585,57 @@ def test_poll_once_push_failure_isolated_and_history_committed():
     assert len(poller._history["000001.SZ"]) == 1
     # (d) 单票 push 失败留痕
     assert "auction_router_push_failed" in logger.events()
+
+
+# ---------------------------------------------------------------------------
+# 评审修复 AUC-2：累计量瞬时回退后，其后第一帧 Δvol 不被放大（基准不下调）
+# ---------------------------------------------------------------------------
+def test_auction_centroid_volume_dip_does_not_inflate_next_delta():
+    """frames volume=[100,200,150,400] price=[10,20,30,40]：
+    150<200 为累计量回退（行情抖动/降级补帧脏值），旧实现把 150 留作基准 → 末帧 Δvol=400-150=250 被放大；
+    修复后基准保持上一更高值 200 → 末帧 Δvol=400-200=200。
+    重心 = Σ(price·Δvol)/ΣΔvol = (20·100 + 40·200)/(100+200) = 10000/300（旧实现为 12000/350）。"""
+    prev = [
+        {"volume": 100, "lastPrice": 10.0},
+        {"volume": 200, "lastPrice": 20.0},
+        {"volume": 150, "lastPrice": 30.0},  # 累计量回退帧
+    ]
+    cur = {"volume": 400, "lastPrice": 40.0}
+    centroid, trend = auction_centroid(prev, cur)
+    assert centroid == Decimal("10000") / Decimal("300")   # 非旧实现的 12000/350
+    assert trend is CentroidTrend.UP                        # 末帧价 40 > 重心≈33.3
+
+
+def test_auction_centroid_missing_volume_frame_breaks_chain():
+    """评审修复 AUC-2（对抗复核校准）：中间帧 volume 缺失(None，§3.7 降级 B 下 tick 在场但量字段缺) → 断链，
+    不跨未知间隙把 300-100=200 桥接成一段增量灌入重心。frames volume=[100, None, 300] → 无可计权增量 → (None, FLAT)，
+    与原严格相邻实现一致（缺量帧断开增量链）。"""
+    prev = [{"volume": 100, "lastPrice": 10.0}, {"volume": None, "lastPrice": 10.5}]
+    cur = {"volume": 300, "lastPrice": 11.0}
+    centroid, trend = auction_centroid(prev, cur)
+    assert centroid is None
+    assert trend is CentroidTrend.FLAT
+
+
+# ---------------------------------------------------------------------------
+# 评审修复 AUC-1：进入定盘段(SETTLED,≥9:25)首轮清空累积历史，切断 9:25 竞价虚拟量→开盘实现量的跳变污染
+# ---------------------------------------------------------------------------
+def test_poller_resets_history_at_settled_boundary():
+    plans = {"600000.SH": make_plan_row("600000.SH", first_board_vol=100000)}
+    tsrc = FakeTickSource(fixed={"600000.SH": {"lastPrice": 12.0, "lastClose": 10.0, "volume": 100}})
+    poller, _, _ = _make_poller(tsrc, plans, utc_at_east8(D, 9, 16, 0))
+    # 竞价锁定段两轮：历史累积、未触发定盘重置
+    poller.poll_once(utc_at_east8(D, 9, 22, 0))
+    poller.poll_once(utc_at_east8(D, 9, 23, 0))
+    assert len(poller._history.get("600000.SH", [])) == 2
+    assert poller._settled_history_reset_done is False
+    # 进入定盘段首轮：清空历史后仅留本定盘帧（开盘后重心从定盘帧起算，不含竞价虚拟量）
+    poller.poll_once(utc_at_east8(D, 9, 25, 30))
+    assert poller._settled_history_reset_done is True
+    assert len(poller._history.get("600000.SH", [])) == 1
+    # 定盘段后续轮：不再重复清空，正常累积
+    poller.poll_once(utc_at_east8(D, 9, 26, 0))
+    assert len(poller._history.get("600000.SH", [])) == 2
+    # 跨日盘前 reset_history 复位标志（新交易日竞价段帧重新参与重心、直到次日 9:25 再清）
+    poller.reset_history()
+    assert poller._settled_history_reset_done is False

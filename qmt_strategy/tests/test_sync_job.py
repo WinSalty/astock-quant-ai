@@ -297,3 +297,62 @@ def test_run_only_picks_target_date(db_and_wq):
     # 远端未收到任何记录；T_BUY 行仍 synced=0（没被误同步）。
     assert len(remote.get_trades(ACCOUNT_ID, T_BUY)) == 0
     assert _count_synced(db, "qmt_trade", 0) == 1
+
+
+# ---------------------------------------------------------------------------
+# 评审修复 SYNC-1：mark_synced 的 row_version CAS 守卫挡住「POST 后被迟到回报改写」的误标
+# ---------------------------------------------------------------------------
+class _BumpRowVersionRemote(InMemoryQmtRepository):
+    """模拟盘后同步窗内迟到回报：upsert_order 被调用(=POST 成功)后，立即对本地同一行做一次写入
+    （row_version+1、synced 重置 0），模拟『SELECT 读到旧版本 → POST(旧值) → mark_synced 前该行被改写为新值』。"""
+
+    def __init__(self, db, account_id, trade_date, order_id):
+        super().__init__()
+        self._db = db
+        self._acc = account_id
+        self._td = trade_date.isoformat()
+        self._oid = order_id
+        self._fired = False
+
+    def upsert_order(self, rec):
+        super().upsert_order(rec)  # POST 成功（远端落到旧值 V1）
+        if not self._fired:
+            self._fired = True
+            conn = sqlite3.connect(self._db)
+            try:
+                conn.execute(
+                    "UPDATE qmt_order SET row_version = row_version + 1, synced = 0 "
+                    "WHERE account_id=? AND trade_date=? AND order_id=?",
+                    (self._acc, self._td, self._oid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+
+def test_mark_synced_cas_guards_against_late_rewrite(db_and_wq):
+    """POST 与 mark_synced 之间该行被迟到回报改写(row_version+1、synced=0)，CAS 守卫(row_version=读时版本)
+    使 mark_synced 命中 0 行 → 本机最新值仍 synced=0、下次重跑再推，绝不被误标已同步（原仅 synced=0 守卫挡不住 0→0）。"""
+    db, wq = db_and_wq
+    # 仅 seed qmt_order 一行（synced=0, row_version=0）
+    rec = _make_order(order_id=123)
+    sql, _cols = build_upsert("qmt_order")
+    params = params_for("qmt_order", mappers.order_to_row(rec))
+
+    def _seed(conn, _sql=sql, _params=params):
+        conn.execute(_sql, _params)
+
+    wq.submit(_seed)
+    assert wq.flush(timeout=2.0)
+    assert _count_synced(db, "qmt_order", 0) == 1
+
+    remote = _BumpRowVersionRemote(db, ACCOUNT_ID, T_BUY, 123)
+    job = RemoteSyncJob(db, remote, wq, RecordingLogger(), account_id=ACCOUNT_ID)
+    report = job.run(T_BUY)
+
+    # POST 确实发生（pushed=1），但 CAS 命中 0 行 → 本机仍 synced=0、report 暴露未清干净。
+    assert report["qmt_order"]["pushed"] == 1
+    assert _count_synced(db, "qmt_order", 1) == 0      # 没被误标已同步（SYNC-1 修复前此处会 ==1）
+    assert _count_synced(db, "qmt_order", 0) == 1      # 仍待同步，下次重跑再推
+    assert report["qmt_order"]["remaining"] == 1
+    assert report["ok"] is False

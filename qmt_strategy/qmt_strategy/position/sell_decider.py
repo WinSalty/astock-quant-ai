@@ -333,15 +333,21 @@ class SellDecider:
         return book.open_pct > Decimal("0")
 
     def _is_book_missing(self, book: OrderBook) -> bool:
-        """盘口竞价信息整体缺失判定（评审三轮 EXEC-position-08）。
+        """盘口竞价信息整体缺失判定（评审三轮 EXEC-position-08；评审修复 SELL-1）。
 
-        判据：open_pct 为 None（无高开幅度）且各结构布尔全 False（未背离/未封板/未炸板/未跌破支撑/未放量）
-        且 open_times==0 且 last_price 缺失——即盘口对象存在但字段整体空白（数据未到/降级 B），与「确实弱开
-        (open_pct<=0)」区分。缺失时安全默认 HOLD，避免无可信盘口误清仓。
+        判据：open_pct 为 None（无高开幅度，多因 tick 缺昨收 lastClose）且各结构布尔全 False
+        （未背离/未封板/未炸板/未跌破支撑/未放量）且 open_times==0——即盘口对象存在但【无任何可信判卖信号】
+        （停牌复牌首日 / 降级 B 的残缺 tick），与「确实弱开 open_pct<=0」区分。缺失时安全默认 HOLD，避免无可信
+        盘口误清仓。
+
+        SELL-1 修复：原判据多绑了 `book.last_price is None` 一项；但 build_sell_books 对 last_price 为 None 的票
+        一律 `continue` 不纳入待决盘口（main.build_sell_books），传进 decide_* 的每个 OrderBook 其 last_price 必非
+        None → 该项恒 False → 整个守卫恒不触发（死守卫）。结果：现价有效但仅缺昨收(open_pct=None、无任何走弱证据)
+        的弱先验持仓会落到「弱开」兜底分支被 CLEAR 卖飞，正是本守卫声称要防的「无可信盘口误清仓」。移除该恒假项，
+        使守卫回到其文档化语义：现价虽有、但高开幅度未知且无任何结构性卖出信号时 → 安全默认 HOLD。
         """
         return (
             book.open_pct is None
-            and book.last_price is None
             and not book.price_volume_diverge
             and not book.is_sealed
             and not book.broke_board

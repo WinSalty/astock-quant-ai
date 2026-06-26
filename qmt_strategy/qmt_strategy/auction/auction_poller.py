@@ -74,6 +74,11 @@ class AuctionPoller:
         # 每只股票的累积帧序列（算重心用增量），key=ts_code。
         # 仅保留「成功取到的完整 tick」入历史，降级帧（tick=None）不污染重心计算。
         self._history: Dict[str, List[dict]] = {}
+        # 定盘段一次性历史重置标志（评审修复 AUC-1）：集合竞价段(9:15–9:25)的累计成交量 volume 是「竞价虚拟撮合量」，
+        # 9:25 正式撮合后切换为「开盘已实现成交量」——两段是不同量纲的累计计数器、在 9:25 发生量级跳变。若把两段帧
+        # 混在同一 _history 里，auction_centroid 的 Δvol 加权会被 9:24→9:25 的虚假巨量增量主导、几乎用开盘单帧价决定
+        # 整段重心与趋势，污染定盘段(SETTLED)的买/弃判定。故首次进入 SETTLED 段时清空历史，使开盘后重心仅由定盘帧起算。
+        self._settled_history_reset_done = False
         # run 主循环的停止标志，供外部注入式打断（除 max_loops / CLOSED_WINDOW 外的兜底）。
         self._stop = False
 
@@ -94,6 +99,8 @@ class AuctionPoller:
         留痕/归因失真，auction_centroid 每轮遍历的帧列表也随天数线性变重。故 prewarm 每日调用本方法从空历史起算。
         """
         self._history.clear()
+        # 每日盘前一并复位定盘段历史重置标志（评审修复 AUC-1），使新交易日竞价段帧重新参与重心、直到 9:25 再清。
+        self._settled_history_reset_done = False
 
     def poll_once(self, now_utc: datetime) -> List[AuctionSnapshot]:
         """单轮轮询：批量取 tick → 逐 code 算四因子 → push 下游，返回本轮 snapshot 列表（§3.6）。
@@ -103,6 +110,11 @@ class AuctionPoller:
         对每个 code 用 tick=None 产出空壳 snapshot（标 NO_TICK），进程不崩、仍持续产帧。
         """
         phase = self.resolve_phase(now_utc)
+        # 进入定盘段(SETTLED, ≥9:25)首轮：清空累积历史（评审修复 AUC-1），切断「竞价虚拟撮合量」与「开盘已实现量」
+        # 在 9:25 的量纲跳变对 auction_centroid 的污染，使开盘后重心仅由定盘帧起算。一次性（每日由 reset_history 复位）。
+        if phase == AuctionPhase.SETTLED and not self._settled_history_reset_done:
+            self._history.clear()
+            self._settled_history_reset_done = True
         plans = self._plan_provider()
         codes: List[str] = list(plans.keys())
         snapshots: List[AuctionSnapshot] = []

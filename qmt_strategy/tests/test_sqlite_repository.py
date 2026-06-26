@@ -161,6 +161,38 @@ def test_mark_cancel_failed_keeps_order_status(repo_ctx):
     assert o.order_status == OrderStatus.REPORTED  # 不改终态
 
 
+def test_mark_cancel_failed_bumps_row_version(repo_ctx):
+    """评审修复 SYNC-1/A1：mark_cancel_failed 与 build_upsert 同为「重置 synced=0」的写者，必须一并自增 row_version。
+    否则盘后 sync 的 (synced=0 AND row_version=读时版本) CAS 会因 0→0、版本未变而误命中，把迟到撤单失败带回的
+    cancel_failed/error_* 误标 synced=1、永不再推远端。"""
+    repo, wq = repo_ctx
+    repo.upsert_order(_make_order(order_id=9, order_status=OrderStatus.REPORTED))
+    assert wq.flush(timeout=2.0) is True
+
+    def _rv_synced():
+        conn = sqlite3.connect(repo._db_path)
+        try:
+            return conn.execute(
+                "SELECT row_version, synced FROM qmt_order WHERE account_id='acc1' AND order_id=9"
+            ).fetchone()
+        finally:
+            conn.close()
+
+    rv0, _ = _rv_synced()
+    assert rv0 == 0
+    # 模拟该行已被盘后 sync 标记同步（synced=1），仅改 synced、不动 row_version。
+    c = sqlite3.connect(repo._db_path)
+    c.execute("UPDATE qmt_order SET synced=1 WHERE account_id='acc1' AND order_id=9")
+    c.commit()
+    c.close()
+    # 迟到撤单失败回报 → mark_cancel_failed：row_version 自增、synced 重置 0（使 sync 的 CAS 能识别「读后被改写」）。
+    repo.mark_cancel_failed("acc1", 9, error_id=42, error_msg="撤单失败")
+    assert wq.flush(timeout=2.0) is True
+    rv1, synced1 = _rv_synced()
+    assert rv1 == rv0 + 1   # A1 修复前此处 rv1==0（不自增）→ CAS 被绕过
+    assert synced1 == 0     # 重新标记待同步
+
+
 def test_mark_cancel_failed_coalesce_keeps_existing_error(repo_ctx):
     repo, wq = repo_ctx
     # 先写一条带 error_id/error_msg 的委托。

@@ -1070,19 +1070,41 @@ class OrderExecutor:
                 grace = timedelta(seconds=getattr(self._settings, "cancel_grace_seconds", 30))
                 self._ttl_deadline[biz_no] = now + grace
                 return
-            self._ledger.update(biz_no, state=OrderState.CANCELLING, updated_at=now)
+            # —— 原子转 CANCELLING（评审修复 ORD-1/ORD-2，对抗复核加固）——
+            # 撤单与成交回报跨线程并发（成交走 QMT 回调线程→add_fill，本巡检走调度线程）；行 1047 的 entry 是早前
+            # 深拷贝旧快照。这里用 mark_cancelling 在台账锁内做「终态守卫 + 置 CANCELLING」的【原子】转换，杜绝
+            # 「重读判非终态 → update 写入前成交恰好落地 → 裸 setattr 把已 TRADED 打回 CANCELLING」的读写竞态：
+            #   - 仅 SUBMITTED/REPORTED/部成在途(PART_TRADED) 才转 CANCELLING（部成仍需撤未成 remaining）；
+            #   - 撤单期间已被迟到成交收口为 TRADED/PART_CANCELLED、或已 CANCELLED/REJECTED/ERROR、或上一轮遗留的
+            #     CANCELLING → 返回 False：不降级覆盖、不据陈旧 filled==0 转次优，仅留痕（已发那次 cancel 对已成单
+            #     是券商无害空操作）。
+            if not self._ledger.mark_cancelling(biz_no, updated_at=now):
+                noop = self._ledger.get(biz_no)
+                self._logger.info(
+                    "order_ttl_cancel_noop_terminal",
+                    biz_order_no=biz_no,
+                    account_id=self._account_id,
+                    order_id=entry.order_id,
+                    state=str(noop.state) if noop is not None else None,
+                    filled_volume=(noop.filled_volume if noop is not None else None),
+                )
+                return
+            # 已原子置 CANCELLING：重读权威台账判 filled（成交可能恰在置 CANCELLING 后落地，add_fill 会据实推进 TRADED/部成）。
+            fresh = self._ledger.get(biz_no)
             self._logger.info(
                 "order_ttl_cancel_sent",
                 biz_order_no=biz_no,
                 account_id=self._account_id,
                 order_id=entry.order_id,
-                filled_volume=entry.filled_volume,
+                filled_volume=(fresh.filled_volume if fresh is not None else 0),
                 from_state=str(entry.state),
             )
             # —— 撤后若一手未成（filled==0）：一字 / 秒封「买不进」归因 + 转次优（§4.4(7)）——
             # 仅买单适用（评审二轮 P1#12）：卖单到期撤单后无"买不进/转次优"语义，撤单回报会触发持仓 revert_selling
             # 让下一轮重挂，故卖单不走 miss_reason/try_next_best 分支。
-            if entry.side == TradeSide.BUY and entry.filled_volume == 0:
+            # 据【权威 fresh】判 filled==0（ORD-1）：单元已原子转 CANCELLING，此处只对完全未成的买单归因「买不进」
+            # 并尝试次优；部成（filled>0）不转次优（已有真实建仓）；fresh 理论上非 None（刚转换成功），仍防御性判空。
+            if fresh is not None and fresh.side == TradeSide.BUY and fresh.filled_volume == 0:
                 miss_reason = self._infer_miss_reason(biz_no)
                 self._ledger.update(biz_no, miss_reason=miss_reason, updated_at=now)
                 self._logger.warn(
@@ -1094,11 +1116,11 @@ class OrderExecutor:
                 # 决策采集：买不进（一字/秒封未成撤单），「为什么没买进」的事实源。
                 self._emit_decision(
                     decision_type="BUY_MISS", decision_stage="ORDER", action="SKIP",
-                    ts_code=entry.ts_code, signal_trade_date=entry.signal_trade_date,
-                    trade_date=entry.target_trade_date, strategy_family=entry.strategy_family,
-                    order_phase=entry.order_phase, reason=f"未成交撤单({miss_reason})",
-                    reason_code="miss_unfilled", order_id=entry.order_id, biz_order_no=biz_no,
-                    plan_volume=entry.plan_volume, limit_price=entry.plan_price,
+                    ts_code=fresh.ts_code, signal_trade_date=fresh.signal_trade_date,
+                    trade_date=fresh.target_trade_date, strategy_family=fresh.strategy_family,
+                    order_phase=fresh.order_phase, reason=f"未成交撤单({miss_reason})",
+                    reason_code="miss_unfilled", order_id=fresh.order_id, biz_order_no=biz_no,
+                    plan_volume=fresh.plan_volume, limit_price=fresh.plan_price,
                 )
                 # 取原决策尝试次优（主标的买不进不放弃整批，§4.4(7)）。
                 decision = self._decision_by_biz.get(biz_no)

@@ -384,3 +384,50 @@ def test_find_active_index_consistent_with_state_collapse():
     led.insert(_entry_full("bizE", d, order_id=6, ts_code="600000.SH"))
     assert led.has_active(d, "600000.SH", "打板") is True
     assert led.has_active(d, "600036.SH", "打板") is False
+
+
+def test_mark_cancelling_atomic_terminal_guard():
+    """评审修复 ORD-2/A3：mark_cancelling 把「判终态 + 置 CANCELLING」收进同一调用——仅可撤在途态
+    (SUBMITTED/REPORTED/PART_TRADED) 才转 CANCELLING 并返回 True；已成/已终态/未知单返回 False、不降级覆盖。
+    这是消除 on_ttl_expired『重读判非终态 → 写 CANCELLING 前并发成交把单收口 TRADED → 裸 setattr 降级已成单』竞态的关键。"""
+    led = InMemoryLocalLedger()
+    # 在途单 → 可转 CANCELLING
+    led.insert(_entry(biz="b-inflight", state=OrderState.SUBMITTED))
+    assert led.mark_cancelling("b-inflight", updated_at=None) is True
+    assert led.get("b-inflight").state is OrderState.CANCELLING
+    # 部成在途 → 仍可转（撤未成 remaining）
+    led.insert(_entry(biz="b-part", state=OrderState.PART_TRADED))
+    assert led.mark_cancelling("b-part", updated_at=None) is True
+    assert led.get("b-part").state is OrderState.CANCELLING
+    # 已成单 → 不转、不降级（核心：ORD-2 已 TRADED 不被打回 CANCELLING）
+    led.insert(_entry(biz="b-traded", state=OrderState.TRADED))
+    assert led.mark_cancelling("b-traded", updated_at=None) is False
+    assert led.get("b-traded").state is OrderState.TRADED
+    # 已撤终态 / 已遗留 CANCELLING → 不转（A3：CANCELLING 也不再被重复降级/转次优）
+    led.insert(_entry(biz="b-cancelled", state=OrderState.CANCELLED))
+    assert led.mark_cancelling("b-cancelled", updated_at=None) is False
+    led.insert(_entry(biz="b-cancelling", state=OrderState.CANCELLING))
+    assert led.mark_cancelling("b-cancelling", updated_at=None) is False
+    # 未知单 → False（不臆造行）
+    assert led.mark_cancelling("b-nonexist", updated_at=None) is False
+
+
+def test_add_fill_on_cancelling_partial_keeps_cancelling():
+    """评审复核二轮 MEDIUM：CANCELLING 单（撤单在途）遇迟到【部分】成交，add_fill 累计 filled 但保持 CANCELLING——
+    绝不回退 PART_TRADED（否则该单重新落入 on_ttl_expired 可撤集 → 每宽限期重复撤单，doc/21 B1 同类）；
+    全成则收口 TRADED（撤单必被券商以已成拒绝）。"""
+    led = InMemoryLocalLedger()
+    led.insert(_entry(biz="b1", plan_volume=1000, state=OrderState.PART_TRADED))
+    led.update("b1", order_id=2001, filled_volume=600)
+    assert led.mark_cancelling("b1", updated_at=None) is True
+    assert led.get("b1").state is OrderState.CANCELLING
+    # 迟到部分成交：filled 累计、状态保持 CANCELLING（不回退 PART_TRADED）
+    led.add_fill(2001, "t-late", 100, Decimal("11.00"))
+    g = led.get("b1")
+    assert g.state is OrderState.CANCELLING
+    assert g.filled_volume == 700
+    # 剩余成交补满：全成收口 TRADED
+    led.add_fill(2001, "t-rest", 300, Decimal("11.00"))
+    g2 = led.get("b1")
+    assert g2.state is OrderState.TRADED
+    assert g2.filled_volume == 1000

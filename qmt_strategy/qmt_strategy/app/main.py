@@ -502,6 +502,10 @@ class Engine:
             OrderStatus.ERROR: "ERROR", OrderStatus.TRADED: "FILLED",
             OrderStatus.PART_TRADED: "PARTIAL", OrderStatus.REPORTED: "ACTIVE",
         }
+        # 同票多卖单聚合优先级（评审修复 ORD-1/state_by_code）：数值越大越「不该复位」。
+        # 在途(ACTIVE) > 部成(PARTIAL) > 已成(FILLED) > 撤/废/错。reconcile_stuck_selling 仅对撤/废/错复位，
+        # 故只要该票【任一】卖单已成交或仍在途，聚合值就应停在非撤废错档，绝不被「另一张已撤单」盖掉。
+        _term_priority = {"ACTIVE": 4, "PARTIAL": 3, "FILLED": 2, "CANCELLED": 1, "REJECTED": 1, "ERROR": 1}
         state_by_code: Dict[str, str] = {}
         for o in orders or []:
             try:
@@ -513,9 +517,11 @@ class Engine:
                 status = _normalize.default_status_resolver(getattr(o, "order_status", None))
                 term = _term.get(status)
                 if term is not None:
-                    # 同票多卖单取「更靠终态」的：已撤/废优先于在途（保证卡死能被识别复位）。
+                    # 取优先级更高的：成交/在途优先于撤废错（评审修复 ORD-1/state_by_code）。
+                    # 旧实现「撤/废一律覆盖」会把同票当日『已成交卖单 + 另一张已撤卖单』误判为零成交撤单 →
+                    # 复位回 HOLDING 对已（部分）卖出的标的重复挂卖单（废单/超卖/白占配额）。
                     prev = state_by_code.get(code)
-                    if prev is None or term in ("CANCELLED", "REJECTED", "ERROR"):
+                    if prev is None or _term_priority.get(term, 0) > _term_priority.get(prev, 0):
                         state_by_code[code] = term
             except Exception:  # noqa: BLE001 单条委托解析失败跳过，不拖垮整体对账
                 continue
@@ -1013,8 +1019,17 @@ class Engine:
             # 留痕由上面的 _orch_block_logged 去抖（每票每拒因每日一次），解锁/重评照常不受影响。
             self._entry.release(decision.ts_code)
             return
-        # 竞价择时闸门：竞价单仅在实测开关打开时下单，否则只采集留痕（§7.1.6）。
-        if decision.order_phase == OrderPhase.AUCTION and not self._settings.auction_timing_enabled:
+        # 竞价择时闸门（§7.1.6 + 评审修复 ROUTE-1）：竞价择时未开（auction_timing_enabled=False）时，
+        # 不仅压住 9:15–9:25 的竞价单（order_phase=AUCTION，任何战法），还须一并关停「竞价强开追」战法
+        # （CHASE_AUCTION_STRONG）在 9:25–9:30 定盘段以 OPENING 身份的真实下单。否则该战法只是把成交从竞价段
+        # 挪到定盘段照样真金建仓——entry_router.release() 刻意放行后续帧重评为 OPENING，main 仅对 order_phase=AUCTION
+        # 设闸，CHASE_AUCTION_STRONG 的 OPENING 决策本会穿过本闸直发 place，与运维「竞价择时关=该战法不实盘」预期不符。
+        # 口径由负责人拍板：false 时完全停该战法（含定盘段 OPENING）。其余战法（打板跟买/低吸）的 OPENING 单不受本闸约束，照常下单。
+        _auction_timing_gate = (not self._settings.auction_timing_enabled) and (
+            decision.order_phase == OrderPhase.AUCTION
+            or decision.action == EntryAction.CHASE_AUCTION_STRONG
+        )
+        if _auction_timing_gate:
             # 去抖（复审 P2-2）：同一票每帧重复采集会洪泛日志/decision_log，每票每日只留痕一次。
             if decision.ts_code not in self._auction_collect_logged:
                 self._auction_collect_logged.add(decision.ts_code)
@@ -1030,8 +1045,12 @@ class Engine:
                     order_phase=decision.order_phase, reason="竞价择时未开,仅采集", reason_code="auction_timing_disabled",
                     factors=decision.factors_snapshot,
                 )
-            # 解除幂等锁（评审二轮 P1#16）：竞价段决策被丢弃后允许后续帧（定盘段）重评为 OPENING 真正成交，
-            # 否则最强龙头(秒封一字/竞价强开)在默认配置下被永久锁死买不进。
+            # 解除幂等锁（评审二轮 P1#16 + 评审修复 ROUTE-1）：丢弃本帧采集态决策后允许后续帧重评，避免该票被
+            # 单帧锁死。注意口径分两类：
+            #   - 非「竞价强开追」战法的 AUCTION 决策（如打板跟买/低吸）：定盘段(9:25 后)会重评为 OPENING 并正常下单
+            #     （本闸只卡 order_phase=AUCTION，OPENING 不再命中），故仍需 release 让其能成交；
+            #   - CHASE_AUCTION_STRONG：无论 AUCTION 还是定盘段 OPENING 帧都命中本闸（按负责人决策 false 时完全停该战法），
+            #     release 后续帧仍只会再次落入采集态、绝不成交——release 仅为不永久锁死该票的留痕/重评，不构成实盘下单。
             self._entry.release(decision.ts_code)
             return
         # 限价合法性 / 偏离防护（评审二轮 P2#67）：下单前校验限价非正/超法定涨停价/偏离盘口过大则拒发，

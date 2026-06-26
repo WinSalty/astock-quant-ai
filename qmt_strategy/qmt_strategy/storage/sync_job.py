@@ -69,9 +69,11 @@ class RemoteSyncJob:
         全部处理后 flush 写队列，再读各表 remaining(synced=0)。
         返回：{表名: {'pushed':n, 'remaining':m, 'errors':k}, 'ok': 所有 remaining==0 且无 errors}。
 
-        运维口径（评审 medium#3）：sync 应在收盘 close_batch flush 完成、盘中回流写已停之后触发(盘后)。
-        本方法开头先 flush 写队列,确保从「已落盘的稳定快照」起算;mark_synced 带 synced=0 守卫,
-        若某行在读后被再次写脏(synced 重置为 0)也不会被误标 synced=1,下次重跑可补,绝不漏同步最新变更。
+        运维口径（评审 medium#3 + 评审修复 SYNC-1）：sync 应在收盘 close_batch flush 完成、盘中回流写已停之后触发(盘后)。
+        本方法开头先 flush 写队列,确保从「已落盘的稳定快照」起算;mark_synced 带 (synced=0 AND row_version=读时版本) 的
+        CAS 守卫——若某行在 SELECT 后、mark_synced 前被迟到回报改写(row_version 自增、synced 重置 0),CAS 不命中、
+        该行保持 synced=0 下次重跑再推,绝不把「只 POST 过旧值、本机已是新值」的行误标 synced=1(SYNC-1:仅 synced=0
+        守卫挡不住 0→0 重写)。代价是 POST 后被改写的行当轮 remaining 仍计 1、report['ok'] 暴露未清干净,符合预期。
         """
         trade_date_iso = trade_date.isoformat()
         report: Dict[str, Any] = {}
@@ -101,6 +103,11 @@ class RemoteSyncJob:
 
             # —— 第 2 步：逐行同步回远端；一行失败不影响后续行 ——
             for row in rows:
+                # CAS 版本快照（评审修复 SYNC-1）：记录读到本行时的 row_version，POST 成功后 mark_synced 据此守卫。
+                # 若 POST 与 mark_synced 之间该行被迟到回报改写（row_version 自增、synced 重置 0），CAS 不命中、
+                # 该行保持 synced=0 下次重跑再推，绝不把「只 POST 了旧值、本机已是新值」的行误标为已同步。
+                # 旧库迁移前无该列时取 None → 退化为仅 synced=0 守卫（向后兼容，不致 KeyError）。
+                row_version = row["row_version"] if "row_version" in row.keys() else None
                 try:
                     rec = row_to_rec(row)
                     upsert(rec)  # 远端按唯一键幂等 upsert；重传不产生重复行
@@ -115,8 +122,8 @@ class RemoteSyncJob:
                     )
                     errors += 1
                     continue
-                # 远端写成功 → 入队一条 mark_synced（异步、单写线程），把本行标记为已同步。
-                self._enqueue_mark_synced(table, rec)
+                # 远端写成功 → 入队一条 mark_synced（异步、单写线程），把本行标记为已同步（带 row_version CAS 守卫）。
+                self._enqueue_mark_synced(table, rec, row_version)
                 pushed += 1
 
             report[table] = {"pushed": pushed, "errors": errors}
@@ -138,24 +145,30 @@ class RemoteSyncJob:
         report["ok"] = all_ok
         return report
 
-    def _enqueue_mark_synced(self, table: str, rec) -> None:
+    def _enqueue_mark_synced(self, table: str, rec, row_version=None) -> None:
         """构造并入队一条 mark_synced UPDATE（按 TABLE_META[table]['unique'] 拼 WHERE）。
 
         WHERE 取值来源：先用 *_to_row 把记录序列化回「存储态」，再按唯一键列取值——保证与表里
         实际存储的列值（Decimal→TEXT、date→ISO、枚举→值）口径一致，定位的就是本行，不会误标他行。
         account_id 也在唯一键里（四表 unique 首列均为 account_id），天然做账户隔离。
+
+        守卫（评审修复 SYNC-1）：除 `synced=0` 外，再叠加 `row_version=?`（CAS）——传入「SELECT 时读到的版本」。
+        原仅 `synced=0` 守卫挡不住「读后该行被迟到回报改写、synced 重置回 0」的 0→0 重写：那样会把只 POST 过旧值、
+        本机已是新值的行误标 synced=1，新值永不再推。叠加 row_version CAS 后，行被改写过版本即变、UPDATE 命中 0 行、
+        保持 synced=0 下次重跑再推。row_version 为 None（旧库迁移前）时退化为仅 synced=0（向后兼容）。
         """
         unique_cols: List[str] = list(TABLE_META[table]["unique"])
         row = _TO_ROW[table](rec)
-        where_clause = " AND ".join("%s=?" % c for c in unique_cols)
-        params = tuple(row[c] for c in unique_cols)
-        # synced=0 守卫（评审 medium#3）：仅当该行仍待同步时才标记已同步。
-        # 若读后该行被再次写脏（任何 upsert/mark_cancel_failed 都会把 synced 重置为 0,见 sqlite_sql/repo），
-        # 本 UPDATE 命中 0 行、保持 synced=0,该行下次重跑再同步,绝不把「未同步的最新变更」误标为已同步。
-        sql = "UPDATE %s SET synced=1 WHERE %s AND synced=0" % (table, where_clause)
+        where_parts = ["%s=?" % c for c in unique_cols] + ["synced=0"]
+        params: List = [row[c] for c in unique_cols]
+        if row_version is not None:
+            where_parts.append("row_version=?")
+            params.append(row_version)
+        sql = "UPDATE %s SET synced=1 WHERE %s" % (table, " AND ".join(where_parts))
+        params_t = tuple(params)
 
         # 写任务闭包：在写线程独占连接上执行 UPDATE（commit 由 AsyncWriteQueue worker 统一做）。
-        def _task(conn, _sql=sql, _params=params):
+        def _task(conn, _sql=sql, _params=params_t):
             conn.execute(_sql, _params)
 
         self._wq.submit(_task)

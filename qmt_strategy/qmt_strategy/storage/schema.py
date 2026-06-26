@@ -111,6 +111,8 @@ _DDL: Dict[str, str] = {
             signal_trade_date TEXT, data_source TEXT NOT NULL DEFAULT 'CALLBACK',
             synced INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
+            -- row_version：乐观锁版本号（SYNC-1）。每次 upsert（含迟到回报覆盖）自增，供盘后 mark_synced 做 CAS 守卫。
+            row_version INTEGER NOT NULL DEFAULT 0,
             UNIQUE (account_id, trade_date, traded_id)
         )""",
     "qmt_order": """
@@ -124,6 +126,7 @@ _DDL: Dict[str, str] = {
             strategy_name TEXT, order_remark TEXT, signal_trade_date TEXT,
             data_source TEXT NOT NULL DEFAULT 'CALLBACK', synced INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
+            row_version INTEGER NOT NULL DEFAULT 0,  -- 乐观锁版本号（SYNC-1）
             UNIQUE (account_id, trade_date, order_id)
         )""",
     "qmt_position_snapshot": """
@@ -135,6 +138,7 @@ _DDL: Dict[str, str] = {
             open_price TEXT, avg_price TEXT, market_value TEXT, last_price TEXT,
             float_profit TEXT, profit_rate TEXT, data_source TEXT NOT NULL DEFAULT 'QUERY',
             synced INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT (datetime('now')),
+            row_version INTEGER NOT NULL DEFAULT 0,  -- 乐观锁版本号（SYNC-1）
             UNIQUE (account_id, trade_date, ts_code, snapshot_type)
         )""",
     "qmt_account_daily": """
@@ -145,6 +149,7 @@ _DDL: Dict[str, str] = {
             daily_pnl TEXT, daily_return TEXT, cash_flow_note TEXT,
             data_source TEXT NOT NULL DEFAULT 'QUERY', synced INTEGER NOT NULL DEFAULT 0,
             created_at TEXT DEFAULT (datetime('now')),
+            row_version INTEGER NOT NULL DEFAULT 0,  -- 乐观锁版本号（SYNC-1）
             UNIQUE (account_id, trade_date, snapshot_type)
         )""",
     "local_order_ledger": """
@@ -206,6 +211,12 @@ _COLUMN_MIGRATIONS = {
         # 列集必含这两列，data_missing/data_missing_reason 经 SQLite 无损 round-trip。
         ("data_missing", "INTEGER"), ("data_missing_reason", "TEXT"),
     ],
+    # row_version 乐观锁列（评审修复 SYNC-1）：旧库（已部署生产机）无此列时幂等补上，DEFAULT 0 使既有行版本归零。
+    # ALTER ADD 带 NOT NULL 必须给默认值（此处 DEFAULT 0），安全。供盘后 mark_synced 的 CAS 守卫识别「读后被改写」。
+    "qmt_trade": [("row_version", "INTEGER NOT NULL DEFAULT 0")],
+    "qmt_order": [("row_version", "INTEGER NOT NULL DEFAULT 0")],
+    "qmt_position_snapshot": [("row_version", "INTEGER NOT NULL DEFAULT 0")],
+    "qmt_account_daily": [("row_version", "INTEGER NOT NULL DEFAULT 0")],
 }
 
 # 索引：对账 / 同步按 (trade_date) 查；台账按 (target_trade_date, ts_code, strategy_family) 查活跃单。
@@ -232,7 +243,9 @@ def apply_pragmas(conn: sqlite3.Connection) -> None:
 def _apply_column_migrations(conn: sqlite3.Connection) -> None:
     """对已存在的表补增量列（评审二轮 P1#18/#63）：读 PRAGMA table_info 取现有列，缺则 ALTER TABLE ADD。
 
-    幂等：已有该列则跳过；SQLite ALTER ADD COLUMN 只能加可空/带默认列，本项均为可空 TEXT，安全。
+    幂等：已有该列则跳过；SQLite ALTER ADD COLUMN 只能加「可空列」或「带字面默认值的列」。本项含两类、均满足：
+    watchlist 增量列为可空 TEXT/INTEGER；qmt_* 的 row_version 为 `INTEGER NOT NULL DEFAULT 0`（带字面默认值，
+    既有行回填 0，合法安全，评审修复 SYNC-1）。
     """
     for table, cols in _COLUMN_MIGRATIONS.items():
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
