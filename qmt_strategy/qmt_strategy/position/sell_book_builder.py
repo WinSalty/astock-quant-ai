@@ -48,7 +48,9 @@ def build_order_book(
     - tick 为 None → 返回空壳 OrderBook（仅 ts_code + NO_TICK），各字段默认；调用方（build_sell_books）
       据此【不纳入 books】，使 run_sell_pass 对该票走「无盘口安全默认不卖」（book is None）。
     - plan 为 None（持仓不在今日 watchlist，无今日涨停价/流通市值基准）→ 封单类字段保持默认（封板质量未知）。
-    - bidVol/bidPrice 为五档 list → 经 _best_level 取 best 档（评审 F4，与买入侧同口径）。
+    - bidVol/bidPrice 为五档 list → 经 _best_level 取 best 档（评审 F4，与买入侧同口径）。盘中连续段
+      bidVol[0]=真买一封单口径正确；若用于竞价段(9:15-9:25)卖出，[0]=虚拟匹配量非封单（同
+      auction_factors.virtual_seal 「时段口径」，竞价段封单取数待决策，当前卖出门控关无在线影响）。
     - cross_frame_builder（评审 doc/19 C-3）：注入则用其填充跨帧状态量；None（T0.1）则跨帧字段保守默认。
     """
     ob = OrderBook(ts_code=ts_code)

@@ -135,6 +135,8 @@ class Settings:
     # 默认 0（关闭）：执行侧 seal_to_float_ratio 依赖 bidVol 的"手/股"量纲(auction_factors.virtual_seal)，
     # 在目标机实测确认 bidVol 量纲(是否需 ×100)并据此标定阈值前，不默认激活——避免量纲偏差把真实强板误杀在
     # 真金买入路径上。实测确认后用 QMT_SEAL_RATIO_MIN 配一个正阈值(如 0.005)启用本护栏。
+    # ⚠️ 另一待决口径(2026-06-26 竞价窗实测,doc/33 §6)：集合竞价段 bidVol[0]=虚拟匹配量(非封单),真实封单在买侧
+    # 残余 bidVol[1]；本封流比在竞价段会失真，故启用竞价择时前须同时定竞价段虚拟封单取数口径(见 virtual_seal 时段口径)。
     seal_ratio_min: Decimal = Decimal("0")            # QMT_SEAL_RATIO_MIN
     # 打板因子消费阈值（执行侧 E2，消费 watchlist 1.2.0 的封板时序/位置因子）：
     # 【默认即生效（业务方决策 2026-06-19）】，env 可覆盖；这三个是【未回测的起步值】，日后按回测/真机标定调整。

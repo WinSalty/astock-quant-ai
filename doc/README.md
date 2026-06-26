@@ -176,7 +176,7 @@
 | `QMT_AUCTION_ABANDON_PCT` / `QMT_AUCTION_OVERHEAT_PCT` | 竞价弱于该幅度放弃 / 超该幅度警惕 | 无 |
 | `QMT_AUCTION_LOWBUY_PCT_LOW` / `…_HIGH` | 低吸触发区间（**平开/微跌回踩**区间，如 `-0.02` / `0.01`） | 无；⚠️**未配则低吸族 fail-closed 不开仓**——绝不再回退用「合理高开区间」臆造低吸档（否则低吸买卖方向相反），低吸战法须显式配此区间 |
 | `QMT_LEADER_STRENGTH_MIN` | 龙头强度分下限 | 无 |
-| `QMT_SEAL_RATIO_MIN` | 打板跟买封流比下限（低于视为封单不稳→弃） | `0`（**关闭**；目标机实测 `bidVol` 量纲后再配正阈值如 `0.005`） |
+| `QMT_SEAL_RATIO_MIN` | 打板跟买封流比下限（低于视为封单不稳→弃） | `0`（**关闭**；目标机实测 `bidVol` 量纲后再配正阈值如 `0.005`；另：竞价段虚拟封单取数口径待决策，见 [doc/33 §6](33-生产部署核对与QMT执行侧口径实测确认-20260624.md)——竞价段 `bidVol[0]`=匹配量非封单） |
 | `QMT_STRATEGY_<NAME>_ENABLED` | 各战法独立开关（`<NAME>` 小写汇总进 `strategy_enabled`） | 未配即不在集合内 |
 | `QMT_AUCTION_POLL_INTERVAL_SEC` | 竞价轮询间隔秒 | `3.0` |
 | `QMT_CLOSE_SNAPSHOT_TIME` | 收盘快照时点 | `15:05` |

@@ -172,6 +172,12 @@ def virtual_seal(
 
     口径：虚拟成交价(lastPrice) ≥ 涨停价(limit_up_price) 视为「顶涨停」is_limit_up=True；
         封单额 = 买一量(bidVol) × 买一价(bidPrice)；封流比 = 封单额 / 流通市值。
+    ⚠️ 时段口径（2026-06-26 竞价窗实测，待负责人决策；详见 _best_level 注释 + 待办 §A / doc/33 §6）：
+        本式「买一量」经 _best_level 取 bidVol[0]。**连续交易段** bidVol[0]=真买一封单（口径正确）；
+        但**集合竞价段(9:15-9:25) bidVol[0]=虚拟匹配量（非封单）**，真实涨停封单是买侧未匹配残余 bidVol[1]，
+        故竞价段本式会把封单严重低估（如 600228 [0]=878 vs [1]=293262，差 ~300 倍）。当前竞价择时门控关
+        (AUCTION_TIMING_ENABLED=false)、竞价段本结果不被消费、无在线影响；启用竞价择时前须先定竞价段虚拟
+        封单取数口径（方案 A 取 bidVol[1] / 方案 B 竞价段降级）。
     业务意图：一字 / 竞价即封涨停时，虚拟封单大小决定能否排进队；封单极大 → 大概率买不进。
     边界：
       - 未达涨停（或 limit_up_price/lastPrice 缺失无法判定）→ is_limit_up=False、封单额=0、
@@ -196,7 +202,8 @@ def virtual_seal(
         # 未达涨停：封单额 0、封流比 None，属正常态。
         return info
 
-    # 已达涨停：尝试取买一档（一档即虚拟封单）。
+    # 已达涨停：取买一档作虚拟封单（连续段 bidVol[0]=真买一封单口径正确；**集合竞价段 [0]=虚拟匹配量、
+    # 真实封单在买侧残余 bidVol[1]**——见上方「时段口径」与 _best_level 注释，竞价择时启用前待定口径）。
     # 评审 F4：bidVol/bidPrice 真实为五档 list，先经 _best_level 取 best 档再转 Decimal，
     # 否则一字/竞价封板（数组）会被 _to_decimal 吞成 None、虚拟封单恒 0。
     bid_vol = _to_decimal(_best_level(tick.get("bidVol")))

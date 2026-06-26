@@ -266,7 +266,7 @@ class PlanRow:
 class SealInfo:
     """虚拟封单计算结果（§3.4 因子 4）。"""
 
-    virtual_seal_amount: Decimal = Decimal("0")     # 虚拟封单额 = 买一量 × 买一价
+    virtual_seal_amount: Decimal = Decimal("0")     # 虚拟封单额 = 买一量 × 买一价（连续段口径；竞价段 bidVol[0]=匹配量非封单，见 auction_factors.virtual_seal 时段口径，待决策）
     seal_to_float_ratio: Optional[Decimal] = None   # 封流比 = 封单额 / 流通市值
     is_limit_up: bool = False                        # 虚拟成交价是否已达涨停价
     data_quality: List[str] = field(default_factory=list)
